@@ -173,28 +173,22 @@ def extract_email(text: str) -> str | None:
 
 
 def apply_button_url(vacancy_id: int) -> str:
+    # Telegram допускает в кнопках только http(s):// и tg:// ссылки — mailto: там
+    # не работает и вызывает BUTTON_URL_INVALID, поэтому Apply всегда идёт через
+    # диплинк на самого бота; сам email (если есть) бот покажет текстом в /start
     return f"https://t.me/{BOT_USERNAME}?start=apply_{vacancy_id}"
-
-
-def resolve_apply_url(fields: dict, vacancy_id: int) -> str:
-    email = extract_email(fields.get("contact"))
-    if email:
-        subject = quote(f"Application - {fields.get('position') or 'Vacancy'}")
-        return f"mailto:{email}?subject={subject}"
-    # нет email в контакте (например инструкция вместо адреса) — путь через бота
-    # с подсчётом кликов и остаётся рабочим запасным вариантом
-    return apply_button_url(vacancy_id)
 
 
 def channel_keyboard(fields: dict, vacancy_id: int, post_link: str | None, title: str) -> InlineKeyboardMarkup:
     rows = [[
-        InlineKeyboardButton(text="📩 Apply", url=resolve_apply_url(fields, vacancy_id)),
+        InlineKeyboardButton(text="📩 Apply", url=apply_button_url(vacancy_id)),
         InlineKeyboardButton(text="📢 Channel", url=f"https://t.me/{CHANNEL_USERNAME}"),
     ]]
     if post_link:
         share_url = "https://t.me/share/url?url=" + quote(post_link) + "&text=" + quote(title)
         rows.append([InlineKeyboardButton(text="↗️ Share", url=share_url)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 
 def draft_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
@@ -255,12 +249,19 @@ async def cmd_start(message: Message, command: CommandObject):
     if command.args and command.args.startswith("apply_"):
         vacancy_id = int(command.args.replace("apply_", ""))
         db.increment_clicks(vacancy_id)
-        await message.answer(
-            "Open the application form:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="Open", url=APPLY_BOT_LINK)
-            ]]),
-        )
+        row = db.get_vacancy(vacancy_id)
+        email = extract_email(row["contact"]) if row else None
+        if email:
+            # обычный текст с email — Telegram сам делает его кликабельным
+            # (открывает почтовый клиент), в отличие от кнопки с mailto:
+            await message.answer(f"Отправьте резюме на: {email}")
+        else:
+            await message.answer(
+                "Open the application form:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Open", url=APPLY_BOT_LINK)
+                ]]),
+            )
         return
 
     if not admin_only(message.from_user.id):
