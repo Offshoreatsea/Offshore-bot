@@ -123,10 +123,13 @@ For each vacancy, extract:
 - documents: list of required certificates/documents/qualifications explicitly mentioned
   (e.g. STCW, COC, BOSIET, medical certificate, visa, passport) — empty list if none stated
 - requirements: list of other requirements (experience, skills) — empty list if none stated
-- contact: how to apply (email or instruction), or null. If multiple positions in
-  the text share one contact given once (e.g. at the end, or in a shared header),
-  use that same contact for every one of those positions — do not leave it null
-  just because it wasn't repeated next to each individual position.
+- contact: how to apply — an email address, a URL to apply through, or a text instruction,
+  or null. If multiple positions in the text share one contact given once (e.g. at the
+  end, or in a shared header), use that same contact for every one of those positions —
+  do not leave it null just because it wasn't repeated next to each individual position.
+  If instead each position has its OWN distinct application link (e.g. a list of roles
+  each followed by a different URL), use that position's own specific link as its contact,
+  not a shared/generic one found elsewhere in the text.
 - notes: any OTHER important information stated in the posting that doesn't fit the fields
   above — e.g. urgency ("urgent, immediate mobilization"), scope of work description, contract
   type, number of positions, shift pattern details, anything a candidate would want to know.
@@ -293,6 +296,11 @@ def extract_email(text: str) -> str | None:
     return m.group(0).rstrip(".") if m else None
 
 
+def extract_url(text: str) -> str | None:
+    m = re.search(r"https?://[^\s)]+", text or "")
+    return m.group(0).rstrip(".,;") if m else None
+
+
 def apply_button_url(vacancy_id: int) -> str:
     # Telegram допускает в кнопках только http(s):// и tg:// ссылки — mailto: там
     # не работает и вызывает BUTTON_URL_INVALID, поэтому Apply всегда идёт через
@@ -301,10 +309,7 @@ def apply_button_url(vacancy_id: int) -> str:
 
 
 def channel_keyboard(fields: dict, vacancy_id: int, post_link: str | None, title: str) -> InlineKeyboardMarkup:
-    rows = [[
-        InlineKeyboardButton(text="📩 Apply", url=apply_button_url(vacancy_id)),
-        InlineKeyboardButton(text="📢 Channel", url=f"https://t.me/{CHANNEL_USERNAME}"),
-    ]]
+    rows = [[InlineKeyboardButton(text="📩 Apply", url=apply_button_url(vacancy_id))]]
     if post_link:
         share_url = "https://t.me/share/url?url=" + quote(post_link) + "&text=" + quote(title)
         rows.append([InlineKeyboardButton(text="↗️ Share", url=share_url)])
@@ -374,16 +379,35 @@ async def cmd_start(message: Message, command: CommandObject):
         vacancy_id = int(command.args.replace("apply_", ""))
         db.increment_clicks(vacancy_id)
         row = db.get_vacancy(vacancy_id)
-        email = extract_email(row["contact"]) if row else None
+        contact = (row["contact"] if row else None) or ""
+        email = extract_email(contact)
+        url = extract_url(contact) if not email else None
         if email:
             # обычный текст с email — Telegram сам делает его кликабельным
             # (открывает почтовый клиент), в отличие от кнопки с mailto:
             await message.answer(f"Отправьте резюме на: {email}")
-        else:
+        elif url:
+            # у вакансии своя собственная ссылка для отклика (например разные
+            # ссылки на каждую позицию в одном посте) — https, кнопка разрешена
             await message.answer(
                 "Open the application form:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="Open", url=APPLY_BOT_LINK)
+                    InlineKeyboardButton(text="Open", url=url)
+                ]]),
+            )
+        elif contact.strip():
+            # контакт есть, но это не email и не ссылка — например текстовая
+            # инструкция ("напишите в личку @agency"). Показываем как есть,
+            # вместо кнопки в никуда.
+            await message.answer(f"Как откликнуться: {contact.strip()}")
+        else:
+            # у вакансии вообще нет контакта в тексте — честно говорим об
+            # этом, а не показываем кнопку "Open", ведущую в общий канал
+            await message.answer(
+                "В этой вакансии не указан прямой контакт для отклика. "
+                "Уточните у администратора канала.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Написать администратору", url=CONSULT_LINK)
                 ]]),
             )
         return
