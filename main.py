@@ -31,13 +31,75 @@ BOT_USERNAME = os.getenv("BOT_USERNAME")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "offshoreatsea")
 CHANNEL_ID = f"@{CHANNEL_USERNAME}"
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 APPLY_BOT_LINK = os.getenv("APPLY_BOT_LINK", f"https://t.me/{CHANNEL_USERNAME}")
+CONSULT_LINK = os.getenv("CONSULT_LINK", "https://t.me/Offshore_atsea")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 DIGEST_TIMES = ["09:00", "14:00", "19:00"]
 
 router = Router()
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# admin_id -> vacancy_id, чья вакансия сейчас ожидает исправленный текст от админа
+pending_corrections: dict[int, int] = {}
+# admin_id -> True, если админ сейчас в процессе публикации рекламного поста
+pending_ads: dict[int, bool] = {}
+# временное хранилище черновиков рекламы: ad_id -> текст
+ad_drafts: dict[int, str] = {}
+_ad_counter = 0
+
+
+def parse_template_text_to_fields(text: str) -> dict:
+    """Разбирает текст, который админ прислал как исправленный вариант вакансии
+    (в том же формате, что показывает сам бот), обратно в поля — без ИИ, просто
+    по известным эмодзи-меткам. Используется для сохранения примеров обучения."""
+    label_map = {
+        "🚢 Vessel": "vessel", "🌍 Region": "region", "🛂 Nationality": "nationality",
+        "📅 Date": "date", "⏱️ Duration": "duration", "🔄 Rotation": "rotation",
+        "💰 Salary": "salary", "📩 Contact": "contact",
+    }
+    lines = [l.strip() for l in text.split("\n")]
+    fields = {v: None for v in label_map.values()}
+    fields["documents"] = []
+    fields["requirements"] = []
+    fields["notes"] = None
+    fields["position"] = None
+
+    section = None
+    for raw_line in lines:
+        line = re.sub(r"^⚓\s*<b>|</b>$", "", raw_line).strip()
+        if not line:
+            continue
+        matched_label = False
+        for label, key in label_map.items():
+            if line.startswith(label):
+                fields[key] = line.split(":", 1)[1].strip() if ":" in line else None
+                matched_label = True
+                section = None
+                break
+        if matched_label:
+            continue
+        if line.startswith("📄"):
+            section = "documents"
+            continue
+        if line.startswith("✅"):
+            section = "requirements"
+            continue
+        if line.startswith("ℹ️"):
+            fields["notes"] = line.lstrip("ℹ️").strip()
+            section = None
+            continue
+        if line.startswith("🔗") or line.startswith("#"):
+            section = None
+            continue
+        if line.startswith("•") and section in ("documents", "requirements"):
+            fields[section].append(line.lstrip("•").strip())
+            continue
+        if fields["position"] is None:
+            fields["position"] = line
+
+    return fields
 
 BATCH_EXTRACT_PROMPT = """You will receive a raw block of text pasted by a recruiter for an
 offshore/maritime job board. It may contain ONE or MULTIPLE separate job vacancy postings
@@ -61,7 +123,10 @@ For each vacancy, extract:
 - documents: list of required certificates/documents/qualifications explicitly mentioned
   (e.g. STCW, COC, BOSIET, medical certificate, visa, passport) — empty list if none stated
 - requirements: list of other requirements (experience, skills) — empty list if none stated
-- contact: how to apply (email or instruction), or null
+- contact: how to apply (email or instruction), or null. If multiple positions in
+  the text share one contact given once (e.g. at the end, or in a shared header),
+  use that same contact for every one of those positions — do not leave it null
+  just because it wasn't repeated next to each individual position.
 - notes: any OTHER important information stated in the posting that doesn't fit the fields
   above — e.g. urgency ("urgent, immediate mobilization"), scope of work description, contract
   type, number of positions, shift pattern details, anything a candidate would want to know.
@@ -74,12 +139,29 @@ Translate every value into English regardless of source language. Never invent d
 Return ONLY a JSON array, one object per distinct vacancy found, in the order they appear.
 If the text contains just one vacancy, return an array with a single object. No markdown
 fences, no commentary — just the JSON array.
-
+{examples}
 Text:
 ---
 {text}
 ---
 """
+
+
+def build_few_shot_examples() -> str:
+    """Подтягивает последние исправления, сделанные админом через кнопку «Исправить»,
+    и превращает их в примеры для промпта — так модель со временем повторяет реже
+    те же ошибки на похожих вакансиях, без переобучения самой модели."""
+    rows = db.get_recent_corrections(3)
+    if not rows:
+        return ""
+    blocks = ["\nHere are recent examples of corrections made by the channel admin — pay attention "
+              "to how fields were filled in these, they reflect this specific channel's conventions:\n"]
+    for i, row in enumerate(rows, 1):
+        blocks.append(
+            f"\nExample {i}:\nInput text:\n{row['original_text'][:800]}\n"
+            f"Correct extraction:\n{row['corrected_fields']}\n"
+        )
+    return "\n".join(blocks) + "\n"
 
 
 def slugify_tag(word: str) -> str:
@@ -96,16 +178,28 @@ def ai_parse_batch(raw: str) -> list[dict]:
     try:
         resp = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=4000,
-            messages=[{"role": "user", "content": BATCH_EXTRACT_PROMPT.format(text=raw)}],
+            max_tokens=8000,
+            messages=[{
+                "role": "user",
+                "content": BATCH_EXTRACT_PROMPT.format(text=raw, examples=build_few_shot_examples()),
+            }],
         )
         content = resp.content[0].text.strip()
         content = re.sub(r"^```(json)?|```$", "", content.strip(), flags=re.MULTILINE).strip()
+        if resp.stop_reason == "max_tokens":
+            print(
+                "[ai_parse_batch] Ответ обрезан по max_tokens — вакансия слишком большая "
+                "для одного запроса, поле разбора будет неполным"
+            )
         data = json.loads(content)
         if not isinstance(data, list):
             data = [data]
         if not data:
             return fallback
+    except json.JSONDecodeError as e:
+        print(f"[ai_parse_batch] Не удалось разобрать JSON от Claude: {e}")
+        print(f"[ai_parse_batch] Сырой ответ (первые 500 символов): {content[:500]!r}")
+        return fallback
     except Exception as e:
         print(f"[ai_parse_batch] Ошибка вызова Claude API: {type(e).__name__}: {e}")
         return fallback
@@ -123,7 +217,7 @@ def ai_parse_batch(raw: str) -> list[dict]:
 def render_template(fields: dict) -> str:
     def val(key):
         v = fields.get(key)
-        return v if v else "—"
+        return v if v else None
 
     def as_list(key):
         v = fields.get(key)
@@ -133,31 +227,58 @@ def render_template(fields: dict) -> str:
             return [l for l in v.split("\n") if l.strip()]
         return []
 
-    parts = [f"⚓ <b>{val('position')}</b>", ""]
-    parts.append(f"🚢 Vessel: {val('vessel')}")
-    parts.append(f"🌍 Region: {val('region')}")
-    parts.append(f"🛂 Nationality: {val('nationality')}")
-    parts.append(f"📅 Date: {val('date') if fields.get('date') else val('dates')}")
-    parts.append(f"⏱️ Duration: {val('duration')}")
-    parts.append(f"🔄 Rotation: {val('rotation')}")
-    parts.append(f"💰 Salary: {val('salary')}")
-    parts.append("")
-    parts.append("📄 Documents/Certificates:")
+    date_val = val("date") or val("dates")
+
+    parts = [f"⚓ <b>{val('position') or 'Vacancy'}</b>", ""]
+    # каждое поле выводится, только если для него реально есть данные —
+    # никакого "—" на пустых полях, чтобы пост не раздувался лишними строками
+    for label, value in [
+        ("🚢 Vessel", val("vessel")),
+        ("🌍 Region", val("region")),
+        ("🛂 Nationality", val("nationality")),
+        ("📅 Date", date_val),
+        ("⏱️ Duration", val("duration")),
+        ("🔄 Rotation", val("rotation")),
+        ("💰 Salary", val("salary")),
+    ]:
+        if value:
+            parts.append(f"{label}: {value}")
+
     docs = as_list("documents")
-    parts += [f"• {d}" for d in docs] if docs else ["—"]
-    parts.append("")
-    parts.append("✅ Requirements:")
+    if docs:
+        parts.append("")
+        parts.append("📄 Documents/Certificates:")
+        parts += [f"• {d}" for d in docs]
+
     reqs = as_list("requirements")
-    parts += [f"• {r}" for r in reqs] if reqs else ["—"]
+    if reqs:
+        parts.append("")
+        parts.append("✅ Requirements:")
+        parts += [f"• {r}" for r in reqs]
+
     if fields.get("notes"):
         parts.append("")
         parts.append(f"ℹ️ {fields['notes']}")
-    parts.append("")
-    parts.append(f"📩 Contact: {val('contact')}")
+
+    if val("contact"):
+        parts.append("")
+        parts.append(f"📩 Contact: {val('contact')}")
+
     if fields.get("hashtags"):
         parts.append("")
         parts.append(fields["hashtags"])
-    return "\n".join(parts)
+
+    parts.append("")
+    parts.append(f"🔗 {CHANNEL_LINK}")
+
+    # схлопываем случайные двойные пустые строки (когда почти все поля пустые
+    # и подряд идёт несколько условных блоков с "" в начале)
+    cleaned: list[str] = []
+    for line in parts:
+        if line == "" and cleaned and cleaned[-1] == "":
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
 
 
 def dedup_key_for(fields: dict) -> str:
@@ -197,7 +318,10 @@ def draft_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Опубликовать сейчас", callback_data=f"pub:{vacancy_id}"),
             InlineKeyboardButton(text="В очередь (дайджест)", callback_data=f"queue:{vacancy_id}"),
         ],
-        [InlineKeyboardButton(text="Отмена", callback_data=f"cancel:{vacancy_id}")],
+        [
+            InlineKeyboardButton(text="✏️ Исправить", callback_data=f"fix:{vacancy_id}"),
+            InlineKeyboardButton(text="Отмена", callback_data=f"cancel:{vacancy_id}"),
+        ],
     ])
 
 
@@ -274,6 +398,7 @@ async def cmd_start(message: Message, command: CommandObject):
         "/stats — сводка за неделю\n"
         "/contacts — список email/агентств из сохранённых вакансий\n"
         "/testchannel — проверить доступ бота к каналу\n"
+        "/ad — опубликовать рекламный пост с кнопкой «Консультация»\n"
         f"/autopublish on|off — автопубликация без подтверждения (сейчас {mode})"
     )
 
@@ -335,9 +460,49 @@ async def cmd_autopublish(message: Message, command: CommandObject):
         await message.answer("Автопубликация выключена — снова буду спрашивать подтверждение.")
 
 
+def ad_keyboard(ad_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Опубликовать", callback_data=f"adpub:{ad_id}"),
+        InlineKeyboardButton(text="Отмена", callback_data=f"adcancel:{ad_id}"),
+    ]])
+
+
+def consult_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🤝 Консультация", url=CONSULT_LINK)
+    ]])
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_vacancy_text(message: Message):
     if not admin_only(message.from_user.id):
+        return
+
+    user_id = message.from_user.id
+
+    # режим исправления — админ прислал текст с правильными полями
+    # взамен того, что бот разобрал неверно
+    if user_id in pending_corrections:
+        vacancy_id = pending_corrections.pop(user_id)
+        row = db.get_vacancy(vacancy_id)
+        corrected_fields = parse_template_text_to_fields(message.text)
+        db.insert_correction(row["raw_text"] or "", json.dumps(corrected_fields, ensure_ascii=False))
+        await message.answer(
+            "Спасибо, запомнил. На похожих вакансиях в следующий раз буду разбирать точнее."
+        )
+        return
+
+    # режим рекламы — следующий текст публикуется как есть, без разбора ИИ
+    if pending_ads.get(user_id):
+        pending_ads[user_id] = False
+        global _ad_counter
+        _ad_counter += 1
+        ad_id = _ad_counter
+        ad_drafts[ad_id] = message.text
+        await message.answer(
+            message.text + "\n\n<i>Опубликовать этот рекламный пост?</i>",
+            reply_markup=ad_keyboard(ad_id),
+        )
         return
 
     status_msg = await message.answer("Разбираю...")
@@ -346,7 +511,7 @@ async def handle_vacancy_text(message: Message):
         key = dedup_key_for(fields)
         dup = db.find_recent_duplicate(key)
 
-        vacancy_id = db.insert_vacancy(fields, key)
+        vacancy_id = db.insert_vacancy(fields, key, raw_text=message.text)
         text = render_template(fields)
 
         if dup:
@@ -373,6 +538,36 @@ async def handle_vacancy_text(message: Message):
                 reply_markup=draft_keyboard(vacancy_id),
             )
     await status_msg.delete()
+
+
+@router.message(Command("ad"))
+async def cmd_ad(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    pending_ads[message.from_user.id] = True
+    await message.answer(
+        "Пришлите текст рекламного поста — опубликую как есть, с одной кнопкой «Консультация»."
+    )
+
+
+@router.callback_query(F.data.startswith("adpub:"))
+async def cb_ad_publish(callback: CallbackQuery):
+    ad_id = int(callback.data.split(":")[1])
+    text = ad_drafts.pop(ad_id, None)
+    if not text:
+        await callback.answer("Черновик не найден, пришлите текст заново.", show_alert=True)
+        return
+    await callback.bot.send_message(chat_id=CHANNEL_ID, text=text, reply_markup=consult_keyboard())
+    await callback.message.edit_text(text + "\n\n✅ Опубликовано")
+    await callback.answer("Опубликовано в канал")
+
+
+@router.callback_query(F.data.startswith("adcancel:"))
+async def cb_ad_cancel(callback: CallbackQuery):
+    ad_id = int(callback.data.split(":")[1])
+    ad_drafts.pop(ad_id, None)
+    await callback.message.edit_text("Отменено")
+    await callback.answer()
 
 
 @router.message(Command("testchannel"))
@@ -429,6 +624,17 @@ async def cb_cancel(callback: CallbackQuery):
     vacancy_id = int(callback.data.split(":")[1])
     db.set_status(vacancy_id, "cancelled")
     await callback.message.edit_text("Отменено")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("fix:"))
+async def cb_fix(callback: CallbackQuery):
+    vacancy_id = int(callback.data.split(":")[1])
+    pending_corrections[callback.from_user.id] = vacancy_id
+    await callback.message.answer(
+        "Пришлите вакансию в исправленном виде — скопируйте пост выше и поправьте "
+        "неверные строки, оставив те же эмодзи-метки (🚢 Vessel:, 🌍 Region: и т.д.)."
+    )
     await callback.answer()
 
 
