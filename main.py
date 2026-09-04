@@ -106,7 +106,8 @@ def ai_parse_batch(raw: str) -> list[dict]:
             data = [data]
         if not data:
             return fallback
-    except Exception:
+    except Exception as e:
+        print(f"[ai_parse_batch] Ошибка вызова Claude API: {type(e).__name__}: {e}")
         return fallback
 
     for item in data:
