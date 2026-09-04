@@ -1,7 +1,8 @@
+import os
 import sqlite3
 from datetime import datetime, timedelta
 
-DB_PATH = "bot.db"
+DB_PATH = os.getenv("DB_PATH") or "bot.db"
 
 
 def get_conn():
@@ -20,6 +21,8 @@ def init_db():
             region TEXT,
             dates TEXT,
             rotation TEXT,
+            salary TEXT,
+            documents TEXT,
             contact TEXT,
             requirements TEXT,
             hashtags TEXT,
@@ -31,6 +34,36 @@ def init_db():
             created_at TEXT
         )
     """)
+    # миграция для уже существующих баз (добавились salary/documents/nationality/duration/notes)
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(vacancies)")}
+    for col in ("salary", "documents", "nationality", "duration", "notes"):
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE vacancies ADD COLUMN {col} TEXT")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def get_setting(key: str, default: str) -> str:
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
     conn.commit()
     conn.close()
 
@@ -47,17 +80,22 @@ def find_recent_duplicate(dedup_key: str, days: int = 3):
     return row
 
 
-def insert_vacancy(fields: dict, text: str, dedup_key: str) -> int:
+def insert_vacancy(fields: dict, dedup_key: str) -> int:
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO vacancies
-           (position, vessel, region, dates, rotation, contact, requirements,
-            hashtags, dedup_key, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
+           (position, vessel, region, nationality, dates, duration, rotation, salary,
+            documents, contact, requirements, notes, hashtags, dedup_key, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
         (
-            fields["position"], fields["vessel"], fields["region"],
-            fields["dates"], fields["rotation"], fields["contact"],
-            "\n".join(fields["requirements"]), fields["hashtags"],
+            fields.get("position"), fields.get("vessel"), fields.get("region"),
+            fields.get("nationality"), fields.get("date"), fields.get("duration"),
+            fields.get("rotation"), fields.get("salary"),
+            "\n".join(fields.get("documents") or []),
+            fields.get("contact"),
+            "\n".join(fields.get("requirements") or []),
+            fields.get("notes"),
+            fields.get("hashtags"),
             dedup_key, datetime.now().isoformat(),
         ),
     )
@@ -128,3 +166,20 @@ def weekly_stats(days: int = 7):
     ).fetchall()
     conn.close()
     return total, top
+
+
+def list_contacts():
+    """Уникальные контакты (email/агентства) из всех сохранённых вакансий,
+    с числом вакансий и датой последней публикации по каждому."""
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT contact,
+               COUNT(*) as vacancy_count,
+               MAX(created_at) as last_seen
+        FROM vacancies
+        WHERE contact IS NOT NULL AND contact != ''
+        GROUP BY LOWER(contact)
+        ORDER BY last_seen DESC
+    """).fetchall()
+    conn.close()
+    return rows
