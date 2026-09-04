@@ -1,15 +1,20 @@
 import asyncio
+import io
+import json
 import os
 import re
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
+import anthropic
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -22,152 +27,172 @@ import db
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BOT_USERNAME = os.getenv("BOT_USERNAME")  # без @, для диплинков счётчика кликов
+BOT_USERNAME = os.getenv("BOT_USERNAME")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "offshoreatsea")
 CHANNEL_ID = f"@{CHANNEL_USERNAME}"
 APPLY_BOT_LINK = os.getenv("APPLY_BOT_LINK", f"https://t.me/{CHANNEL_USERNAME}")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-DIGEST_TIMES = ["09:00", "14:00", "19:00"]  # время сервера — см. примечание в инструкции
+DIGEST_TIMES = ["09:00", "14:00", "19:00"]
 
 router = Router()
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ---------- Справочники ----------
+BATCH_EXTRACT_PROMPT = """You will receive a raw block of text pasted by a recruiter for an
+offshore/maritime job board. It may contain ONE or MULTIPLE separate job vacancy postings
+mashed together, in any language and any format — with explicit labels (Position:, Location:...),
+free-flowing prose, bulleted lists, or a mix. There is often NO reliable separator between
+postings: a new vacancy can start right after the previous one's contact email with just a
+period and a couple of spaces, or after a blank line, or after "---". Identify where each
+distinct vacancy starts and ends by meaning (a new job title / new "send your CV to" contact
+usually signals a new posting), then extract fields for each one separately.
 
-REGIONS = [
-    "UK", "United Kingdom", "Angola", "Nigeria", "Saudi Arabia", "ARAMCO",
-    "Finland", "USA", "US", "Norway", "Netherlands", "Qatar", "UAE",
-    "Worldwide", "Europe", "West Africa", "Ghana", "Egypt", "Brazil",
-]
-VESSEL_TYPES = [
-    "AHTS", "PSV", "OSV", "DP2", "DP3", "Jack Up", "Jackup", "Heavy Lift",
-    "Cable Lay", "Rock Installation", "Research Vessel",
-    "Diving Support Vessel", "Pipe Lay", "Construction Vessel",
-]
-BULLET_PREFIXES = ("•", "-", "*", "☑", "✓", "‣", "·")
+For each vacancy, extract:
+- position: short job title
+- vessel: vessel/rig type or name, or null
+- region: country/region/location, or null
+- nationality: nationality/citizenship requirement if stated, or null
+- date: joining/start date, or null
+- duration: overall contract length if stated separately from rotation (e.g. "28 days, one hitch",
+  "until end of 2026"), or null
+- rotation: rotation schedule (e.g. "12 weeks on / 12 weeks off"), or null
+- salary: salary or rate if mentioned, or null
+- documents: list of required certificates/documents/qualifications explicitly mentioned
+  (e.g. STCW, COC, BOSIET, medical certificate, visa, passport) — empty list if none stated
+- requirements: list of other requirements (experience, skills) — empty list if none stated
+- contact: how to apply (email or instruction), or null
+- notes: any OTHER important information stated in the posting that doesn't fit the fields
+  above — e.g. urgency ("urgent, immediate mobilization"), scope of work description, contract
+  type, number of positions, shift pattern details, anything a candidate would want to know.
+  Keep it short (1-3 sentences, or a few short bullet-style fragments joined with "; "). Do not
+  repeat information already captured in the other fields. Null if there's nothing extra to add.
+
+Translate every value into English regardless of source language. Never invent data — use null
+(or an empty list) for anything not stated.
+
+Return ONLY a JSON array, one object per distinct vacancy found, in the order they appear.
+If the text contains just one vacancy, return an array with a single object. No markdown
+fences, no commentary — just the JSON array.
+
+Text:
+---
+{text}
+---
+"""
 
 
 def slugify_tag(word: str) -> str:
     return "#" + re.sub(r"[^A-Za-z0-9]", "", word)
 
 
-def find_first(patterns: list[str], text: str) -> str | None:
-    for p in patterns:
-        if re.search(rf"\b{re.escape(p)}\b", text, re.IGNORECASE):
-            return p
-    return None
+def ai_parse_batch(raw: str) -> list[dict]:
+    fallback = [{
+        "position": raw.strip().split("\n")[0][:120] or "Vacancy",
+        "vessel": None, "region": None, "nationality": None, "date": None,
+        "duration": None, "rotation": None, "salary": None,
+        "documents": [], "requirements": [], "contact": None, "notes": None,
+    }]
+    try:
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4000,
+            messages=[{"role": "user", "content": BATCH_EXTRACT_PROMPT.format(text=raw)}],
+        )
+        content = resp.content[0].text.strip()
+        content = re.sub(r"^```(json)?|```$", "", content.strip(), flags=re.MULTILINE).strip()
+        data = json.loads(content)
+        if not isinstance(data, list):
+            data = [data]
+        if not data:
+            return fallback
+    except Exception:
+        return fallback
 
-
-def extract_email(text: str) -> str | None:
-    m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
-    return m.group(0) if m else None
-
-
-def extract_dates(text: str) -> str | None:
-    patterns = [
-        r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b",
-        r"\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|"
-        r"September|October|November|December)\s*\d{0,4}\b",
-    ]
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            return m.group(0)
-    return None
-
-
-def extract_rotation(text: str) -> str | None:
-    m = re.search(
-        r"\d+\s*(?:week|weeks|day|days)?\s*(?:on|ON)\s*/\s*\d+\s*(?:week|weeks|day|days)?\s*(?:off|OFF)",
-        text,
-    )
-    if m:
-        return m.group(0)
-    m = re.search(r"\d+/\d+\s*rotation", text, re.IGNORECASE)
-    return m.group(0) if m else None
-
-
-def extract_requirements(lines: list[str]) -> list[str]:
-    reqs = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(BULLET_PREFIXES):
-            cleaned = stripped.lstrip("".join(BULLET_PREFIXES)).strip()
-            if cleaned:
-                reqs.append(cleaned)
-    return reqs
-
-
-def parse_vacancy(raw: str) -> dict:
-    lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
-    full_text = raw
-
-    position = lines[0] if lines else "Вакансия"
-    vessel = find_first(VESSEL_TYPES, full_text)
-    region = find_first(REGIONS, full_text)
-    dates = extract_dates(full_text)
-    rotation = extract_rotation(full_text)
-    contact = extract_email(full_text)
-    requirements = extract_requirements(lines)
-
-    tags = []
-    if region:
-        tags.append(slugify_tag(region))
-    if vessel:
-        tags.append(slugify_tag(vessel))
-    hashtags = " ".join(tags)
-
-    return {
-        "position": position, "vessel": vessel, "region": region,
-        "dates": dates, "rotation": rotation, "contact": contact,
-        "requirements": requirements, "hashtags": hashtags,
-    }
+    for item in data:
+        tags = []
+        if item.get("region"):
+            tags.append(slugify_tag(item["region"]))
+        if item.get("vessel"):
+            tags.append(slugify_tag(item["vessel"]))
+        item["hashtags"] = " ".join(tags)
+    return data
 
 
 def render_template(fields: dict) -> str:
-    parts = [f"⚓ <b>{fields['position']}</b>", ""]
-    parts.append(f"🚢 Судно: {fields['vessel'] or '—'}")
-    parts.append(f"🌍 Регион: {fields['region'] or '—'}")
-    parts.append(f"📅 Дата: {fields['dates'] or '—'}")
-    parts.append(f"🔄 Ротация: {fields['rotation'] or '—'}")
+    def val(key):
+        v = fields.get(key)
+        return v if v else "—"
+
+    def as_list(key):
+        v = fields.get(key)
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str) and v.strip():
+            return [l for l in v.split("\n") if l.strip()]
+        return []
+
+    parts = [f"⚓ <b>{val('position')}</b>", ""]
+    parts.append(f"🚢 Vessel: {val('vessel')}")
+    parts.append(f"🌍 Region: {val('region')}")
+    parts.append(f"🛂 Nationality: {val('nationality')}")
+    parts.append(f"📅 Date: {val('date') if fields.get('date') else val('dates')}")
+    parts.append(f"⏱️ Duration: {val('duration')}")
+    parts.append(f"🔄 Rotation: {val('rotation')}")
+    parts.append(f"💰 Salary: {val('salary')}")
     parts.append("")
-    parts.append("✅ Требования:")
-    reqs = fields["requirements"] if isinstance(fields["requirements"], list) else \
-        [r for r in fields["requirements"].split("\n") if r]
-    if reqs:
-        for r in reqs:
-            parts.append(f"• {r}")
-    else:
-        parts.append("—")
+    parts.append("📄 Documents/Certificates:")
+    docs = as_list("documents")
+    parts += [f"• {d}" for d in docs] if docs else ["—"]
     parts.append("")
-    parts.append(f"📩 Контакт: {fields['contact'] or '—'}")
+    parts.append("✅ Requirements:")
+    reqs = as_list("requirements")
+    parts += [f"• {r}" for r in reqs] if reqs else ["—"]
+    if fields.get("notes"):
+        parts.append("")
+        parts.append(f"ℹ️ {fields['notes']}")
+    parts.append("")
+    parts.append(f"📩 Contact: {val('contact')}")
     if fields.get("hashtags"):
         parts.append("")
         parts.append(fields["hashtags"])
     return "\n".join(parts)
 
 
-def split_batch(text: str) -> list[str]:
-    parts = re.split(r"\n\s*[-=]{3,}\s*\n", text)
-    if len(parts) == 1:
-        parts = re.split(r"\n{3,}", text)
-    return [p.strip() for p in parts if p.strip()]
-
-
 def dedup_key_for(fields: dict) -> str:
-    return f"{fields['position'].strip().lower()}|{(fields['contact'] or '').strip().lower()}"
+    position = (fields.get("position") or "").strip().lower()
+    contact = (fields.get("contact") or "").strip().lower()
+    return f"{position}|{contact}"
+
+
+
+def extract_email(text: str) -> str | None:
+    m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text or "")
+    return m.group(0).rstrip(".") if m else None
 
 
 def apply_button_url(vacancy_id: int) -> str:
-    # диплинк на самого бота — так можно посчитать клик перед тем, как отдать реальную ссылку
     return f"https://t.me/{BOT_USERNAME}?start=apply_{vacancy_id}"
 
 
-def channel_keyboard(vacancy_id: int, post_link: str | None, title: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="📩 Откликнуться", url=apply_button_url(vacancy_id))]]
+def resolve_apply_url(fields: dict, vacancy_id: int) -> str:
+    email = extract_email(fields.get("contact"))
+    if email:
+        subject = quote(f"Application - {fields.get('position') or 'Vacancy'}")
+        return f"mailto:{email}?subject={subject}"
+    # нет email в контакте (например инструкция вместо адреса) — путь через бота
+    # с подсчётом кликов и остаётся рабочим запасным вариантом
+    return apply_button_url(vacancy_id)
+
+
+def channel_keyboard(fields: dict, vacancy_id: int, post_link: str | None, title: str) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton(text="📩 Apply", url=resolve_apply_url(fields, vacancy_id)),
+        InlineKeyboardButton(text="📢 Channel", url=f"https://t.me/{CHANNEL_USERNAME}"),
+    ]]
     if post_link:
         share_url = "https://t.me/share/url?url=" + quote(post_link) + "&text=" + quote(title)
-        rows.append([InlineKeyboardButton(text="↗️ Поделиться", url=share_url)])
+        rows.append([InlineKeyboardButton(text="↗️ Share", url=share_url)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -192,6 +217,10 @@ def admin_only(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+def is_auto_publish() -> bool:
+    return db.get_setting("auto_publish", "off") == "on"
+
+
 def next_digest_slot() -> datetime:
     now = datetime.now()
     for t in DIGEST_TIMES:
@@ -206,31 +235,29 @@ def next_digest_slot() -> datetime:
 async def do_publish(bot: Bot, vacancy_id: int):
     row = db.get_vacancy(vacancy_id)
     fields = dict(row)
-    fields["requirements"] = fields["requirements"]  # уже строка из БД, render_template это учитывает
     text = render_template(fields)
 
     sent = await bot.send_message(
         chat_id=CHANNEL_ID, text=text,
-        reply_markup=channel_keyboard(vacancy_id, None, fields["position"]),
+        reply_markup=channel_keyboard(fields, vacancy_id, None, fields["position"] or "Vacancy"),
     )
     post_link = f"https://t.me/{CHANNEL_USERNAME}/{sent.message_id}"
     await bot.edit_message_reply_markup(
         chat_id=CHANNEL_ID, message_id=sent.message_id,
-        reply_markup=channel_keyboard(vacancy_id, post_link, fields["position"]),
+        reply_markup=channel_keyboard(fields, vacancy_id, post_link, fields["position"] or "Vacancy"),
     )
     db.set_status(vacancy_id, "published", sent.message_id)
 
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
-    # обработка диплинка счётчика кликов: /start apply_<id>
     if command.args and command.args.startswith("apply_"):
         vacancy_id = int(command.args.replace("apply_", ""))
         db.increment_clicks(vacancy_id)
         await message.answer(
-            "Переход на форму отклика:",
+            "Open the application form:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="Открыть", url=APPLY_BOT_LINK)
+                InlineKeyboardButton(text="Open", url=APPLY_BOT_LINK)
             ]]),
         )
         return
@@ -238,9 +265,14 @@ async def cmd_start(message: Message, command: CommandObject):
     if not admin_only(message.from_user.id):
         await message.answer("Бот приватный.")
         return
+    mode = "включена" if is_auto_publish() else "выключена"
     await message.answer(
-        "Пришлите текст вакансии в свободной форме (или пачку через ---).\n"
-        "Команды: /stats — сводка за неделю."
+        "Пришлите текст вакансии в любом формате (или пачку через ---).\n"
+        "Команды:\n"
+        "/stats — сводка за неделю\n"
+        "/contacts — список email/агентств из сохранённых вакансий\n"
+        "/testchannel — проверить доступ бота к каналу\n"
+        f"/autopublish on|off — автопубликация без подтверждения (сейчас {mode})"
     )
 
 
@@ -252,7 +284,53 @@ async def cmd_stats(message: Message):
     lines = [f"За последние 7 дней опубликовано: {total}", "", "Топ по кликам:"]
     for row in top:
         lines.append(f"• {row['position']} — {row['clicks']} кликов")
-    await message.answer("\n".join(lines) or "Пока нет данных.")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("contacts"))
+async def cmd_contacts(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    rows = db.list_contacts()
+    if not rows:
+        await message.answer("Пока нет сохранённых контактов.")
+        return
+
+    lines = [f"Уникальных контактов: {len(rows)}", ""]
+    for row in rows:
+        last_seen = (row["last_seen"] or "")[:10]
+        lines.append(f"{row['contact']} — вакансий: {row['vacancy_count']}, последняя: {last_seen}")
+    text = "\n".join(lines)
+
+    if len(text) <= 3500:
+        await message.answer(text)
+    else:
+        # слишком длинный список для одного сообщения — отдаём файлом
+        buf = io.BytesIO(text.encode("utf-8"))
+        buf.name = "contacts.txt"
+        await message.answer_document(BufferedInputFile(buf.read(), filename="contacts.txt"))
+
+
+@router.message(Command("autopublish"))
+async def cmd_autopublish(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    arg = (command.args or "").strip().lower()
+    if arg not in ("on", "off"):
+        mode = "включена" if is_auto_publish() else "выключена"
+        await message.answer(
+            f"Автопубликация сейчас {mode}.\nЧтобы переключить: /autopublish on или /autopublish off"
+        )
+        return
+    db.set_setting("auto_publish", arg)
+    if arg == "on":
+        await message.answer(
+            "✅ Автопубликация включена.\n"
+            "Вакансии без обнаруженных дублей будут публиковаться сразу, без превью.\n"
+            "Подозрение на дубликат всё равно потребует вашего подтверждения."
+        )
+    else:
+        await message.answer("Автопубликация выключена — снова буду спрашивать подтверждение.")
 
 
 @router.message(F.text & ~F.text.startswith("/"))
@@ -260,31 +338,75 @@ async def handle_vacancy_text(message: Message):
     if not admin_only(message.from_user.id):
         return
 
-    for raw in split_batch(message.text):
-        fields = parse_vacancy(raw)
+    status_msg = await message.answer("Разбираю...")
+    auto = is_auto_publish()
+    for fields in ai_parse_batch(message.text):
         key = dedup_key_for(fields)
         dup = db.find_recent_duplicate(key)
 
-        vacancy_id = db.insert_vacancy(fields, render_template(fields), key)
+        vacancy_id = db.insert_vacancy(fields, key)
         text = render_template(fields)
 
         if dup:
+            # дубликат всегда требует ручного подтверждения, даже в режиме автопубликации
             warn = (
                 f"⚠️ Похоже, такая вакансия уже публиковалась "
                 f"{dup['created_at'][:10]} (id {dup['id']}).\n\n{text}"
             )
             await message.answer(warn, reply_markup=duplicate_keyboard(vacancy_id))
+            continue
+
+        if auto:
+            try:
+                await do_publish(message.bot, vacancy_id)
+                await message.answer(text + "\n\n✅ Опубликовано автоматически")
+            except TelegramAPIError as e:
+                await message.answer(
+                    f"❌ Не удалось опубликовать автоматически: {e}\n\n{text}",
+                    reply_markup=draft_keyboard(vacancy_id),
+                )
         else:
             await message.answer(
                 text + "\n\n<i>Опубликовать сейчас или поставить в очередь дайджеста?</i>",
                 reply_markup=draft_keyboard(vacancy_id),
             )
+    await status_msg.delete()
+
+
+@router.message(Command("testchannel"))
+async def cmd_testchannel(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    try:
+        chat = await message.bot.get_chat(CHANNEL_ID)
+        member = await message.bot.get_chat_member(CHANNEL_ID, message.bot.id)
+        can_post = getattr(member, "can_post_messages", None)
+        status_line = f"Статус бота в канале: {member.status}"
+        if can_post is not None:
+            status_line += f", право «Публикация сообщений»: {'да' if can_post else 'НЕТ'}"
+        await message.answer(
+            f"✅ Вижу канал: {chat.title} ({CHANNEL_ID})\n{status_line}"
+        )
+    except TelegramAPIError as e:
+        await message.answer(
+            f"❌ Не могу получить доступ к {CHANNEL_ID}: {e}\n\n"
+            f"Проверьте CHANNEL_USERNAME в .env и что бот добавлен админом канала."
+        )
 
 
 @router.callback_query(F.data.startswith("pub:"))
 async def cb_publish(callback: CallbackQuery):
     vacancy_id = int(callback.data.split(":")[1])
-    await do_publish(callback.bot, vacancy_id)
+    try:
+        await do_publish(callback.bot, vacancy_id)
+    except TelegramAPIError as e:
+        await callback.message.answer(
+            f"❌ Не удалось опубликовать: {e}\n\n"
+            f"Частая причина — бот не админ канала {CHANNEL_ID} "
+            f"или у него нет права «Публикация сообщений»."
+        )
+        await callback.answer("Ошибка публикации")
+        return
     await callback.message.edit_text(callback.message.html_text + "\n\n✅ Опубликовано")
     await callback.answer("Опубликовано в канал")
 
@@ -312,7 +434,10 @@ async def digest_worker(bot: Bot):
     while True:
         due = db.get_due_queue(datetime.now().isoformat())
         for row in due:
-            await do_publish(bot, row["id"])
+            try:
+                await do_publish(bot, row["id"])
+            except TelegramAPIError:
+                pass
         await asyncio.sleep(60)
 
 
