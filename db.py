@@ -34,11 +34,20 @@ def init_db():
             created_at TEXT
         )
     """)
-    # миграция для уже существующих баз (добавились salary/documents/nationality/duration/notes)
+    # миграция для уже существующих баз (добавились salary/documents/nationality/duration/notes/raw_text)
     existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(vacancies)")}
-    for col in ("salary", "documents", "nationality", "duration", "notes"):
+    for col in ("salary", "documents", "nationality", "duration", "notes", "raw_text"):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE vacancies ADD COLUMN {col} TEXT")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS corrections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            original_text TEXT,
+            corrected_fields TEXT,
+            created_at TEXT
+        )
+    """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS settings (
@@ -80,13 +89,14 @@ def find_recent_duplicate(dedup_key: str, days: int = 3):
     return row
 
 
-def insert_vacancy(fields: dict, dedup_key: str) -> int:
+def insert_vacancy(fields: dict, dedup_key: str, raw_text: str = "") -> int:
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO vacancies
            (position, vessel, region, nationality, dates, duration, rotation, salary,
-            documents, contact, requirements, notes, hashtags, dedup_key, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
+            documents, contact, requirements, notes, hashtags, dedup_key, raw_text,
+            status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
         (
             fields.get("position"), fields.get("vessel"), fields.get("region"),
             fields.get("nationality"), fields.get("date"), fields.get("duration"),
@@ -96,7 +106,7 @@ def insert_vacancy(fields: dict, dedup_key: str) -> int:
             "\n".join(fields.get("requirements") or []),
             fields.get("notes"),
             fields.get("hashtags"),
-            dedup_key, datetime.now().isoformat(),
+            dedup_key, raw_text, datetime.now().isoformat(),
         ),
     )
     conn.commit()
@@ -166,6 +176,26 @@ def weekly_stats(days: int = 7):
     ).fetchall()
     conn.close()
     return total, top
+
+
+def insert_correction(original_text: str, corrected_fields_json: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO corrections (original_text, corrected_fields, created_at) VALUES (?, ?, ?)",
+        (original_text, corrected_fields_json, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_corrections(limit: int = 3):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT original_text, corrected_fields FROM corrections ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 def list_contacts():
