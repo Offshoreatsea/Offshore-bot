@@ -195,12 +195,19 @@ def create_app(bot, bot_token: str) -> web.Application:
 
         return web.json_response({"ok": True})
 
+    async def handle_index(request: web.Request) -> web.Response:
+        # без этого голый домен (WEBAPP_URL без /index.html на конце) отдавал
+        # 403 Forbidden — статический хендлер ниже не умеет сам подставлять
+        # index.html для корневого пути
+        return web.FileResponse(STATIC_DIR / "index.html")
+
     app.router.add_get("/api/filters", handle_filters)
     app.router.add_get("/api/vacancies", handle_vacancies)
     app.router.add_post("/api/apply", handle_apply)
     app.router.add_get("/api/profile", handle_get_profile)
     app.router.add_post("/api/profile", handle_post_profile)
     app.router.add_get("/api/applications", handle_my_applications)
+    app.router.add_get("/", handle_index)
     app.router.add_static("/", STATIC_DIR, show_index=False)
     return app
 
