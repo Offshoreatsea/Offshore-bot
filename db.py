@@ -64,6 +64,20 @@ def init_db():
     """)
 
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS candidates (
+            tg_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            nationality TEXT,
+            current_rank TEXT,
+            vessel_types TEXT,
+            years_experience TEXT,
+            availability TEXT,
+            documents TEXT,
+            updated_at TEXT
+        )
+    """)
+
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -451,6 +465,55 @@ def list_recent_applications(limit: int = 20):
     ).fetchall()
     conn.close()
     return rows
+
+
+def get_applications_for_candidate(candidate_tg_id: int, limit: int = 50):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT applications.*, vacancies.position AS vacancy_position,
+                  vacancies.vessel AS vacancy_vessel
+           FROM applications
+           LEFT JOIN vacancies ON vacancies.id = applications.vacancy_id
+           WHERE applications.candidate_tg_id = ?
+           ORDER BY applications.id DESC LIMIT ?""",
+        (candidate_tg_id, limit),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_candidate_profile(tg_id: int):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM candidates WHERE tg_id = ?", (tg_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def upsert_candidate_profile(tg_id: int, fields: dict):
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO candidates
+           (tg_id, full_name, nationality, current_rank, vessel_types,
+            years_experience, availability, documents, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(tg_id) DO UPDATE SET
+               full_name = excluded.full_name,
+               nationality = excluded.nationality,
+               current_rank = excluded.current_rank,
+               vessel_types = excluded.vessel_types,
+               years_experience = excluded.years_experience,
+               availability = excluded.availability,
+               documents = excluded.documents,
+               updated_at = excluded.updated_at""",
+        (
+            tg_id, fields.get("full_name"), fields.get("nationality"),
+            fields.get("current_rank"), fields.get("vessel_types"),
+            fields.get("years_experience"), fields.get("availability"),
+            fields.get("documents"), datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
 
 
 def list_contacts():
