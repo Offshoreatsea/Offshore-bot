@@ -18,11 +18,14 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MenuButtonWebApp,
     Message,
+    WebAppInfo,
 )
 from dotenv import load_dotenv
 
 import db
+import webapp
 
 load_dotenv()
 
@@ -35,8 +38,32 @@ CHANNEL_LINK = os.getenv("CHANNEL_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 APPLY_BOT_LINK = os.getenv("APPLY_BOT_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 CONSULT_LINK = os.getenv("CONSULT_LINK", "https://t.me/Offshore_atsea")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+WEBAPP_URL = os.getenv("WEBAPP_URL")  # публичный https-адрес мини-приложения, см. README
+PORT = int(os.getenv("PORT", "8080"))
 
 DIGEST_TIMES = ["09:00", "14:00", "19:00"]
+
+# Фиксированный список должностей — единственный источник правды для тегов
+# #Position и для матчинга в /subscribe. Если встретится реально новая
+# должность, которой тут нет, — просто допишите строку в список, ничего
+# больше менять не нужно.
+RANK_TAGS = [
+    "Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "DeckCadet",
+    "ChiefEngineer", "SecondEngineer", "ThirdEngineer", "FourthEngineer", "EngineCadet",
+    "ETO", "Electrician", "Bosun", "AB", "OS", "Motorman", "Oiler", "Fitter", "Cook", "Steward",
+    "CraneOperator", "DPOperator", "ROVPilot", "Rigger", "Welder", "Scaffolder",
+    "ClientRepresentative", "SafetyOfficer", "Surveyor",
+]
+
+# Фиксированный список типов судов — тоже единый источник правды для тегов
+# и матчинга.
+VESSEL_TAGS = [
+    "Tanker", "Container", "Bulk", "LNG", "LPG", "Chemical",
+    "Offshore", "OSV", "CSV", "DSV", "MPV", "MPSV", "AHTS", "PSV", "SOV",
+    "CableLayer", "Dredger", "Cruise", "RoRo", "Ferry", "Yacht", "FPSO", "JackUp",
+]
+
+FALLBACK_TAG = "Other"
 
 router = Router()
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -111,8 +138,17 @@ distinct vacancy starts and ends by meaning (a new job title / new "send your CV
 usually signals a new posting), then extract fields for each one separately.
 
 For each vacancy, extract:
-- position: short job title
-- vessel: vessel/rig type or name, or null
+- position: short job title, as written/implied in the source (human-readable, keep natural
+  wording, e.g. "Chief Engineer", "2nd Officer")
+- position_tag: map the position to EXACTLY ONE tag from this fixed list (pick the closest
+  match, e.g. "2/O" or "Second Mate" -> "SecondOfficer"; "Electro-Technical Officer" -> "ETO"):
+  {rank_tags}
+  If truly nothing in the list fits, use "Other".
+- vessel: vessel/rig type or name, as written/implied in the source, or null
+- vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list (e.g. "OSV",
+  "Offshore Support Vessel", "supply vessel" -> "OSV"; "product tanker" -> "Tanker"):
+  {vessel_tags}
+  If vessel type isn't stated or nothing fits, use "Other".
 - region: country/region/location, or null
 - nationality: nationality/citizenship requirement if stated, or null
 - date: joining/start date, or null
@@ -136,7 +172,9 @@ For each vacancy, extract:
   Keep it short (1-3 sentences, or a few short bullet-style fragments joined with "; "). Do not
   repeat information already captured in the other fields. Null if there's nothing extra to add.
 
-Translate every value into English regardless of source language. Never invent data — use null
+Translate every value into English regardless of source language. position_tag and vessel_tag
+are ALWAYS one of the exact English strings from the lists above, regardless of the source
+post's language — never translate or invent a new tag string. Never invent data — use null
 (or an empty list) for anything not stated.
 
 Return ONLY a JSON array, one object per distinct vacancy found, in the order they appear.
@@ -184,7 +222,10 @@ def ai_parse_batch(raw: str) -> list[dict]:
             max_tokens=8000,
             messages=[{
                 "role": "user",
-                "content": BATCH_EXTRACT_PROMPT.format(text=raw, examples=build_few_shot_examples()),
+                "content": BATCH_EXTRACT_PROMPT.format(
+                    text=raw, examples=build_few_shot_examples(),
+                    rank_tags=", ".join(RANK_TAGS), vessel_tags=", ".join(VESSEL_TAGS),
+                ),
             }],
         )
         content = resp.content[0].text.strip()
@@ -208,12 +249,18 @@ def ai_parse_batch(raw: str) -> list[dict]:
         return fallback
 
     for item in data:
-        tags = []
-        if item.get("region"):
-            tags.append(slugify_tag(item["region"]))
-        if item.get("vessel"):
-            tags.append(slugify_tag(item["vessel"]))
-        item["hashtags"] = " ".join(tags)
+        # модель иногда всё равно может вернуть что-то не из списка (опечатка,
+        # синоним) — подстраховываемся: если тега нет в фиксированном списке,
+        # откатываемся на Other, а не тащим в канал произвольный текст как тег
+        position_tag = item.get("position_tag") or FALLBACK_TAG
+        if position_tag not in RANK_TAGS:
+            position_tag = FALLBACK_TAG
+        vessel_tag = item.get("vessel_tag") or FALLBACK_TAG
+        if vessel_tag not in VESSEL_TAGS:
+            vessel_tag = FALLBACK_TAG
+        item["position_tag"] = position_tag
+        item["vessel_tag"] = vessel_tag
+        item["hashtags"] = f"#{position_tag} #{vessel_tag}"
     return data
 
 
@@ -321,13 +368,24 @@ def draft_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="Опубликовать сейчас", callback_data=f"pub:{vacancy_id}"),
-            InlineKeyboardButton(text="В очередь (дайджест)", callback_data=f"queue:{vacancy_id}"),
+            InlineKeyboardButton(text="В очередь", callback_data=f"queue:{vacancy_id}"),
         ],
         [
             InlineKeyboardButton(text="✏️ Исправить", callback_data=f"fix:{vacancy_id}"),
             InlineKeyboardButton(text="Отмена", callback_data=f"cancel:{vacancy_id}"),
         ],
     ])
+
+
+def queue_delay_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
+    # выбор задержки показывается только ПОСЛЕ нажатия «В очередь» —
+    # ничего не публикуется и не планируется до этого второго нажатия
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="1ч", callback_data=f"queuedelay:{vacancy_id}:1"),
+        InlineKeyboardButton(text="2ч", callback_data=f"queuedelay:{vacancy_id}:2"),
+        InlineKeyboardButton(text="6ч", callback_data=f"queuedelay:{vacancy_id}:6"),
+        InlineKeyboardButton(text="12ч", callback_data=f"queuedelay:{vacancy_id}:12"),
+    ]])
 
 
 def duplicate_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
@@ -372,6 +430,14 @@ async def do_publish(bot: Bot, vacancy_id: int):
     )
     db.set_status(vacancy_id, "published", sent.message_id)
 
+    # публикация в канал уже состоялась и подтверждена выше — рассылка
+    # подписчикам оборачивается отдельно, чтобы её сбой ни в коем случае
+    # не выглядел как ошибка самой публикации
+    try:
+        await notify_subscribers(bot, vacancy_id, fields)
+    except Exception as e:
+        print(f"[do_publish] Рассылка подписчикам не удалась (публикация в канал прошла успешно): {e}")
+
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
@@ -385,7 +451,7 @@ async def cmd_start(message: Message, command: CommandObject):
         if email:
             # обычный текст с email — Telegram сам делает его кликабельным
             # (открывает почтовый клиент), в отличие от кнопки с mailto:
-            await message.answer(f"Отправьте резюме на: {email}")
+            await message.answer(f"Send your CV to: {email}")
         elif url:
             # у вакансии своя собственная ссылка для отклика (например разные
             # ссылки на каждую позицию в одном посте) — https, кнопка разрешена
@@ -399,15 +465,15 @@ async def cmd_start(message: Message, command: CommandObject):
             # контакт есть, но это не email и не ссылка — например текстовая
             # инструкция ("напишите в личку @agency"). Показываем как есть,
             # вместо кнопки в никуда.
-            await message.answer(f"Как откликнуться: {contact.strip()}")
+            await message.answer(f"How to apply: {contact.strip()}")
         else:
             # у вакансии вообще нет контакта в тексте — честно говорим об
             # этом, а не показываем кнопку "Open", ведущую в общий канал
             await message.answer(
-                "В этой вакансии не указан прямой контакт для отклика. "
-                "Уточните у администратора канала.",
+                "No direct contact is listed for this vacancy. "
+                "Please contact the channel admin.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="Написать администратору", url=CONSULT_LINK)
+                    InlineKeyboardButton(text="Contact admin", url=CONSULT_LINK)
                 ]]),
             )
         return
@@ -419,22 +485,48 @@ async def cmd_start(message: Message, command: CommandObject):
     await message.answer(
         "Пришлите текст вакансии в любом формате (или пачку через ---).\n"
         "Команды:\n"
-        "/stats — сводка за неделю\n"
+        "/stats — сводка за сегодня (/stats 7 — за 7 дней)\n"
         "/contacts — список email/агентств из сохранённых вакансий\n"
         "/testchannel — проверить доступ бота к каналу\n"
         "/ad — опубликовать рекламный пост с кнопкой «Консультация»\n"
+        "/search — открыть поиск вакансий с фильтрами (мини-приложение)\n"
+        "/applications — последние отклики через мини-приложение\n"
+        "/subscribe — команда для кандидатов: подписка на вакансии по должности "
+        "(доступна любому, не только вам)\n"
         f"/autopublish on|off — автопубликация без подтверждения (сейчас {mode})"
     )
 
 
 @router.message(Command("stats"))
-async def cmd_stats(message: Message):
+async def cmd_stats(message: Message, command: CommandObject):
     if not admin_only(message.from_user.id):
         return
-    total, top = db.weekly_stats(7)
-    lines = [f"За последние 7 дней опубликовано: {total}", "", "Топ по кликам:"]
-    for row in top:
-        lines.append(f"• {row['position']} — {row['clicks']} кликов")
+    # /stats — сводка за сегодня (по умолчанию); /stats 7 — за последние 7 дней
+    arg = (command.args or "").strip()
+    days = int(arg) if arg.isdigit() else 1
+    period_label = "сегодня" if days == 1 else f"последние {days} дней"
+
+    s = db.daily_stats(days)
+    lines = [f"📊 Статистика за {period_label}", "", f"Опубликовано вакансий: {s['total']}"]
+
+    if s["by_position"]:
+        lines.append("")
+        lines.append("По должностям:")
+        lines += [f"• {row['tag']} — {row['c']}" for row in s["by_position"]]
+
+    lines.append("")
+    if s["peak_hour"]:
+        lines.append(f"Пик активности по откликам: {s['peak_hour']}:00 UTC")
+    else:
+        lines.append("Пик активности по откликам: пока нет данных за период")
+
+    if s["top_post"]:
+        lines.append(f"Самый кликабельный пост: «{s['top_post']['position']}» — {s['top_post']['clicks']} кликов")
+
+    lines.append("")
+    lines.append("Точное число просмотров поста Telegram боту не отдаёт — это видно "
+                  "только во встроенной статистике канала (иконка 👁 под постом).")
+
     await message.answer("\n".join(lines))
 
 
@@ -491,9 +583,22 @@ def ad_keyboard(ad_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+def subscribe_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for tag in RANK_TAGS:
+        row.append(InlineKeyboardButton(text=tag, callback_data=f"subpos:{tag}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def consult_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🤝 Консультация", url=CONSULT_LINK)
+        InlineKeyboardButton(text="🤝 Consultation", url=CONSULT_LINK)
     ]])
 
 
@@ -574,6 +679,98 @@ async def cmd_ad(message: Message):
     )
 
 
+@router.message(Command("subscribe"))
+async def cmd_subscribe(message: Message):
+    # доступно всем, не только админу — это функция для кандидатов, не для
+    # управления каналом
+    await message.answer(
+        "Choose your position — I'll send matching vacancies from the last 3 days, "
+        "then new ones as they're posted:",
+        reply_markup=subscribe_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("subpos:"))
+async def cb_subscribe_position(callback: CallbackQuery):
+    position_tag = callback.data.split(":", 1)[1]
+    tg_id = callback.from_user.id
+    db.upsert_subscriber(tg_id, position_tag, callback.from_user.username)
+    await callback.message.edit_text(f"✅ Subscribed to {position_tag}. Sending recent vacancies...")
+    await callback.answer()
+
+    backfill = db.get_recent_published_by_tag(position_tag, days=3)
+    if not backfill:
+        await callback.bot.send_message(
+            tg_id, f"No {position_tag} vacancies in the last 3 days yet — "
+                   "you'll get the next one as soon as it's posted."
+        )
+        return
+    for row in backfill:
+        fields = dict(row)
+        try:
+            await callback.bot.send_message(
+                tg_id, render_template(fields),
+                reply_markup=channel_keyboard(fields, row["id"], None, fields["position"] or "Vacancy"),
+            )
+            await asyncio.sleep(0.3)  # не спамим Telegram API пачкой без пауз
+        except TelegramAPIError:
+            pass
+
+
+async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
+    """Дублирует свежеопубликованную вакансию в личку подписчикам с таким же
+    position_tag. Вызывается ПОСЛЕ успешной публикации в канал и полностью
+    изолирована try/except-ом на уровне вызова — сбой рассылки никак не
+    должен влиять на основную публикацию, которая на этот момент уже прошла."""
+    position_tag = fields.get("position_tag")
+    if not position_tag or position_tag == FALLBACK_TAG:
+        return
+    for tg_id in db.get_subscribers_for_tag(position_tag):
+        try:
+            await bot.send_message(
+                tg_id, render_template(fields),
+                reply_markup=channel_keyboard(fields, vacancy_id, None, fields.get("position") or "Vacancy"),
+            )
+            await asyncio.sleep(0.1)
+        except TelegramAPIError:
+            pass
+
+
+@router.message(Command("search"))
+async def cmd_search(message: Message):
+    if not WEBAPP_URL:
+        await message.answer(
+            "Job search isn't set up yet (WEBAPP_URL missing). "
+            "Check the channel directly for vacancies."
+        )
+        return
+    await message.answer(
+        "Search vacancies by position, vessel or region:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔍 Open search", web_app=WebAppInfo(url=WEBAPP_URL))
+        ]]),
+    )
+
+
+@router.message(Command("applications"))
+async def cmd_applications(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    rows = db.list_recent_applications(20)
+    if not rows:
+        await message.answer("Пока нет откликов через мини-приложение.")
+        return
+    lines = ["Последние отклики:", ""]
+    for row in rows:
+        when = (row["created_at"] or "")[:16].replace("T", " ")
+        username = f" (@{row['candidate_username']})" if row["candidate_username"] else ""
+        lines.append(
+            f"• {row['vacancy_position'] or 'вакансия'} — {row['candidate_name'] or '—'}{username}\n"
+            f"  {row['contact']} · {when}"
+        )
+    await message.answer("\n".join(lines))
+
+
 @router.callback_query(F.data.startswith("adpub:"))
 async def cb_ad_publish(callback: CallbackQuery):
     ad_id = int(callback.data.split(":")[1])
@@ -635,10 +832,18 @@ async def cb_publish(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("queue:"))
 async def cb_queue(callback: CallbackQuery):
     vacancy_id = int(callback.data.split(":")[1])
-    slot = next_digest_slot()
+    await callback.message.edit_reply_markup(reply_markup=queue_delay_keyboard(vacancy_id))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("queuedelay:"))
+async def cb_queue_delay(callback: CallbackQuery):
+    _, vacancy_id_str, hours_str = callback.data.split(":")
+    vacancy_id, hours = int(vacancy_id_str), int(hours_str)
+    slot = datetime.now() + timedelta(hours=hours)
     db.set_schedule(vacancy_id, slot.isoformat())
     await callback.message.edit_text(
-        callback.message.html_text + f"\n\n🕒 В очереди, выйдет в {slot.strftime('%H:%M %d.%m')}"
+        callback.message.html_text + f"\n\n🕒 В очереди, выйдет в {slot.strftime('%H:%M %d.%m')} (через {hours}ч)"
     )
     await callback.answer("Добавлено в очередь")
 
@@ -679,6 +884,18 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     asyncio.create_task(digest_worker(bot))
+
+    if WEBAPP_URL:
+        asyncio.create_task(webapp.run_web_server(bot, BOT_TOKEN, PORT))
+        try:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="Jobs", web_app=WebAppInfo(url=WEBAPP_URL))
+            )
+        except TelegramAPIError as e:
+            print(f"[main] Не удалось установить кнопку меню мини-приложения: {e}")
+    else:
+        print("[main] WEBAPP_URL не задан — мини-приложение (поиск вакансий) не запущено")
+
     await dp.start_polling(bot)
 
 
