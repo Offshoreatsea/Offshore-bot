@@ -84,6 +84,25 @@ def init_db():
         conn.execute("ALTER TABLE subscribers ADD COLUMN language TEXT")
 
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            tg_id INTEGER,
+            position_tag TEXT,
+            subscribed_at TEXT,
+            PRIMARY KEY (tg_id, position_tag)
+        )
+    """)
+    # миграция: у старых подписчиков одна должность лежала прямо в subscribers.position_tag —
+    # переносим её в новую таблицу, чтобы человек не терял подписку при переходе на мульти-выбор
+    legacy = conn.execute(
+        "SELECT tg_id, position_tag FROM subscribers WHERE position_tag IS NOT NULL AND position_tag != ''"
+    ).fetchall()
+    for row in legacy:
+        conn.execute(
+            "INSERT OR IGNORE INTO subscriptions (tg_id, position_tag, subscribed_at) VALUES (?, ?, ?)",
+            (row["tg_id"], row["position_tag"], datetime.now().isoformat()),
+        )
+
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS click_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             vacancy_id INTEGER,
@@ -262,23 +281,20 @@ def daily_stats(days: int = 1):
     }
 
 
-def upsert_subscriber(tg_id: int, username: str | None, position_tag: str | None = None,
-                       language: str | None = None):
-    """Обновляет только переданные поля — вызывается и с шага выбора языка
-    (position_tag ещё нет), и с шага выбора должности (language уже есть)."""
+def upsert_subscriber(tg_id: int, username: str | None, language: str | None = None):
+    """Хранит только язык и username — сами должности теперь в отдельной
+    таблице subscriptions (много-ко-многим), см. toggle_subscription()."""
     conn = get_conn()
     existing = conn.execute("SELECT * FROM subscribers WHERE tg_id = ?", (tg_id,)).fetchone()
-    final_position = position_tag if position_tag is not None else (existing["position_tag"] if existing else None)
     final_language = language if language is not None else (existing["language"] if existing else None)
     conn.execute(
-        """INSERT INTO subscribers (tg_id, position_tag, username, language, subscribed_at)
-           VALUES (?, ?, ?, ?, ?)
+        """INSERT INTO subscribers (tg_id, username, language, subscribed_at)
+           VALUES (?, ?, ?, ?)
            ON CONFLICT(tg_id) DO UPDATE SET
-               position_tag = excluded.position_tag,
                username = excluded.username,
                language = excluded.language,
                subscribed_at = excluded.subscribed_at""",
-        (tg_id, final_position, username, final_language, datetime.now().isoformat()),
+        (tg_id, username, final_language, datetime.now().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -291,12 +307,45 @@ def get_subscriber_language(tg_id: int) -> str | None:
     return row["language"] if row else None
 
 
+def toggle_subscription(tg_id: int, position_tag: str) -> bool:
+    """Переключает подписку на должность (добавляет, если не было — убирает,
+    если уже была). Возвращает True, если после вызова подписка ДОБАВЛЕНА
+    (значит нужно прислать бэкфилл), False — если снята."""
+    conn = get_conn()
+    existing = conn.execute(
+        "SELECT 1 FROM subscriptions WHERE tg_id = ? AND position_tag = ?", (tg_id, position_tag)
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "DELETE FROM subscriptions WHERE tg_id = ? AND position_tag = ?", (tg_id, position_tag)
+        )
+        added = False
+    else:
+        conn.execute(
+            "INSERT INTO subscriptions (tg_id, position_tag, subscribed_at) VALUES (?, ?, ?)",
+            (tg_id, position_tag, datetime.now().isoformat()),
+        )
+        added = True
+    conn.commit()
+    conn.close()
+    return added
+
+
+def get_subscriber_positions(tg_id: int) -> list[str]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT position_tag FROM subscriptions WHERE tg_id = ? ORDER BY position_tag", (tg_id,)
+    ).fetchall()
+    conn.close()
+    return [r["position_tag"] for r in rows]
+
+
 def subscriber_stats():
     conn = get_conn()
     total = conn.execute("SELECT COUNT(*) c FROM subscribers").fetchone()["c"]
     by_tag = conn.execute(
-        """SELECT COALESCE(position_tag, 'not chosen yet') AS tag, COUNT(*) c
-           FROM subscribers GROUP BY tag ORDER BY c DESC"""
+        """SELECT position_tag AS tag, COUNT(*) c
+           FROM subscriptions GROUP BY tag ORDER BY c DESC"""
     ).fetchall()
     conn.close()
     return total, by_tag
@@ -305,7 +354,7 @@ def subscriber_stats():
 def get_subscribers_for_tag(position_tag: str):
     conn = get_conn()
     rows = conn.execute(
-        "SELECT tg_id FROM subscribers WHERE position_tag = ?", (position_tag,)
+        "SELECT tg_id FROM subscriptions WHERE position_tag = ?", (position_tag,)
     ).fetchall()
     conn.close()
     return [r["tg_id"] for r in rows]
