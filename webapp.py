@@ -46,7 +46,9 @@ def vacancy_to_dict(row) -> dict:
     return {
         "id": row["id"],
         "position": row["position"],
+        "position_tag": row["position_tag"],
         "vessel": row["vessel"],
+        "vessel_tag": row["vessel_tag"],
         "region": row["region"],
         "nationality": row["nationality"],
         "date": row["dates"],
@@ -73,6 +75,73 @@ async def handle_vacancies(request: web.Request) -> web.Response:
 
 def create_app(bot, bot_token: str) -> web.Application:
     app = web.Application()
+
+    def get_authenticated_tg_id(init_data: str) -> int | None:
+        """Проверяет подпись initData и достаёт id пользователя. Используется
+        и профилем, и списком откликов — везде, где нужно точно знать, что
+        запрос пришёл от конкретного кандидата, а не подделан снаружи."""
+        parsed = validate_init_data(init_data, bot_token)
+        if parsed is None:
+            return None
+        try:
+            tg_user = json.loads(parsed.get("user", "{}"))
+        except json.JSONDecodeError:
+            return None
+        return tg_user.get("id")
+
+    async def handle_get_profile(request: web.Request) -> web.Response:
+        init_data = request.query.get("initData", "")
+        tg_id = get_authenticated_tg_id(init_data)
+        if tg_id is None:
+            return web.json_response({"error": "invalid_init_data"}, status=403)
+        row = db.get_candidate_profile(tg_id)
+        if row is None:
+            return web.json_response(None)
+        return web.json_response({
+            "full_name": row["full_name"],
+            "nationality": row["nationality"],
+            "current_rank": row["current_rank"],
+            "vessel_types": row["vessel_types"],
+            "years_experience": row["years_experience"],
+            "availability": row["availability"],
+            "documents": row["documents"],
+        })
+
+    async def handle_post_profile(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "invalid_json"}, status=400)
+        tg_id = get_authenticated_tg_id(body.get("initData", ""))
+        if tg_id is None:
+            return web.json_response({"error": "invalid_init_data"}, status=403)
+        fields = {
+            "full_name": (body.get("full_name") or "").strip()[:200],
+            "nationality": (body.get("nationality") or "").strip()[:100],
+            "current_rank": (body.get("current_rank") or "").strip()[:50],
+            "vessel_types": (body.get("vessel_types") or "").strip()[:300],
+            "years_experience": (body.get("years_experience") or "").strip()[:20],
+            "availability": (body.get("availability") or "").strip()[:50],
+            "documents": (body.get("documents") or "").strip()[:300],
+        }
+        db.upsert_candidate_profile(tg_id, fields)
+        return web.json_response({"ok": True})
+
+    async def handle_my_applications(request: web.Request) -> web.Response:
+        init_data = request.query.get("initData", "")
+        tg_id = get_authenticated_tg_id(init_data)
+        if tg_id is None:
+            return web.json_response({"error": "invalid_init_data"}, status=403)
+        rows = db.get_applications_for_candidate(tg_id)
+        return web.json_response([
+            {
+                "id": r["id"],
+                "vacancy_position": r["vacancy_position"],
+                "vacancy_vessel": r["vacancy_vessel"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ])
 
     async def handle_apply(request: web.Request) -> web.Response:
         try:
@@ -129,6 +198,9 @@ def create_app(bot, bot_token: str) -> web.Application:
     app.router.add_get("/api/filters", handle_filters)
     app.router.add_get("/api/vacancies", handle_vacancies)
     app.router.add_post("/api/apply", handle_apply)
+    app.router.add_get("/api/profile", handle_get_profile)
+    app.router.add_post("/api/profile", handle_post_profile)
+    app.router.add_get("/api/applications", handle_my_applications)
     app.router.add_static("/", STATIC_DIR, show_index=False)
     return app
 
