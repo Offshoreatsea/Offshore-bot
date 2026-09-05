@@ -410,7 +410,7 @@ def apply_button_url(vacancy_id: int) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=apply_{vacancy_id}"
 
 
-def channel_keyboard(fields: dict, vacancy_id: int, post_link: str | None, title: str) -> InlineKeyboardMarkup:
+def channel_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text="📩 Apply", url=apply_button_url(vacancy_id))]]
     rows.append([InlineKeyboardButton(
         text="🔔 Get Job Alerts", url=f"https://t.me/{BOT_USERNAME}?start=join"
@@ -476,12 +476,7 @@ async def do_publish(bot: Bot, vacancy_id: int):
 
     sent = await bot.send_message(
         chat_id=CHANNEL_ID, text=text,
-        reply_markup=channel_keyboard(fields, vacancy_id, None, fields["position"] or "Vacancy"),
-    )
-    post_link = f"https://t.me/{CHANNEL_USERNAME}/{sent.message_id}"
-    await bot.edit_message_reply_markup(
-        chat_id=CHANNEL_ID, message_id=sent.message_id,
-        reply_markup=channel_keyboard(fields, vacancy_id, post_link, fields["position"] or "Vacancy"),
+        reply_markup=channel_keyboard(vacancy_id),
     )
     db.set_status(vacancy_id, "published", sent.message_id)
 
@@ -802,7 +797,7 @@ async def cb_subscribe_position(callback: CallbackQuery):
         try:
             await callback.bot.send_message(
                 tg_id, render_template(fields),
-                reply_markup=channel_keyboard(fields, row["id"], None, fields["position"] or "Vacancy"),
+                reply_markup=channel_keyboard(row["id"]),
             )
             await asyncio.sleep(0.3)  # не спамим Telegram API пачкой без пауз
         except TelegramAPIError:
@@ -821,7 +816,7 @@ async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
         try:
             await bot.send_message(
                 tg_id, render_template(fields),
-                reply_markup=channel_keyboard(fields, vacancy_id, None, fields.get("position") or "Vacancy"),
+                reply_markup=channel_keyboard(vacancy_id),
             )
             await asyncio.sleep(0.1)
         except TelegramAPIError:
