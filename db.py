@@ -311,7 +311,7 @@ def get_subscribers_for_tag(position_tag: str):
     return [r["tg_id"] for r in rows]
 
 
-def get_recent_published_by_tag(position_tag: str, days: int = 3):
+def get_recent_published_by_tag(position_tag: str, days: int = 7):
     """Бэкфилл для новых подписчиков — опубликованные вакансии этой должности
     за последние `days` суток, от старых к новым."""
     conn = get_conn()
