@@ -75,9 +75,13 @@ def init_db():
             tg_id INTEGER PRIMARY KEY,
             position_tag TEXT,
             username TEXT,
+            language TEXT,
             subscribed_at TEXT
         )
     """)
+    sub_cols = {row["name"] for row in conn.execute("PRAGMA table_info(subscribers)")}
+    if "language" not in sub_cols:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN language TEXT")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS click_events (
@@ -258,19 +262,44 @@ def daily_stats(days: int = 1):
     }
 
 
-def upsert_subscriber(tg_id: int, position_tag: str, username: str | None):
+def upsert_subscriber(tg_id: int, username: str | None, position_tag: str | None = None,
+                       language: str | None = None):
+    """Обновляет только переданные поля — вызывается и с шага выбора языка
+    (position_tag ещё нет), и с шага выбора должности (language уже есть)."""
     conn = get_conn()
+    existing = conn.execute("SELECT * FROM subscribers WHERE tg_id = ?", (tg_id,)).fetchone()
+    final_position = position_tag if position_tag is not None else (existing["position_tag"] if existing else None)
+    final_language = language if language is not None else (existing["language"] if existing else None)
     conn.execute(
-        """INSERT INTO subscribers (tg_id, position_tag, username, subscribed_at)
-           VALUES (?, ?, ?, ?)
+        """INSERT INTO subscribers (tg_id, position_tag, username, language, subscribed_at)
+           VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(tg_id) DO UPDATE SET
                position_tag = excluded.position_tag,
                username = excluded.username,
+               language = excluded.language,
                subscribed_at = excluded.subscribed_at""",
-        (tg_id, position_tag, username, datetime.now().isoformat()),
+        (tg_id, final_position, username, final_language, datetime.now().isoformat()),
     )
     conn.commit()
     conn.close()
+
+
+def get_subscriber_language(tg_id: int) -> str | None:
+    conn = get_conn()
+    row = conn.execute("SELECT language FROM subscribers WHERE tg_id = ?", (tg_id,)).fetchone()
+    conn.close()
+    return row["language"] if row else None
+
+
+def subscriber_stats():
+    conn = get_conn()
+    total = conn.execute("SELECT COUNT(*) c FROM subscribers").fetchone()["c"]
+    by_tag = conn.execute(
+        """SELECT COALESCE(position_tag, 'not chosen yet') AS tag, COUNT(*) c
+           FROM subscribers GROUP BY tag ORDER BY c DESC"""
+    ).fetchall()
+    conn.close()
+    return total, by_tag
 
 
 def get_subscribers_for_tag(position_tag: str):
