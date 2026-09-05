@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>OFFSHOREATSEA — vacancies</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root {
+  --bg: var(--tg-theme-bg-color, #ffffff);
+  --secondary-bg: var(--tg-theme-secondary-bg-color, #f2f2f7);
+  --text: var(--tg-theme-text-color, #0b0b0c);
+  --hint: var(--tg-theme-hint-color, #8a8a8e);
+  --link: var(--tg-theme-link-color, #1c7c74);
+  --button: var(--tg-theme-button-color, #1c7c74);
+  --button-text: var(--tg-theme-button-text-color, #ffffff);
+  --divider: rgba(120, 120, 128, 0.24);
+  --success-bg: #e3f6ea; --success-text: #1c7c4d;
+  --warning-bg: #fdf1de; --warning-text: #b06a12;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+button { font-family: inherit; }
+.hidden { display: none !important; }
+.tapscale { transition: transform 100ms; }
+.tapscale:active { transform: scale(0.94); }
+.chip { border: 0.5px solid var(--divider); color: var(--hint); font-size: 13px; padding: 6px 14px; border-radius: 999px; white-space: nowrap; }
+.chip.active { background: var(--button); color: var(--button-text); border: none; }
+.card { background: var(--secondary-bg); border-radius: 12px; padding: 12px 14px; margin-bottom: 8px; cursor: pointer; }
+.badge { font-size: 11px; padding: 3px 8px; border-radius: 6px; white-space: nowrap; }
+.row { display: flex; justify-content: space-between; align-items: center; }
+input, select { width: 100%; padding: 10px 12px; border-radius: 8px; border: 0.5px solid var(--divider); background: var(--bg); color: var(--text); font-size: 14px; margin-bottom: 10px; }
+.primary-btn { width: 100%; background: var(--button); color: var(--button-text); border: none; font-size: 14px; padding: 12px; border-radius: 8px; }
+.navbar { display: flex; border-top: 0.5px solid var(--divider); position: sticky; bottom: 0; background: var(--bg); }
+.navbtn { flex: 1; text-align: center; padding: 10px 0; color: var(--hint); font-size: 11px; }
+.navbtn.active { color: var(--link); }
+</style>
+</head>
+<body>
+
+<div style="padding: 14px 16px 10px; display:flex; justify-content:space-between; align-items:center;">
+  <p id="header-title" style="font-weight:600; font-size:17px; margin:0;">Jobs</p>
+</div>
+
+<div id="chips" style="display:flex; gap:8px; padding:0 16px 12px; overflow-x:auto;"></div>
+<div id="search-wrap" style="padding:0 16px 8px;">
+  <input id="searchInput" type="text" placeholder="Search position, vessel…">
+</div>
+
+<div id="s-jobs" style="padding:0 16px 16px;"></div>
+
+<div id="s-applications" class="hidden" style="padding:16px;"></div>
+
+<div id="s-profile" class="hidden" style="padding:16px;"></div>
+
+<div id="s-detail" class="hidden">
+  <div style="padding:14px 16px; display:flex; align-items:center; gap:10px; border-bottom:0.5px solid var(--divider);">
+    <span id="back-btn" class="tapscale" style="font-size:20px; cursor:pointer;">‹</span>
+    <p id="d-title" style="font-weight:600; font-size:16px; margin:0;"></p>
+  </div>
+  <div id="d-body" style="padding:16px;"></div>
+</div>
+
+<div class="navbar">
+  <div class="navbtn active" data-tab="jobs">⚓<br>Jobs</div>
+  <div class="navbtn" data-tab="applications">📄<br>Applied</div>
+  <div class="navbtn" data-tab="profile">👤<br>Profile</div>
+</div>
+
+<script>
+const tg = window.Telegram ? window.Telegram.WebApp : null;
+if (tg) { tg.ready(); tg.expand(); }
+const initData = tg ? tg.initData : "";
+
+const DEPARTMENTS = {
+  "Bridge": ["Master","ChiefOfficer","SecondOfficer","ThirdOfficer","DeckCadet"],
+  "Engine": ["ChiefEngineer","SecondEngineer","ThirdEngineer","FourthEngineer","EngineCadet","ETO","Electrician"],
+  "Ratings": ["Bosun","AB","OS","Motorman","Oiler","Fitter"],
+  "Catering": ["Cook","Steward","Campboss","ChiefSteward"],
+  "Offshore & Specialist": ["CraneOperator","DPOperator","ROVPilot","Rigger","Welder","Scaffolder","ClientRepresentative","SafetyOfficer","Surveyor"]
+};
+
+let allVacancies = [];
+let activeDept = "all";
+let currentTab = "jobs";
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s || "";
+  return d.innerHTML;
+}
+
+function renderChips() {
+  const wrap = document.getElementById("chips");
+  const depts = ["all", ...Object.keys(DEPARTMENTS)];
+  wrap.innerHTML = depts.map(d =>
+    `<span class="chip tapscale${d===activeDept ? " active" : ""}" data-d="${escapeHtml(d)}">${d === "all" ? "All" : escapeHtml(d)}</span>`
+  ).join("");
+  wrap.querySelectorAll(".chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      activeDept = chip.getAttribute("data-d");
+      renderChips();
+      renderJobsList();
+    });
+  });
+}
+
+function matchesDept(v) {
+  if (activeDept === "all") return true;
+  const tags = DEPARTMENTS[activeDept] || [];
+  return tags.includes(v.position_tag);
+}
+
+function renderJobsList() {
+  const q = (document.getElementById("searchInput").value || "").toLowerCase();
+  const list = allVacancies.filter(v => matchesDept(v) &&
+    (!q || (v.position + " " + (v.vessel||"")).toLowerCase().includes(q)));
+  const el = document.getElementById("s-jobs");
+  if (!list.length) {
+    el.innerHTML = '<p style="color:var(--hint); text-align:center; padding:24px 0;">No vacancies match yet.</p>';
+    return;
+  }
+  el.innerHTML = list.map(v => `
+    <div class="card tapscale" data-id="${v.id}">
+      <div class="row" style="align-items:flex-start;">
+        <div>
+          <p style="font-weight:600; font-size:14px; margin:0;">${escapeHtml(v.position || "Vacancy")}</p>
+          <p style="font-size:12px; color:var(--hint); margin:4px 0 0;">${escapeHtml([v.vessel, v.region, v.rotation].filter(Boolean).join(" · "))}</p>
+        </div>
+        ${v.salary ? `<span class="badge" style="background:var(--success-bg); color:var(--success-text);">${escapeHtml(v.salary)}</span>` : ""}
+      </div>
+    </div>
+  `).join("");
+  el.querySelectorAll(".card").forEach(card => {
+    card.addEventListener("click", () => openDetail(parseInt(card.getAttribute("data-id"), 10)));
+  });
+}
+
+async function loadVacancies() {
+  document.getElementById("s-jobs").innerHTML = '<p style="color:var(--hint); text-align:center; padding:24px 0;">Loading…</p>';
+  try {
+    const res = await fetch("/api/vacancies");
+    allVacancies = await res.json();
+  } catch (e) {
+    allVacancies = [];
+  }
+  renderJobsList();
+}
+
+function openDetail(id) {
+  const v = allVacancies.find(x => x.id === id);
+  if (!v) return;
+  document.getElementById("d-title").textContent = v.position || "Vacancy";
+  const docs = (v.documents || []).map(d => `<li>${escapeHtml(d)}</li>`).join("");
+  const reqs = (v.requirements || []).map(d => `<li>${escapeHtml(d)}</li>`).join("");
+  document.getElementById("d-body").innerHTML = `
+    <div style="background:var(--secondary-bg); border-radius:12px; padding:4px 14px; margin-bottom:14px;">
+      ${v.vessel ? `<div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Vessel</span><span style="font-size:13px;">${escapeHtml(v.vessel)}</span></div>` : ""}
+      ${v.region ? `<div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Region</span><span style="font-size:13px;">${escapeHtml(v.region)}</span></div>` : ""}
+      ${v.rotation ? `<div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Rotation</span><span style="font-size:13px;">${escapeHtml(v.rotation)}</span></div>` : ""}
+      ${v.salary ? `<div class="row" style="padding:10px 0;"><span style="color:var(--hint); font-size:13px;">Salary</span><span style="font-size:13px; font-weight:600;">${escapeHtml(v.salary)}</span></div>` : ""}
+    </div>
+    ${docs ? `<p style="font-size:13px; color:var(--hint); margin:0 0 4px;">Documents</p><ul style="font-size:13px; margin:0 0 14px; padding-left:18px;">${docs}</ul>` : ""}
+    ${reqs ? `<p style="font-size:13px; color:var(--hint); margin:0 0 4px;">Requirements</p><ul style="font-size:13px; margin:0 0 14px; padding-left:18px;">${reqs}</ul>` : ""}
+    <div id="apply-area"></div>
+  `;
+  renderApplyForm(v.id);
+  showScreen("detail");
+}
+
+function renderApplyForm(vacancyId) {
+  const area = document.getElementById("apply-area");
+  area.innerHTML = `
+    <input id="ap-name" type="text" placeholder="Your name">
+    <input id="ap-contact" type="text" placeholder="Email or phone to contact you">
+    <input id="ap-message" type="text" placeholder="Message (optional)">
+    <p id="ap-status" style="font-size:13px; color:var(--hint); min-height:16px; margin:0 0 8px;"></p>
+    <button class="primary-btn tapscale" id="ap-submit">Apply</button>
+  `;
+  document.getElementById("ap-submit").addEventListener("click", async () => {
+    const name = document.getElementById("ap-name").value.trim();
+    const contact = document.getElementById("ap-contact").value.trim();
+    const message = document.getElementById("ap-message").value.trim();
+    const statusEl = document.getElementById("ap-status");
+    if (!contact) {
+      statusEl.textContent = "Enter an email or phone number to contact you.";
+      return;
+    }
+    try {
+      const res = await fetch("/api/apply", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ initData, vacancy_id: vacancyId, name, contact, message })
+      });
+      if (res.ok) {
+        statusEl.textContent = "Application sent ✓";
+        document.getElementById("ap-submit").disabled = true;
+      } else {
+        statusEl.textContent = "Couldn't send, please try again.";
+      }
+    } catch (e) {
+      statusEl.textContent = "Couldn't send, check your connection.";
+    }
+  });
+}
+
+async function loadApplications() {
+  const el = document.getElementById("s-applications");
+  el.innerHTML = '<p style="color:var(--hint); text-align:center; padding:24px 0;">Loading…</p>';
+  try {
+    const res = await fetch("/api/applications?initData=" + encodeURIComponent(initData));
+    const rows = await res.json();
+    if (!rows.length) {
+      el.innerHTML = '<p style="color:var(--hint); text-align:center; padding:24px 0;">Your applications will show up here.</p>';
+      return;
+    }
+    el.innerHTML = rows.map(r => `
+      <div class="card">
+        <div class="row">
+          <div>
+            <p style="font-weight:600; font-size:14px; margin:0;">${escapeHtml(r.vacancy_position || "Vacancy")}</p>
+            <p style="font-size:12px; color:var(--hint); margin:4px 0 0;">${escapeHtml(r.vacancy_vessel || "")}</p>
+          </div>
+          <span class="badge" style="background:var(--secondary-bg); border:0.5px solid var(--divider);">Sent</span>
+        </div>
+      </div>
+    `).join("");
+  } catch (e) {
+    el.innerHTML = '<p style="color:var(--hint); text-align:center; padding:24px 0;">Couldn\\'t load your applications.</p>';
+  }
+}
+
+function rankOptionsHtml(current) {
+  let html = '<option value="">Select…</option>';
+  for (const dept in DEPARTMENTS) {
+    html += `<optgroup label="${escapeHtml(dept)}">`;
+    DEPARTMENTS[dept].forEach(tag => {
+      html += `<option value="${tag}"${tag === current ? " selected" : ""}>${tag}</option>`;
+    });
+    html += "</optgroup>";
+  }
+  return html;
+}
+
+async function loadProfile() {
+  const el = document.getElementById("s-profile");
+  el.innerHTML = '<p style="color:var(--hint); text-align:center; padding:24px 0;">Loading…</p>';
+  let profile = null;
+  try {
+    const res = await fetch("/api/profile?initData=" + encodeURIComponent(initData));
+    profile = await res.json();
+  } catch (e) {}
+  renderProfileView(profile);
+}
+
+function renderProfileView(profile) {
+  const el = document.getElementById("s-profile");
+  if (!profile) {
+    el.innerHTML = `
+      <p style="color:var(--hint); text-align:center; padding:16px 0 20px;">Complete your profile so employers know who you are.</p>
+      <button class="primary-btn tapscale" id="edit-profile-btn">Create profile</button>
+    `;
+  } else {
+    el.innerHTML = `
+      <div style="background:var(--secondary-bg); border-radius:12px; padding:4px 14px; margin-bottom:14px;">
+        <div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Name</span><span style="font-size:13px;">${escapeHtml(profile.full_name || "—")}</span></div>
+        <div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Nationality</span><span style="font-size:13px;">${escapeHtml(profile.nationality || "—")}</span></div>
+        <div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Rank</span><span style="font-size:13px;">${escapeHtml(profile.current_rank || "—")}</span></div>
+        <div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Vessel types</span><span style="font-size:13px; text-align:right;">${escapeHtml(profile.vessel_types || "—")}</span></div>
+        <div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Experience</span><span style="font-size:13px;">${escapeHtml(profile.years_experience || "—")} yrs</span></div>
+        <div class="row" style="padding:10px 0;"><span style="color:var(--hint); font-size:13px;">Available</span><span style="font-size:13px;">${escapeHtml(profile.availability || "—")}</span></div>
+      </div>
+      <button class="primary-btn tapscale" id="edit-profile-btn">Edit profile</button>
+    `;
+  }
+  document.getElementById("edit-profile-btn").addEventListener("click", () => renderProfileForm(profile));
+}
+
+function renderProfileForm(profile) {
+  profile = profile || {};
+  const el = document.getElementById("s-profile");
+  el.innerHTML = `
+    <input id="pf-name" type="text" placeholder="Full name" value="${escapeHtml(profile.full_name || "")}">
+    <input id="pf-nat" type="text" placeholder="Nationality" value="${escapeHtml(profile.nationality || "")}">
+    <select id="pf-rank">${rankOptionsHtml(profile.current_rank || "")}</select>
+    <input id="pf-vessels" type="text" placeholder="Vessel types (e.g. Tanker, OSV)" value="${escapeHtml(profile.vessel_types || "")}">
+    <input id="pf-exp" type="text" placeholder="Years of experience" value="${escapeHtml(profile.years_experience || "")}">
+    <select id="pf-avail">
+      <option value="">Availability…</option>
+      <option value="Available now"${profile.availability === "Available now" ? " selected" : ""}>Available now</option>
+      <option value="On contract"${profile.availability === "On contract" ? " selected" : ""}>On contract</option>
+    </select>
+    <input id="pf-docs" type="text" placeholder="Certificates (e.g. STCW, BOSIET)" value="${escapeHtml(profile.documents || "")}">
+    <p id="pf-status" style="font-size:13px; color:var(--hint); min-height:16px;"></p>
+    <button class="primary-btn tapscale" id="pf-save">Save profile</button>
+  `;
+  document.getElementById("pf-save").addEventListener("click", async () => {
+    const fields = {
+      full_name: document.getElementById("pf-name").value.trim(),
+      nationality: document.getElementById("pf-nat").value.trim(),
+      current_rank: document.getElementById("pf-rank").value,
+      vessel_types: document.getElementById("pf-vessels").value.trim(),
+      years_experience: document.getElementById("pf-exp").value.trim(),
+      availability: document.getElementById("pf-avail").value,
+      documents: document.getElementById("pf-docs").value.trim(),
+    };
+    const statusEl = document.getElementById("pf-status");
+    if (!fields.full_name || !fields.current_rank) {
+      statusEl.textContent = "Enter your name and rank at least.";
+      return;
+    }
+    try {
+      const res = await fetch("/api/profile", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ initData, ...fields })
+      });
+      if (res.ok) { loadProfile(); } else { statusEl.textContent = "Couldn't save, please try again."; }
+    } catch (e) {
+      statusEl.textContent = "Couldn't save, check your connection.";
+    }
+  });
+}
+
+function showScreen(name) {
+  document.getElementById("s-jobs").classList.toggle("hidden", name !== "jobs");
+  document.getElementById("chips").classList.toggle("hidden", name !== "jobs");
+  document.getElementById("search-wrap").classList.toggle("hidden", name !== "jobs");
+  document.getElementById("s-applications").classList.toggle("hidden", name !== "applications");
+  document.getElementById("s-profile").classList.toggle("hidden", name !== "profile");
+  document.getElementById("s-detail").classList.toggle("hidden", name !== "detail");
+  document.querySelector(".navbar").classList.toggle("hidden", name === "detail");
+  const titles = { jobs: "Jobs", applications: "Applied", profile: "Profile" };
+  if (titles[name]) document.getElementById("header-title").textContent = titles[name];
+}
+
+document.getElementById("back-btn").addEventListener("click", () => showScreen(currentTab));
+
+document.querySelectorAll(".navbtn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".navbtn").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    currentTab = btn.getAttribute("data-tab");
+    showScreen(currentTab);
+    if (currentTab === "applications") loadApplications();
+    if (currentTab === "profile") loadProfile();
+  });
+});
+
+document.getElementById("searchInput").addEventListener("input", renderJobsList);
+
+renderChips();
+loadVacancies();
+</script>
+</body>
+</html>
