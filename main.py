@@ -71,11 +71,16 @@ TR = {
     "en": {
         "intro": "This bot sends you offshore & maritime job vacancies for the "
                   "position you choose — no need to scroll the channel.",
-        "choose_position": "Choose your position — I'll send matching vacancies "
-                            "from the last 7 days, then new ones as they're posted:",
-        "subscribed": "✅ Subscribed to {tag}. Sending recent vacancies...",
+        "choose_position": "Choose one or more positions — tap to select, tap "
+                            "again to remove. I'll send matching vacancies from "
+                            "the last 7 days for each, then new ones as they're posted:",
+        "subscribed": "✅ Added {tag}. Sending recent vacancies...",
+        "unsubscribed": "Removed {tag} from your alerts.",
         "backfill_empty": "No {tag} vacancies in the last 7 days yet — "
                            "you'll get the next one as soon as it's posted.",
+        "done": "✅ Done",
+        "no_selection": "You haven't picked any position yet — tap one above.",
+        "subscribed_summary": "Your alerts are set up for: {tags}",
         "contact_admin": "🆘 Contact admin",
         "send_cv": "Send your CV to: {v}",
         "open_form": "Open the application form:",
@@ -86,11 +91,16 @@ TR = {
     "ru": {
         "intro": "Этот бот присылает вакансии в офшоре и морской индустрии по "
                  "выбранной должности — не нужно листать канал.",
-        "choose_position": "Выберите должность — пришлю подходящие вакансии за "
-                            "последние 7 дней, и дальше — все новые:",
-        "subscribed": "✅ Подписка оформлена: {tag}. Отправляю вакансии...",
+        "choose_position": "Выберите одну или несколько должностей — нажмите, "
+                            "чтобы добавить, ещё раз — чтобы убрать. Пришлю вакансии "
+                            "за последние 7 дней по каждой, и дальше — все новые:",
+        "subscribed": "✅ Добавлено: {tag}. Отправляю вакансии...",
+        "unsubscribed": "Убрано из подписки: {tag}.",
         "backfill_empty": "Вакансий по {tag} за последние 7 дней пока нет — "
                            "пришлю, как только появится подходящая.",
+        "done": "✅ Готово",
+        "no_selection": "Вы ещё не выбрали ни одной должности — нажмите на любую выше.",
+        "subscribed_summary": "Ваши подписки: {tags}",
         "contact_admin": "🆘 Написать администратору",
         "send_cv": "Отправьте резюме на: {v}",
         "open_form": "Откройте форму отклика:",
@@ -101,11 +111,16 @@ TR = {
     "uk": {
         "intro": "Цей бот надсилає вакансії в офшорі та морській галузі за "
                  "обраною посадою — не потрібно гортати канал.",
-        "choose_position": "Оберіть посаду — надішлю відповідні вакансії за "
-                            "останні 7 днів, а далі — всі нові:",
-        "subscribed": "✅ Підписку оформлено: {tag}. Надсилаю вакансії...",
+        "choose_position": "Оберіть одну або кілька посад — натисніть, щоб додати, "
+                            "ще раз — щоб прибрати. Надішлю вакансії за останні 7 днів "
+                            "по кожній, а далі — всі нові:",
+        "subscribed": "✅ Додано: {tag}. Надсилаю вакансії...",
+        "unsubscribed": "Прибрано з підписки: {tag}.",
         "backfill_empty": "Вакансій по {tag} за останні 7 днів поки немає — "
                            "надішлю, щойно з'явиться відповідна.",
+        "done": "✅ Готово",
+        "no_selection": "Ви ще не обрали жодної посади — натисніть на будь-яку вище.",
+        "subscribed_summary": "Ваші підписки: {tags}",
         "contact_admin": "🆘 Написати адміністратору",
         "send_cv": "Надішліть резюме на: {v}",
         "open_form": "Відкрийте форму відгуку:",
@@ -566,17 +581,25 @@ async def cb_show_language(callback: CallbackQuery):
 
 @router.callback_query(F.data == "showpos")
 async def cb_show_positions(callback: CallbackQuery):
-    lang = db.get_subscriber_language(callback.from_user.id)
-    await callback.message.edit_text(t(lang, "choose_position"), reply_markup=subscribe_keyboard(lang))
+    tg_id = callback.from_user.id
+    lang = db.get_subscriber_language(tg_id)
+    selected = set(db.get_subscriber_positions(tg_id))
+    await callback.message.edit_text(
+        t(lang, "choose_position"), reply_markup=subscribe_keyboard(lang, selected)
+    )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("lang:"))
 async def cb_set_language(callback: CallbackQuery):
     lang = callback.data.split(":", 1)[1]
-    db.upsert_subscriber(callback.from_user.id, callback.from_user.username, language=lang)
+    tg_id = callback.from_user.id
+    db.upsert_subscriber(tg_id, callback.from_user.username, language=lang)
+    selected = set(db.get_subscriber_positions(tg_id))
     await callback.message.edit_text(t(lang, "intro"))
-    await callback.message.answer(t(lang, "choose_position"), reply_markup=subscribe_keyboard(lang))
+    await callback.message.answer(
+        t(lang, "choose_position"), reply_markup=subscribe_keyboard(lang, selected)
+    )
     await callback.answer()
 
 
@@ -674,26 +697,29 @@ def language_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
-def subscribe_keyboard(lang: str | None = None) -> InlineKeyboardMarkup:
+def subscribe_keyboard(lang: str | None = None, selected: set[str] | None = None) -> InlineKeyboardMarkup:
+    selected = selected or set()
     rows = []
     row = []
     for tag in RANK_TAGS:
-        row.append(InlineKeyboardButton(text=tag, callback_data=f"subpos:{tag}"))
+        label = f"✅ {tag}" if tag in selected else tag
+        row.append(InlineKeyboardButton(text=label, callback_data=f"subpos:{tag}"))
         if len(row) == 3:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton(text=t(lang, "done"), callback_data="subdone")])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def after_subscribe_keyboard(lang: str | None = None) -> InlineKeyboardMarkup:
-    # короткая клавиатура под подтверждением подписки — не дублирует весь список
-    # должностей, просто даёт быстрый путь назад без поиска команд руками
+    # клавиатура под итоговой сводкой (после "Готово") — быстрый путь назад
+    # без поиска команд руками
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Change position", callback_data="showpos")],
+        [InlineKeyboardButton(text="🔄 Change positions", callback_data="showpos")],
         [InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")],
         [InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)],
     ])
@@ -799,10 +825,12 @@ async def cmd_subscribers(message: Message):
 async def cmd_subscribe(message: Message):
     # доступно всем, не только админу — это функция для кандидатов, не для
     # управления каналом
-    lang = db.get_subscriber_language(message.from_user.id)
+    tg_id = message.from_user.id
+    lang = db.get_subscriber_language(tg_id)
+    selected = set(db.get_subscriber_positions(tg_id))
     await message.answer(
         t(lang, "choose_position"),
-        reply_markup=subscribe_keyboard(lang),
+        reply_markup=subscribe_keyboard(lang, selected),
     )
 
 
@@ -811,13 +839,21 @@ async def cb_subscribe_position(callback: CallbackQuery):
     position_tag = callback.data.split(":", 1)[1]
     tg_id = callback.from_user.id
     lang = db.get_subscriber_language(tg_id)
-    db.upsert_subscriber(tg_id, callback.from_user.username, position_tag=position_tag)
-    await callback.message.edit_text(
-        t(lang, "subscribed", tag=position_tag),
-        reply_markup=after_subscribe_keyboard(lang),
-    )
-    await callback.answer()
+    added = db.toggle_subscription(tg_id, position_tag)
 
+    # обновляем только галочки на клавиатуре — текст-приглашение ("выберите
+    # должности...") остаётся тем же на протяжении всего мульти-выбора
+    selected = set(db.get_subscriber_positions(tg_id))
+    try:
+        await callback.message.edit_reply_markup(reply_markup=subscribe_keyboard(lang, selected))
+    except TelegramAPIError:
+        pass  # клавиатура уже в нужном состоянии — Telegram иногда так отвечает, это не ошибка
+
+    if not added:
+        await callback.answer(t(lang, "unsubscribed", tag=position_tag))
+        return
+
+    await callback.answer(t(lang, "subscribed", tag=position_tag))
     backfill = db.get_recent_published_by_tag(position_tag, days=7)
     if not backfill:
         await callback.bot.send_message(tg_id, t(lang, "backfill_empty", tag=position_tag))
@@ -832,6 +868,21 @@ async def cb_subscribe_position(callback: CallbackQuery):
             await asyncio.sleep(0.3)  # не спамим Telegram API пачкой без пауз
         except TelegramAPIError:
             pass
+
+
+@router.callback_query(F.data == "subdone")
+async def cb_subscribe_done(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    lang = db.get_subscriber_language(tg_id)
+    selected = db.get_subscriber_positions(tg_id)
+    if not selected:
+        await callback.answer(t(lang, "no_selection"), show_alert=True)
+        return
+    await callback.message.edit_text(
+        t(lang, "subscribed_summary", tags=", ".join(selected)),
+        reply_markup=after_subscribe_keyboard(lang),
+    )
+    await callback.answer()
 
 
 async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
