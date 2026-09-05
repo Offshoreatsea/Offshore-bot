@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta
 
 import anthropic
@@ -49,10 +50,26 @@ DIGEST_TIMES = ["09:00", "14:00", "19:00"]
 RANK_TAGS = [
     "Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "DeckCadet",
     "ChiefEngineer", "SecondEngineer", "ThirdEngineer", "FourthEngineer", "EngineCadet",
-    "ETO", "Electrician", "Bosun", "AB", "OS", "Motorman", "Oiler", "Fitter", "Cook", "Steward",
+    "ETO", "Electrician", "Bosun", "AB", "OS", "Motorman", "Oiler", "Fitter",
+    "Cook", "Steward", "Campboss", "ChiefSteward",
     "CraneOperator", "DPOperator", "ROVPilot", "Rigger", "Welder", "Scaffolder",
     "ClientRepresentative", "SafetyOfficer", "Surveyor",
 ]
+
+# Группировка тегов по департаментам — чисто вопрос навигации в /subscribe,
+# на матчинг вакансий и хранение подписок не влияет (там как был, так и
+# остался плоский position_tag). Допишите сюда любую новую должность из
+# RANK_TAGS в подходящий департамент, иначе она не попадёт ни в один экран.
+DEPARTMENTS = {
+    "Bridge": ["Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "DeckCadet"],
+    "Engine": ["ChiefEngineer", "SecondEngineer", "ThirdEngineer", "FourthEngineer",
+               "EngineCadet", "ETO", "Electrician"],
+    "Ratings": ["Bosun", "AB", "OS", "Motorman", "Oiler", "Fitter"],
+    "Catering": ["Cook", "Steward", "Campboss", "ChiefSteward"],
+    "Offshore & Specialist": ["CraneOperator", "DPOperator", "ROVPilot", "Rigger",
+                              "Welder", "Scaffolder", "ClientRepresentative",
+                              "SafetyOfficer", "Surveyor"],
+}
 
 # Фиксированный список типов судов — тоже единый источник правды для тегов
 # и матчинга.
@@ -71,6 +88,7 @@ TR = {
     "en": {
         "intro": "This bot sends you offshore & maritime job vacancies for the "
                   "position you choose — no need to scroll the channel.",
+        "choose_department": "Choose a department to see its positions:",
         "choose_position": "Choose one or more positions — tap to select, tap "
                             "again to remove. I'll send matching vacancies from "
                             "the last 7 days for each, then new ones as they're posted:",
@@ -79,6 +97,7 @@ TR = {
         "backfill_empty": "No {tag} vacancies in the last 7 days yet — "
                            "you'll get the next one as soon as it's posted.",
         "done": "✅ Done",
+        "back_to_departments": "⬅ Departments",
         "no_selection": "You haven't picked any position yet — tap one above.",
         "subscribed_summary": "Your alerts are set up for: {tags}",
         "contact_admin": "🆘 Contact admin",
@@ -91,6 +110,7 @@ TR = {
     "ru": {
         "intro": "Этот бот присылает вакансии в офшоре и морской индустрии по "
                  "выбранной должности — не нужно листать канал.",
+        "choose_department": "Выберите департамент, чтобы увидеть должности:",
         "choose_position": "Выберите одну или несколько должностей — нажмите, "
                             "чтобы добавить, ещё раз — чтобы убрать. Пришлю вакансии "
                             "за последние 7 дней по каждой, и дальше — все новые:",
@@ -99,6 +119,7 @@ TR = {
         "backfill_empty": "Вакансий по {tag} за последние 7 дней пока нет — "
                            "пришлю, как только появится подходящая.",
         "done": "✅ Готово",
+        "back_to_departments": "⬅ Департаменты",
         "no_selection": "Вы ещё не выбрали ни одной должности — нажмите на любую выше.",
         "subscribed_summary": "Ваши подписки: {tags}",
         "contact_admin": "🆘 Написать администратору",
@@ -111,6 +132,7 @@ TR = {
     "uk": {
         "intro": "Цей бот надсилає вакансії в офшорі та морській галузі за "
                  "обраною посадою — не потрібно гортати канал.",
+        "choose_department": "Оберіть департамент, щоб побачити посади:",
         "choose_position": "Оберіть одну або кілька посад — натисніть, щоб додати, "
                             "ще раз — щоб прибрати. Надішлю вакансії за останні 7 днів "
                             "по кожній, а далі — всі нові:",
@@ -119,6 +141,7 @@ TR = {
         "backfill_empty": "Вакансій по {tag} за останні 7 днів поки немає — "
                            "надішлю, щойно з'явиться відповідна.",
         "done": "✅ Готово",
+        "back_to_departments": "⬅ Департаменти",
         "no_selection": "Ви ще не обрали жодної посади — натисніть на будь-яку вище.",
         "subscribed_summary": "Ваші підписки: {tags}",
         "contact_admin": "🆘 Написати адміністратору",
@@ -211,9 +234,38 @@ For each vacancy, extract:
 - position: short job title, as written/implied in the source (human-readable, keep natural
   wording, e.g. "Chief Engineer", "2nd Officer")
 - position_tag: map the position to EXACTLY ONE tag from this fixed list (pick the closest
-  match, e.g. "2/O" or "Second Mate" -> "SecondOfficer"; "Electro-Technical Officer" -> "ETO"):
+  match — treat abbreviations, informal titles, and near-synonyms as the same rank):
   {rank_tags}
-  If truly nothing in the list fits, use "Other".
+  Common mappings to use as a guide (not exhaustive — apply the same logic to anything
+  similar that isn't listed here):
+    "Master", "Captain", "Skipper" -> Master
+    "C/O", "Chief Officer", "Chief Mate", "First Mate", "1/O" -> ChiefOfficer
+    "2/O", "2nd Officer", "Second Officer", "Second Mate", "SDPO" -> SecondOfficer
+    "3/O", "3rd Officer", "Third Officer", "Third Mate" -> ThirdOfficer
+    "Deck Cadet", "Deck Trainee", "Navigation Cadet" -> DeckCadet
+    "C/E", "Chief Engineer" -> ChiefEngineer
+    "2/E", "Second Engineer", "First Assistant Engineer" -> SecondEngineer
+    "3/E", "Third Engineer", "Second Assistant Engineer" -> ThirdEngineer
+    "4/E", "Fourth Engineer", "Third Assistant Engineer" -> FourthEngineer
+    "Engine Cadet", "Engine Trainee", "Motor Cadet" -> EngineCadet
+    "Junior ETO", "Electro-Technical Officer", "Electrical Officer", "Electrical"
+    (as a job title, not a requirement) -> ETO
+    "Ship's Electrician", "Electrical Rating" -> Electrician
+    "Boatswain", "Bosun's Mate" -> Bosun
+    "AB", "Able Seaman", "Able Bodied Seaman", "Deck Hand", "Deckhand" -> AB
+    "OS", "Ordinary Seaman" -> OS
+    "Motorman", "Engine Rating" -> Motorman
+    "Oiler", "Wiper" -> Oiler
+    "Fitter", "Engine Fitter" -> Fitter
+    "Cook", "Ship's Cook", "Chief Cook", "Galley Cook" -> Cook
+    "Steward", "Mess Man", "Messman" -> Steward
+    "Camp Boss", "Campboss", "Catering Manager" -> Campboss
+    "Chief Steward", "Chief Steward/ess" -> ChiefSteward
+    "OOW" (Officer of the Watch) or a bare "Mate" with no rank number given is ambiguous
+    between SecondOfficer and ThirdOfficer — infer from context (years of experience
+    required, COC class, whether it's described as senior/junior watch); if there is truly
+    no way to tell, default to SecondOfficer rather than Other.
+  If truly nothing in the list or the guidance above fits, use "Other".
 - vessel: vessel/rig type or name, as written/implied in the source, or null
 - vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list (e.g. "OSV",
   "Offshore Support Vessel", "supply vessel" -> "OSV"; "product tanker" -> "Tanker"):
@@ -469,6 +521,22 @@ def admin_only(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+# антиспам для кандидатских кнопок (subpos/lang/showpos/showlang/subdone) — не даёт
+# накрутить рассылку себе или другим частыми повторными тапами. Парсинг вакансий
+# через Claude API тут ни при чём — он и так admin_only (см. handle_vacancy_text),
+# случайный человек не может обратиться к платному AI-парсингу вообще никак.
+_last_candidate_action: dict[int, float] = {}
+
+
+def throttled(tg_id: int, seconds: float = 0.6) -> bool:
+    now = time.monotonic()
+    last = _last_candidate_action.get(tg_id, 0)
+    if now - last < seconds:
+        return True
+    _last_candidate_action[tg_id] = now
+    return False
+
+
 def is_auto_publish() -> bool:
     return db.get_setting("auto_publish", "off") == "on"
 
@@ -572,6 +640,9 @@ async def cmd_start(message: Message, command: CommandObject):
 
 @router.callback_query(F.data == "showlang")
 async def cb_show_language(callback: CallbackQuery):
+    if throttled(callback.from_user.id):
+        await callback.answer()
+        return
     await callback.message.edit_text(
         "🇬🇧 English / 🇷🇺 Русский / 🇺🇦 Українська",
         reply_markup=language_keyboard(),
@@ -582,23 +653,58 @@ async def cb_show_language(callback: CallbackQuery):
 @router.callback_query(F.data == "showpos")
 async def cb_show_positions(callback: CallbackQuery):
     tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
     lang = db.get_subscriber_language(tg_id)
     selected = set(db.get_subscriber_positions(tg_id))
     await callback.message.edit_text(
-        t(lang, "choose_position"), reply_markup=subscribe_keyboard(lang, selected)
+        t(lang, "choose_department"), reply_markup=department_keyboard(lang, selected)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("subdept:"))
+async def cb_show_department(callback: CallbackQuery):
+    dept = callback.data.split(":", 1)[1]
+    tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
+    lang = db.get_subscriber_language(tg_id)
+    selected = set(db.get_subscriber_positions(tg_id))
+    await callback.message.edit_text(
+        t(lang, "choose_position"), reply_markup=subscribe_keyboard(dept, lang, selected)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "subdeptback")
+async def cb_department_back(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
+    lang = db.get_subscriber_language(tg_id)
+    selected = set(db.get_subscriber_positions(tg_id))
+    await callback.message.edit_text(
+        t(lang, "choose_department"), reply_markup=department_keyboard(lang, selected)
     )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("lang:"))
 async def cb_set_language(callback: CallbackQuery):
-    lang = callback.data.split(":", 1)[1]
     tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
+    lang = callback.data.split(":", 1)[1]
     db.upsert_subscriber(tg_id, callback.from_user.username, language=lang)
     selected = set(db.get_subscriber_positions(tg_id))
     await callback.message.edit_text(t(lang, "intro"))
     await callback.message.answer(
-        t(lang, "choose_position"), reply_markup=subscribe_keyboard(lang, selected)
+        t(lang, "choose_department"), reply_markup=department_keyboard(lang, selected)
     )
     await callback.answer()
 
@@ -697,18 +803,41 @@ def language_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
-def subscribe_keyboard(lang: str | None = None, selected: set[str] | None = None) -> InlineKeyboardMarkup:
+def department_keyboard(lang: str | None = None, selected: set[str] | None = None) -> InlineKeyboardMarkup:
     selected = selected or set()
     rows = []
     row = []
-    for tag in RANK_TAGS:
+    for dept, tags in DEPARTMENTS.items():
+        count = len(selected & set(tags))
+        label = f"{dept} ({count})" if count else dept
+        row.append(InlineKeyboardButton(text=label, callback_data=f"subdept:{dept}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text=t(lang, "done"), callback_data="subdone")])
+    rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
+    rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def subscribe_keyboard(dept: str, lang: str | None = None, selected: set[str] | None = None) -> InlineKeyboardMarkup:
+    # клавиатура должностей ВНУТРИ одного департамента — dept закодирован в
+    # callback_data (subpos:<dept>:<tag>), чтобы toggle-хендлер знал, какой
+    # именно экран перерисовывать после нажатия
+    selected = selected or set()
+    rows = []
+    row = []
+    for tag in DEPARTMENTS[dept]:
         label = f"✅ {tag}" if tag in selected else tag
-        row.append(InlineKeyboardButton(text=label, callback_data=f"subpos:{tag}"))
+        row.append(InlineKeyboardButton(text=label, callback_data=f"subpos:{dept}:{tag}"))
         if len(row) == 3:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton(text=t(lang, "back_to_departments"), callback_data="subdeptback")])
     rows.append([InlineKeyboardButton(text=t(lang, "done"), callback_data="subdone")])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
@@ -829,23 +958,27 @@ async def cmd_subscribe(message: Message):
     lang = db.get_subscriber_language(tg_id)
     selected = set(db.get_subscriber_positions(tg_id))
     await message.answer(
-        t(lang, "choose_position"),
-        reply_markup=subscribe_keyboard(lang, selected),
+        t(lang, "choose_department"),
+        reply_markup=department_keyboard(lang, selected),
     )
 
 
 @router.callback_query(F.data.startswith("subpos:"))
 async def cb_subscribe_position(callback: CallbackQuery):
-    position_tag = callback.data.split(":", 1)[1]
+    _, dept, position_tag = callback.data.split(":", 2)
     tg_id = callback.from_user.id
+    if throttled(tg_id, seconds=1.0):
+        await callback.answer()
+        return
     lang = db.get_subscriber_language(tg_id)
     added = db.toggle_subscription(tg_id, position_tag)
 
-    # обновляем только галочки на клавиатуре — текст-приглашение ("выберите
-    # должности...") остаётся тем же на протяжении всего мульти-выбора
+    # обновляем только галочки на клавиатуре этого же департамента — текст-
+    # приглашение ("выберите должности...") остаётся тем же на протяжении
+    # всего мульти-выбора
     selected = set(db.get_subscriber_positions(tg_id))
     try:
-        await callback.message.edit_reply_markup(reply_markup=subscribe_keyboard(lang, selected))
+        await callback.message.edit_reply_markup(reply_markup=subscribe_keyboard(dept, lang, selected))
     except TelegramAPIError:
         pass  # клавиатура уже в нужном состоянии — Telegram иногда так отвечает, это не ошибка
 
@@ -873,6 +1006,9 @@ async def cb_subscribe_position(callback: CallbackQuery):
 @router.callback_query(F.data == "subdone")
 async def cb_subscribe_done(callback: CallbackQuery):
     tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
     lang = db.get_subscriber_language(tg_id)
     selected = db.get_subscriber_positions(tg_id)
     if not selected:
