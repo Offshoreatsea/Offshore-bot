@@ -72,9 +72,9 @@ TR = {
         "intro": "This bot sends you offshore & maritime job vacancies for the "
                   "position you choose — no need to scroll the channel.",
         "choose_position": "Choose your position — I'll send matching vacancies "
-                            "from the last 3 days, then new ones as they're posted:",
+                            "from the last 7 days, then new ones as they're posted:",
         "subscribed": "✅ Subscribed to {tag}. Sending recent vacancies...",
-        "backfill_empty": "No {tag} vacancies in the last 3 days yet — "
+        "backfill_empty": "No {tag} vacancies in the last 7 days yet — "
                            "you'll get the next one as soon as it's posted.",
         "contact_admin": "🆘 Contact admin",
         "send_cv": "Send your CV to: {v}",
@@ -87,9 +87,9 @@ TR = {
         "intro": "Этот бот присылает вакансии в офшоре и морской индустрии по "
                  "выбранной должности — не нужно листать канал.",
         "choose_position": "Выберите должность — пришлю подходящие вакансии за "
-                            "последние 3 дня, и дальше — все новые:",
+                            "последние 7 дней, и дальше — все новые:",
         "subscribed": "✅ Подписка оформлена: {tag}. Отправляю вакансии...",
-        "backfill_empty": "Вакансий по {tag} за последние 3 дня пока нет — "
+        "backfill_empty": "Вакансий по {tag} за последние 7 дней пока нет — "
                            "пришлю, как только появится подходящая.",
         "contact_admin": "🆘 Написать администратору",
         "send_cv": "Отправьте резюме на: {v}",
@@ -102,9 +102,9 @@ TR = {
         "intro": "Цей бот надсилає вакансії в офшорі та морській галузі за "
                  "обраною посадою — не потрібно гортати канал.",
         "choose_position": "Оберіть посаду — надішлю відповідні вакансії за "
-                            "останні 3 дні, а далі — всі нові:",
+                            "останні 7 днів, а далі — всі нові:",
         "subscribed": "✅ Підписку оформлено: {tag}. Надсилаю вакансії...",
-        "backfill_empty": "Вакансій по {tag} за останні 3 дні поки немає — "
+        "backfill_empty": "Вакансій по {tag} за останні 7 днів поки немає — "
                            "надішлю, щойно з'явиться відповідна.",
         "contact_admin": "🆘 Написати адміністратору",
         "send_cv": "Надішліть резюме на: {v}",
@@ -555,6 +555,22 @@ async def cmd_start(message: Message, command: CommandObject):
     )
 
 
+@router.callback_query(F.data == "showlang")
+async def cb_show_language(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🇬🇧 English / 🇷🇺 Русский / 🇺🇦 Українська",
+        reply_markup=language_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "showpos")
+async def cb_show_positions(callback: CallbackQuery):
+    lang = db.get_subscriber_language(callback.from_user.id)
+    await callback.message.edit_text(t(lang, "choose_position"), reply_markup=subscribe_keyboard(lang))
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("lang:"))
 async def cb_set_language(callback: CallbackQuery):
     lang = callback.data.split(":", 1)[1]
@@ -668,8 +684,19 @@ def subscribe_keyboard(lang: str | None = None) -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def after_subscribe_keyboard(lang: str | None = None) -> InlineKeyboardMarkup:
+    # короткая клавиатура под подтверждением подписки — не дублирует весь список
+    # должностей, просто даёт быстрый путь назад без поиска команд руками
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Change position", callback_data="showpos")],
+        [InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")],
+        [InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)],
+    ])
 
 
 def consult_keyboard() -> InlineKeyboardMarkup:
@@ -785,10 +812,13 @@ async def cb_subscribe_position(callback: CallbackQuery):
     tg_id = callback.from_user.id
     lang = db.get_subscriber_language(tg_id)
     db.upsert_subscriber(tg_id, callback.from_user.username, position_tag=position_tag)
-    await callback.message.edit_text(t(lang, "subscribed", tag=position_tag))
+    await callback.message.edit_text(
+        t(lang, "subscribed", tag=position_tag),
+        reply_markup=after_subscribe_keyboard(lang),
+    )
     await callback.answer()
 
-    backfill = db.get_recent_published_by_tag(position_tag, days=3)
+    backfill = db.get_recent_published_by_tag(position_tag, days=7)
     if not backfill:
         await callback.bot.send_message(tg_id, t(lang, "backfill_empty", tag=position_tag))
         return
