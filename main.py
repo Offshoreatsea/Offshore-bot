@@ -4,7 +4,6 @@ import json
 import os
 import re
 from datetime import datetime, timedelta
-from urllib.parse import quote
 
 import anthropic
 from aiogram import Bot, Dispatcher, F, Router
@@ -64,6 +63,62 @@ VESSEL_TAGS = [
 ]
 
 FALLBACK_TAG = "Other"
+
+# Переводы для кандидата — единственное место, где текст локализуется под язык,
+# выбранный при первом /start. Сами теги должностей (RANK_TAGS) остаются
+# английскими в любом языке — это канонические идентификаторы, а не текст.
+TR = {
+    "en": {
+        "intro": "This bot sends you offshore & maritime job vacancies for the "
+                  "position you choose — no need to scroll the channel.",
+        "choose_position": "Choose your position — I'll send matching vacancies "
+                            "from the last 3 days, then new ones as they're posted:",
+        "subscribed": "✅ Subscribed to {tag}. Sending recent vacancies...",
+        "backfill_empty": "No {tag} vacancies in the last 3 days yet — "
+                           "you'll get the next one as soon as it's posted.",
+        "contact_admin": "🆘 Contact admin",
+        "send_cv": "Send your CV to: {v}",
+        "open_form": "Open the application form:",
+        "how_to_apply": "How to apply: {v}",
+        "no_contact": "No direct contact is listed for this vacancy. "
+                       "Please contact the channel admin.",
+    },
+    "ru": {
+        "intro": "Этот бот присылает вакансии в офшоре и морской индустрии по "
+                 "выбранной должности — не нужно листать канал.",
+        "choose_position": "Выберите должность — пришлю подходящие вакансии за "
+                            "последние 3 дня, и дальше — все новые:",
+        "subscribed": "✅ Подписка оформлена: {tag}. Отправляю вакансии...",
+        "backfill_empty": "Вакансий по {tag} за последние 3 дня пока нет — "
+                           "пришлю, как только появится подходящая.",
+        "contact_admin": "🆘 Написать администратору",
+        "send_cv": "Отправьте резюме на: {v}",
+        "open_form": "Откройте форму отклика:",
+        "how_to_apply": "Как откликнуться: {v}",
+        "no_contact": "Для этой вакансии не указан прямой контакт. "
+                       "Напишите администратору канала.",
+    },
+    "uk": {
+        "intro": "Цей бот надсилає вакансії в офшорі та морській галузі за "
+                 "обраною посадою — не потрібно гортати канал.",
+        "choose_position": "Оберіть посаду — надішлю відповідні вакансії за "
+                            "останні 3 дні, а далі — всі нові:",
+        "subscribed": "✅ Підписку оформлено: {tag}. Надсилаю вакансії...",
+        "backfill_empty": "Вакансій по {tag} за останні 3 дні поки немає — "
+                           "надішлю, щойно з'явиться відповідна.",
+        "contact_admin": "🆘 Написати адміністратору",
+        "send_cv": "Надішліть резюме на: {v}",
+        "open_form": "Відкрийте форму відгуку:",
+        "how_to_apply": "Як відгукнутися: {v}",
+        "no_contact": "Для цієї вакансії не вказано прямий контакт. "
+                       "Напишіть адміністратору каналу.",
+    },
+}
+
+
+def t(lang: str | None, key: str, **kwargs) -> str:
+    lang = lang if lang in TR else "en"
+    return TR[lang][key].format(**kwargs)
 
 router = Router()
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -357,9 +412,9 @@ def apply_button_url(vacancy_id: int) -> str:
 
 def channel_keyboard(fields: dict, vacancy_id: int, post_link: str | None, title: str) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text="📩 Apply", url=apply_button_url(vacancy_id))]]
-    if post_link:
-        share_url = "https://t.me/share/url?url=" + quote(post_link) + "&text=" + quote(title)
-        rows.append([InlineKeyboardButton(text="↗️ Share", url=share_url)])
+    rows.append([InlineKeyboardButton(
+        text="🔔 Get Job Alerts", url=f"https://t.me/{BOT_USERNAME}?start=join"
+    )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -448,15 +503,16 @@ async def cmd_start(message: Message, command: CommandObject):
         contact = (row["contact"] if row else None) or ""
         email = extract_email(contact)
         url = extract_url(contact) if not email else None
+        lang = db.get_subscriber_language(message.from_user.id)
         if email:
             # обычный текст с email — Telegram сам делает его кликабельным
             # (открывает почтовый клиент), в отличие от кнопки с mailto:
-            await message.answer(f"Send your CV to: {email}")
+            await message.answer(t(lang, "send_cv", v=email))
         elif url:
             # у вакансии своя собственная ссылка для отклика (например разные
             # ссылки на каждую позицию в одном посте) — https, кнопка разрешена
             await message.answer(
-                "Open the application form:",
+                t(lang, "open_form"),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(text="Open", url=url)
                 ]]),
@@ -465,36 +521,52 @@ async def cmd_start(message: Message, command: CommandObject):
             # контакт есть, но это не email и не ссылка — например текстовая
             # инструкция ("напишите в личку @agency"). Показываем как есть,
             # вместо кнопки в никуда.
-            await message.answer(f"How to apply: {contact.strip()}")
+            await message.answer(t(lang, "how_to_apply", v=contact.strip()))
         else:
             # у вакансии вообще нет контакта в тексте — честно говорим об
             # этом, а не показываем кнопку "Open", ведущую в общий канал
             await message.answer(
-                "No direct contact is listed for this vacancy. "
-                "Please contact the channel admin.",
+                t(lang, "no_contact"),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="Contact admin", url=CONSULT_LINK)
+                    InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)
                 ]]),
             )
         return
 
-    if not admin_only(message.from_user.id):
-        await message.answer("Бот приватный.")
+    if admin_only(message.from_user.id):
+        mode = "включена" if is_auto_publish() else "выключена"
+        await message.answer(
+            "Пришлите текст вакансии в любом формате (или пачку через ---).\n"
+            "Команды:\n"
+            "/stats — сводка за сегодня (/stats 7 — за 7 дней)\n"
+            "/contacts — список email/агентств из сохранённых вакансий\n"
+            "/testchannel — проверить доступ бота к каналу\n"
+            "/ad — опубликовать рекламный пост с кнопкой «Консультация»\n"
+            "/search — открыть поиск вакансий с фильтрами (мини-приложение)\n"
+            "/applications — последние отклики через мини-приложение\n"
+            "/subscribe — команда для кандидатов: подписка на вакансии по должности "
+            "(доступна любому, не только вам)\n"
+            "/subscribers — сколько людей подписалось и разбивка по должностям\n"
+            f"/autopublish on|off — автопубликация без подтверждения (сейчас {mode})"
+        )
         return
-    mode = "включена" if is_auto_publish() else "выключена"
+
+    # любой другой человек (не админ, без apply_-диплинка) — это кандидат,
+    # который либо перешёл по кнопке «🔔 Get Job Alerts» из канала, либо
+    # написал боту сам. Онбординг начинается с выбора языка.
     await message.answer(
-        "Пришлите текст вакансии в любом формате (или пачку через ---).\n"
-        "Команды:\n"
-        "/stats — сводка за сегодня (/stats 7 — за 7 дней)\n"
-        "/contacts — список email/агентств из сохранённых вакансий\n"
-        "/testchannel — проверить доступ бота к каналу\n"
-        "/ad — опубликовать рекламный пост с кнопкой «Консультация»\n"
-        "/search — открыть поиск вакансий с фильтрами (мини-приложение)\n"
-        "/applications — последние отклики через мини-приложение\n"
-        "/subscribe — команда для кандидатов: подписка на вакансии по должности "
-        "(доступна любому, не только вам)\n"
-        f"/autopublish on|off — автопубликация без подтверждения (сейчас {mode})"
+        "🇬🇧 English / 🇷🇺 Русский / 🇺🇦 Українська",
+        reply_markup=language_keyboard(),
     )
+
+
+@router.callback_query(F.data.startswith("lang:"))
+async def cb_set_language(callback: CallbackQuery):
+    lang = callback.data.split(":", 1)[1]
+    db.upsert_subscriber(callback.from_user.id, callback.from_user.username, language=lang)
+    await callback.message.edit_text(t(lang, "intro"))
+    await callback.message.answer(t(lang, "choose_position"), reply_markup=subscribe_keyboard(lang))
+    await callback.answer()
 
 
 @router.message(Command("stats"))
@@ -583,7 +655,15 @@ def ad_keyboard(ad_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
-def subscribe_keyboard() -> InlineKeyboardMarkup:
+def language_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🇬🇧 English", callback_data="lang:en"),
+        InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang:ru"),
+        InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang:uk"),
+    ]])
+
+
+def subscribe_keyboard(lang: str | None = None) -> InlineKeyboardMarkup:
     rows = []
     row = []
     for tag in RANK_TAGS:
@@ -593,6 +673,7 @@ def subscribe_keyboard() -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -679,14 +760,27 @@ async def cmd_ad(message: Message):
     )
 
 
+@router.message(Command("subscribers"))
+async def cmd_subscribers(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    total, by_tag = db.subscriber_stats()
+    lines = [f"👥 Подписчиков на /subscribe: {total}"]
+    if by_tag:
+        lines.append("")
+        lines.append("По должностям:")
+        lines += [f"• {row['tag']} — {row['c']}" for row in by_tag]
+    await message.answer("\n".join(lines))
+
+
 @router.message(Command("subscribe"))
 async def cmd_subscribe(message: Message):
     # доступно всем, не только админу — это функция для кандидатов, не для
     # управления каналом
+    lang = db.get_subscriber_language(message.from_user.id)
     await message.answer(
-        "Choose your position — I'll send matching vacancies from the last 3 days, "
-        "then new ones as they're posted:",
-        reply_markup=subscribe_keyboard(),
+        t(lang, "choose_position"),
+        reply_markup=subscribe_keyboard(lang),
     )
 
 
@@ -694,16 +788,14 @@ async def cmd_subscribe(message: Message):
 async def cb_subscribe_position(callback: CallbackQuery):
     position_tag = callback.data.split(":", 1)[1]
     tg_id = callback.from_user.id
-    db.upsert_subscriber(tg_id, position_tag, callback.from_user.username)
-    await callback.message.edit_text(f"✅ Subscribed to {position_tag}. Sending recent vacancies...")
+    lang = db.get_subscriber_language(tg_id)
+    db.upsert_subscriber(tg_id, callback.from_user.username, position_tag=position_tag)
+    await callback.message.edit_text(t(lang, "subscribed", tag=position_tag))
     await callback.answer()
 
     backfill = db.get_recent_published_by_tag(position_tag, days=3)
     if not backfill:
-        await callback.bot.send_message(
-            tg_id, f"No {position_tag} vacancies in the last 3 days yet — "
-                   "you'll get the next one as soon as it's posted."
-        )
+        await callback.bot.send_message(tg_id, t(lang, "backfill_empty", tag=position_tag))
         return
     for row in backfill:
         fields = dict(row)
