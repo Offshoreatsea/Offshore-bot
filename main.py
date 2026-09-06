@@ -18,8 +18,10 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
     MenuButtonWebApp,
     Message,
+    PreCheckoutQuery,
     WebAppInfo,
 )
 from dotenv import load_dotenv
@@ -40,6 +42,12 @@ CONSULT_LINK = os.getenv("CONSULT_LINK", "https://t.me/Offshore_atsea")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 WEBAPP_URL = os.getenv("WEBAPP_URL")  # публичный https-адрес мини-приложения, см. README
 PORT = int(os.getenv("PORT", "8080"))
+SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "250"))
+SUBSCRIPTION_DAYS = 7
+MAX_POSITIONS = 2
+SUBSCRIPTION_DAYS_MONTH = 30
+SUBSCRIPTION_PRICE_STARS_MONTH = int(os.getenv("SUBSCRIPTION_PRICE_STARS_MONTH", "800"))  # вместо 4×250=1000 — скидка за месяц
+REFERRAL_BONUS_DAYS = 3
 
 DIGEST_TIMES = ["09:00", "14:00", "19:00"]
 
@@ -87,7 +95,10 @@ FALLBACK_TAG = "Other"
 TR = {
     "en": {
         "intro": "This bot sends you offshore & maritime job vacancies for the "
-                  "position you choose — no need to scroll the channel.",
+                  "position you choose — no need to scroll the channel.\n\n"
+                  "⚠️ OffshoreAtSea is a vacancy aggregator only — we are not "
+                  "the employer and are not responsible for working conditions "
+                  "at the companies listed.",
         "choose_department": "Choose a department to see its positions:",
         "choose_position": "Choose one or more positions — tap to select, tap "
                             "again to remove. I'll send matching vacancies from "
@@ -101,6 +112,21 @@ TR = {
         "no_selection": "You haven't picked any position yet — tap one above.",
         "subscribed_summary": "Your alerts are set up for: {tags}",
         "contact_admin": "🆘 Contact admin",
+        "pay_intro": "Job alerts by position are a paid feature: {price} Stars "
+                     "gets you 7 days of instant notifications for the positions "
+                     "you choose, plus everything already posted in the last 7 days.",
+        "pay_button": "⭐ Pay {price} Stars for 7 days",
+        "pay_button_month": "⭐ Pay {price} Stars for 30 days (save vs weekly)",
+        "pay_contact_admin": "💬 Can't pay with Stars? Message admin",
+        "referral_bonus": "🎁 A friend you invited just paid — you got +{days} days, now active until {until}!",
+        "invite_friend": "🎁 Invite a friend, get 3 free days",
+        "referral_share_text": "Get job alerts by position on OffshoreAtSea 👇",
+        "expiry_reminder": "⏳ Your job alerts subscription ends in less than 24 hours. Renew to keep getting instant notifications:",
+        "pay_active_until": "✅ Your subscription is active until {until}.",
+        "payment_thanks": "✅ Payment received — active until {until}. Now pick your positions:",
+        "max_positions": "You can pick up to {max} positions. Remove one first to add another.",
+        "positions_locked_notice": "Your positions are locked in for this period: {tags}. "
+                                    "Contact admin if you need to change them.",
         "send_cv": "Send your CV to: {v}",
         "open_form": "Open the application form:",
         "how_to_apply": "How to apply: {v}",
@@ -109,7 +135,10 @@ TR = {
     },
     "ru": {
         "intro": "Этот бот присылает вакансии в офшоре и морской индустрии по "
-                 "выбранной должности — не нужно листать канал.",
+                 "выбранной должности — не нужно листать канал.\n\n"
+                 "⚠️ OffshoreAtSea — только агрегатор вакансий, мы не являемся "
+                 "работодателем и не несём ответственности за условия труда "
+                 "у указанных компаний.",
         "choose_department": "Выберите департамент, чтобы увидеть должности:",
         "choose_position": "Выберите одну или несколько должностей — нажмите, "
                             "чтобы добавить, ещё раз — чтобы убрать. Пришлю вакансии "
@@ -123,6 +152,21 @@ TR = {
         "no_selection": "Вы ещё не выбрали ни одной должности — нажмите на любую выше.",
         "subscribed_summary": "Ваши подписки: {tags}",
         "contact_admin": "🆘 Написать администратору",
+        "pay_intro": "Уведомления по должности — платная функция: {price} ⭐ "
+                     "дают 7 дней мгновенных уведомлений по выбранным должностям, "
+                     "плюс всё, что уже публиковалось за последние 7 дней.",
+        "pay_button": "⭐ Оплатить {price} Stars за 7 дней",
+        "pay_button_month": "⭐ Оплатить {price} Stars за 30 дней (выгоднее понедельной)",
+        "pay_contact_admin": "💬 Не можете оплатить Stars? Написать администратору",
+        "referral_bonus": "🎁 Приглашённый вами друг оплатил — вам +{days} дня, теперь активно до {until}!",
+        "invite_friend": "🎁 Пригласить друга, получить 3 дня бесплатно",
+        "referral_share_text": "Уведомления о вакансиях по должности в OffshoreAtSea 👇",
+        "expiry_reminder": "⏳ Ваша подписка на уведомления заканчивается меньше чем через 24 часа. Продлите, чтобы не пропускать вакансии:",
+        "pay_active_until": "✅ Подписка активна до {until}.",
+        "payment_thanks": "✅ Оплата прошла — активно до {until}. Теперь выберите должности:",
+        "max_positions": "Можно выбрать не больше {max} должностей. Сначала уберите одну, чтобы добавить другую.",
+        "positions_locked_notice": "Ваши должности зафиксированы на этот период: {tags}. "
+                                    "Если нужно изменить — напишите администратору.",
         "send_cv": "Отправьте резюме на: {v}",
         "open_form": "Откройте форму отклика:",
         "how_to_apply": "Как откликнуться: {v}",
@@ -131,7 +175,10 @@ TR = {
     },
     "uk": {
         "intro": "Цей бот надсилає вакансії в офшорі та морській галузі за "
-                 "обраною посадою — не потрібно гортати канал.",
+                 "обраною посадою — не потрібно гортати канал.\n\n"
+                 "⚠️ OffshoreAtSea — лише агрегатор вакансій, ми не є "
+                 "роботодавцем і не несемо відповідальності за умови праці "
+                 "у зазначених компаніях.",
         "choose_department": "Оберіть департамент, щоб побачити посади:",
         "choose_position": "Оберіть одну або кілька посад — натисніть, щоб додати, "
                             "ще раз — щоб прибрати. Надішлю вакансії за останні 7 днів "
@@ -145,6 +192,21 @@ TR = {
         "no_selection": "Ви ще не обрали жодної посади — натисніть на будь-яку вище.",
         "subscribed_summary": "Ваші підписки: {tags}",
         "contact_admin": "🆘 Написати адміністратору",
+        "pay_intro": "Сповіщення за посадою — платна функція: {price} ⭐ дають "
+                     "7 днів миттєвих сповіщень за обраними посадами, плюс усе, "
+                     "що вже публікувалося за останні 7 днів.",
+        "pay_button": "⭐ Оплатити {price} Stars за 7 днів",
+        "pay_button_month": "⭐ Оплатити {price} Stars за 30 днів (вигідніше за тижневу)",
+        "pay_contact_admin": "💬 Не можете оплатити Stars? Напишіть адміністратору",
+        "referral_bonus": "🎁 Запрошений вами друг оплатив — вам +{days} дні, тепер активно до {until}!",
+        "invite_friend": "🎁 Запросити друга, отримати 3 дні безкоштовно",
+        "referral_share_text": "Сповіщення про вакансії за посадою в OffshoreAtSea 👇",
+        "expiry_reminder": "⏳ Ваша підписка на сповіщення закінчується менш ніж за 24 години. Продовжте, щоб не пропускати вакансії:",
+        "pay_active_until": "✅ Підписку активовано до {until}.",
+        "payment_thanks": "✅ Оплату отримано — активно до {until}. Тепер оберіть посади:",
+        "max_positions": "Можна обрати не більше {max} посад. Спочатку приберіть одну, щоб додати іншу.",
+        "positions_locked_notice": "Ваші посади зафіксовано на цей період: {tags}. "
+                                    "Якщо потрібно змінити — напишіть адміністратору.",
         "send_cv": "Надішліть резюме на: {v}",
         "open_form": "Відкрийте форму відгуку:",
         "how_to_apply": "Як відгукнутися: {v}",
@@ -478,11 +540,11 @@ def apply_button_url(vacancy_id: int) -> str:
 
 
 def channel_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="📩 Apply", url=apply_button_url(vacancy_id))]]
-    rows.append([InlineKeyboardButton(
-        text="🔔 Get Job Alerts", url=f"https://t.me/{BOT_USERNAME}?start=join"
-    )])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🎯 Get Matched Jobs", url=f"https://t.me/{BOT_USERNAME}?start=join"
+        )
+    ]])
 
 
 
@@ -625,17 +687,165 @@ async def cmd_start(message: Message, command: CommandObject):
             "/subscribe — команда для кандидатов: подписка на вакансии по должности "
             "(доступна любому, не только вам)\n"
             "/subscribers — сколько людей подписалось и разбивка по должностям\n"
+            "/subscriberslist — полный список подписчиков (ник, должности, статус оплаты)\n"
+            "/grant <@ник или id> [дней] — выдать доступ вручную, если оплатили не через Stars\n"
+            "/refund <@ник или id> — вернуть последний неоплаченный возвратом платёж\n"
+            "/revenue [дней] — доход в Stars за период (по умолчанию 7 дней)\n"
+            "/blockuser <@ник или id> — заблокировать (бот перестанет отвечать)\n"
+            "/unblockuser <@ник или id> — снять блокировку\n"
             f"/autopublish on|off — автопубликация без подтверждения (сейчас {mode})"
         )
+        # email-дайджест за неделю — только тебе, никто другой это не увидит
+        contacts = db.list_contacts_since(7)
+        emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
+        if emails:
+            await message.answer(
+                f"📧 Email за последние 7 дней ({len(emails)}):\n\n" + "\n".join(emails)
+            )
         return
 
     # любой другой человек (не админ, без apply_-диплинка) — это кандидат,
-    # который либо перешёл по кнопке «🔔 Get Job Alerts» из канала, либо
-    # написал боту сам. Онбординг начинается с выбора языка.
+    # который либо перешёл по кнопке «🎯 Get Matched Jobs» из канала, либо
+    # написал боту сам.
+    tg_id = message.from_user.id
+    if db.is_blocked(tg_id):
+        return  # заблокированные админом (спам/злоупотребление) — бот просто молчит
+
+    # диплинк-приглашение вида ?start=ref_123456789 — запоминаем, кто кого
+    # привёл, чтобы начислить бонус пригласившему при первой оплате друга
+    if command.args and command.args.startswith("ref_"):
+        try:
+            referrer_id = int(command.args.replace("ref_", ""))
+            if referrer_id != tg_id:
+                db.set_referred_by(tg_id, referrer_id)
+        except ValueError:
+            pass
+
+    # Онбординг начинается с выбора языка.
     await message.answer(
         "🇬🇧 English / 🇷🇺 Русский / 🇺🇦 Українська",
         reply_markup=language_keyboard(),
     )
+
+
+def payment_keyboard(lang: str | None = None) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=t(lang, "pay_button", price=SUBSCRIPTION_PRICE_STARS),
+            callback_data=f"pay_sub:{SUBSCRIPTION_DAYS}:{SUBSCRIPTION_PRICE_STARS}",
+        )],
+        [InlineKeyboardButton(
+            text=t(lang, "pay_button_month", price=SUBSCRIPTION_PRICE_STARS_MONTH),
+            callback_data=f"pay_sub:{SUBSCRIPTION_DAYS_MONTH}:{SUBSCRIPTION_PRICE_STARS_MONTH}",
+        )],
+        [InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")],
+        [InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)],
+    ])
+
+
+async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit: bool):
+    """target — либо Message (обычный ответ), либо CallbackQuery.message (для
+    edit_text). Показывает: экран оплаты (нет активной подписки), сводку
+    без редактирования (должности уже зафиксированы на этот период), либо
+    список департаментов для выбора (оплачено, но ещё не выбрано/разблокировано)."""
+    if db.is_blocked(tg_id):
+        return  # заблокированный — просто молчим, не даём вообще никакого экрана
+    if not db.is_subscription_active(tg_id):
+        text = t(lang, "pay_intro", price=SUBSCRIPTION_PRICE_STARS)
+        markup = payment_keyboard(lang)
+    elif db.is_positions_locked(tg_id):
+        selected = db.get_subscriber_positions(tg_id)
+        text = t(lang, "positions_locked_notice", tags=", ".join(selected))
+        markup = after_subscribe_keyboard(lang, tg_id)
+    else:
+        selected = set(db.get_subscriber_positions(tg_id))
+        text, markup = t(lang, "choose_department"), department_keyboard(lang, selected)
+    if edit:
+        await target.edit_text(text, reply_markup=markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("pay_sub:"))
+async def cb_pay_subscription(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
+    if db.is_blocked(tg_id):
+        await callback.answer()
+        return
+    _, days_str, price_str = callback.data.split(":")
+    days, price = int(days_str), int(price_str)
+    await callback.bot.send_invoice(
+        chat_id=tg_id,
+        title=f"OffshoreAtSea — Job Alerts ({days} days)",
+        description=f"Instant vacancy alerts for the positions you choose, "
+                     f"{days} days of access.",
+        payload=f"subscription_{tg_id}_{days}_{price}",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"Job Alerts — {days} days", amount=price)],
+        provider_token="",  # для Stars (XTR) provider_token не нужен
+    )
+    await callback.answer()
+
+
+@router.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    # обязательно ответить в течение ~10 секунд, иначе Telegram отменит платёж
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    tg_id = message.from_user.id
+    sp = message.successful_payment
+    # payload несёт реальные дни/цену конкретного тарифа — не полагаемся на
+    # константы по умолчанию, человек мог оплатить недельный или месячный
+    try:
+        _, _, days_str, price_str = sp.invoice_payload.split("_")
+        days, price = int(days_str), int(price_str)
+    except (ValueError, AttributeError):
+        days, price = SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS
+
+    is_first_payment = db.count_payments(tg_id) == 0
+    db.insert_payment(tg_id, price, days, sp.telegram_payment_charge_id)
+    new_until = db.extend_subscription(tg_id, days)
+    db.unlock_positions(tg_id)  # новый оплаченный период — можно скорректировать выбор
+    lang = db.get_subscriber_language(tg_id)
+    until_str = datetime.fromisoformat(new_until).strftime("%d.%m.%Y")
+    selected = set(db.get_subscriber_positions(tg_id))
+    await message.answer(
+        t(lang, "payment_thanks", until=until_str),
+        reply_markup=department_keyboard(lang, selected),
+    )
+
+    # реферальный бонус — только за самую первую оплату приглашённого,
+    # чтобы не начислять его повторно за каждое продление
+    if is_first_payment:
+        referrer_id = db.get_referrer(tg_id)
+        if referrer_id:
+            ref_until = db.extend_subscription(referrer_id, REFERRAL_BONUS_DAYS)
+            ref_lang = db.get_subscriber_language(referrer_id)
+            ref_until_str = datetime.fromisoformat(ref_until).strftime("%d.%m.%Y")
+            try:
+                await message.bot.send_message(
+                    referrer_id, t(ref_lang, "referral_bonus", days=REFERRAL_BONUS_DAYS, until=ref_until_str)
+                )
+            except TelegramAPIError:
+                pass
+
+    # уведомление тебе в реальном времени о каждой оплате — без захода в
+    # /subscriberslist руками
+    username = f"@{message.from_user.username}" if message.from_user.username else f"id{tg_id}"
+    for admin_id in ADMIN_IDS:
+        try:
+            await message.bot.send_message(
+                admin_id,
+                f"💰 Оплата: {username} — {price}⭐ за {days} дней, активно до {until_str}",
+            )
+        except TelegramAPIError:
+            pass
 
 
 @router.callback_query(F.data == "showlang")
@@ -657,10 +867,7 @@ async def cb_show_positions(callback: CallbackQuery):
         await callback.answer()
         return
     lang = db.get_subscriber_language(tg_id)
-    selected = set(db.get_subscriber_positions(tg_id))
-    await callback.message.edit_text(
-        t(lang, "choose_department"), reply_markup=department_keyboard(lang, selected)
-    )
+    await show_department_or_paywall(callback.message, tg_id, lang, edit=True)
     await callback.answer()
 
 
@@ -672,6 +879,10 @@ async def cb_show_department(callback: CallbackQuery):
         await callback.answer()
         return
     lang = db.get_subscriber_language(tg_id)
+    if db.is_positions_locked(tg_id) or not db.is_subscription_active(tg_id):
+        await show_department_or_paywall(callback.message, tg_id, lang, edit=True)
+        await callback.answer()
+        return
     selected = set(db.get_subscriber_positions(tg_id))
     await callback.message.edit_text(
         t(lang, "choose_position"), reply_markup=subscribe_keyboard(dept, lang, selected)
@@ -701,11 +912,8 @@ async def cb_set_language(callback: CallbackQuery):
         return
     lang = callback.data.split(":", 1)[1]
     db.upsert_subscriber(tg_id, callback.from_user.username, language=lang)
-    selected = set(db.get_subscriber_positions(tg_id))
     await callback.message.edit_text(t(lang, "intro"))
-    await callback.message.answer(
-        t(lang, "choose_department"), reply_markup=department_keyboard(lang, selected)
-    )
+    await show_department_or_paywall(callback.message, tg_id, lang, edit=False)
     await callback.answer()
 
 
@@ -844,14 +1052,17 @@ def subscribe_keyboard(dept: str, lang: str | None = None, selected: set[str] | 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def after_subscribe_keyboard(lang: str | None = None) -> InlineKeyboardMarkup:
-    # клавиатура под итоговой сводкой (после "Готово") — быстрый путь назад
-    # без поиска команд руками
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Change positions", callback_data="showpos")],
-        [InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")],
-        [InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)],
-    ])
+def after_subscribe_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
+    # должности зафиксированы после "Готово" — кнопки на их смену больше нет,
+    # это осознанное решение (см. cb_subscribe_done); язык менять можно всегда
+    rows = []
+    if tg_id:
+        ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{tg_id}"
+        share_url = f"https://t.me/share/url?url={ref_link}&text=" + t(lang, "referral_share_text")
+        rows.append([InlineKeyboardButton(text=t(lang, "invite_friend"), url=share_url)])
+    rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
+    rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def consult_keyboard() -> InlineKeyboardMarkup:
@@ -950,17 +1161,141 @@ async def cmd_subscribers(message: Message):
     await message.answer("\n".join(lines))
 
 
+@router.message(Command("subscriberslist"))
+async def cmd_subscribers_list(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    people = db.get_subscribers_list()
+    if not people:
+        await message.answer("Пока никто не подписался.")
+        return
+    now = datetime.now()
+    lines = [f"👥 Подписчики ({len(people)}):\n"]
+    for p in people:
+        handle = f"@{p['username']}" if p['username'] else f"id{p['tg_id']}"
+        positions = ", ".join(p["positions"]) if p["positions"] else "—"
+        if p["subscription_until"] and datetime.fromisoformat(p["subscription_until"]) > now:
+            until = datetime.fromisoformat(p["subscription_until"]).strftime("%d.%m.%Y")
+            status = f"✅ до {until}"
+        else:
+            status = "❌ не оплачена"
+        lines.append(f"{handle} — {positions} — {status}")
+    # телеграм режет сообщения длиннее ~4096 символов — режем на части сами,
+    # чтобы длинный список не падал с ошибкой на большой базе подписчиков
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await message.answer(text[i:i + 3500])
+
+
+@router.message(Command("grant"))
+async def cmd_grant(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    args = (command.args or "").split()
+    if not args:
+        await message.answer("Использование: /grant <@username или id> [дней, по умолчанию 7]")
+        return
+    handle = args[0]
+    days = int(args[1]) if len(args) > 1 and args[1].isdigit() else SUBSCRIPTION_DAYS
+    row = db.find_subscriber_by_handle(handle)
+    if not row:
+        await message.answer(
+            f"Не нашёл {handle} в базе — человек должен хотя бы раз написать боту /start, "
+            f"прежде чем выдать ему доступ вручную."
+        )
+        return
+    tg_id = row["tg_id"]
+    new_until = db.extend_subscription(tg_id, days)
+    db.unlock_positions(tg_id)
+    until_str = datetime.fromisoformat(new_until).strftime("%d.%m.%Y")
+    await message.answer(f"✅ Выдал доступ на {days} дней. Активно до {until_str}.")
+    lang = db.get_subscriber_language(tg_id)
+    try:
+        await message.bot.send_message(
+            tg_id, t(lang, "payment_thanks", until=until_str),
+            reply_markup=department_keyboard(lang, set(db.get_subscriber_positions(tg_id))),
+        )
+    except TelegramAPIError:
+        pass
+
+
+@router.message(Command("refund"))
+async def cmd_refund(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    handle = (command.args or "").strip()
+    if not handle:
+        await message.answer("Использование: /refund <@username или id>")
+        return
+    row = db.find_subscriber_by_handle(handle)
+    if not row:
+        await message.answer(f"Не нашёл {handle} в базе подписчиков.")
+        return
+    payment = db.get_last_unrefunded_payment(row["tg_id"])
+    if not payment:
+        await message.answer(f"У {handle} нет неоплаченных возвратом платежей.")
+        return
+    try:
+        await message.bot.refund_star_payment(
+            user_id=row["tg_id"], telegram_payment_charge_id=payment["charge_id"]
+        )
+    except TelegramAPIError as e:
+        await message.answer(f"❌ Не удалось вернуть: {e}")
+        return
+    db.mark_payment_refunded(payment["id"])
+    await message.answer(f"✅ Возвращено {payment['amount_stars']}⭐ пользователю {handle}.")
+
+
+@router.message(Command("revenue"))
+async def cmd_revenue(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    arg = (command.args or "").strip()
+    days = int(arg) if arg.isdigit() else 7
+    total, count = db.revenue_since(days)
+    label = "неделю" if days == 7 else f"{days} дней"
+    await message.answer(f"💰 Доход за последние {label}: {total}⭐ ({count} оплат)")
+
+
+@router.message(Command("blockuser"))
+async def cmd_block_user(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    handle = (command.args or "").strip()
+    if not handle:
+        await message.answer("Использование: /blockuser <@username или id>")
+        return
+    row = db.find_subscriber_by_handle(handle)
+    if not row:
+        await message.answer(f"Не нашёл {handle} в базе подписчиков.")
+        return
+    db.set_blocked(row["tg_id"], True)
+    await message.answer(f"🚫 {handle} заблокирован — бот больше не будет ему отвечать.")
+
+
+@router.message(Command("unblockuser"))
+async def cmd_unblock_user(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    handle = (command.args or "").strip()
+    if not handle:
+        await message.answer("Использование: /unblockuser <@username или id>")
+        return
+    row = db.find_subscriber_by_handle(handle)
+    if not row:
+        await message.answer(f"Не нашёл {handle} в базе подписчиков.")
+        return
+    db.set_blocked(row["tg_id"], False)
+    await message.answer(f"✅ {handle} разблокирован.")
+
+
 @router.message(Command("subscribe"))
 async def cmd_subscribe(message: Message):
     # доступно всем, не только админу — это функция для кандидатов, не для
     # управления каналом
     tg_id = message.from_user.id
     lang = db.get_subscriber_language(tg_id)
-    selected = set(db.get_subscriber_positions(tg_id))
-    await message.answer(
-        t(lang, "choose_department"),
-        reply_markup=department_keyboard(lang, selected),
-    )
+    await show_department_or_paywall(message, tg_id, lang, edit=False)
 
 
 @router.callback_query(F.data.startswith("subpos:"))
@@ -971,6 +1306,20 @@ async def cb_subscribe_position(callback: CallbackQuery):
         await callback.answer()
         return
     lang = db.get_subscriber_language(tg_id)
+    if not db.is_subscription_active(tg_id):
+        await show_department_or_paywall(callback.message, tg_id, lang, edit=True)
+        await callback.answer()
+        return
+    if db.is_positions_locked(tg_id):
+        await show_department_or_paywall(callback.message, tg_id, lang, edit=True)
+        await callback.answer()
+        return
+
+    current = db.get_subscriber_positions(tg_id)
+    if position_tag not in current and len(current) >= MAX_POSITIONS:
+        await callback.answer(t(lang, "max_positions", max=MAX_POSITIONS), show_alert=True)
+        return
+
     added = db.toggle_subscription(tg_id, position_tag)
 
     # обновляем только галочки на клавиатуре этого же департамента — текст-
@@ -1014,9 +1363,10 @@ async def cb_subscribe_done(callback: CallbackQuery):
     if not selected:
         await callback.answer(t(lang, "no_selection"), show_alert=True)
         return
+    db.lock_positions(tg_id)  # с этого момента выбор нельзя изменить до следующей оплаты
     await callback.message.edit_text(
         t(lang, "subscribed_summary", tags=", ".join(selected)),
-        reply_markup=after_subscribe_keyboard(lang),
+        reply_markup=after_subscribe_keyboard(lang, tg_id),
     )
     await callback.answer()
 
@@ -1182,12 +1532,31 @@ async def digest_worker(bot: Bot):
         await asyncio.sleep(60)
 
 
+async def subscription_reminder_worker(bot: Bot):
+    # проверяем раз в час — часто чаще и не нужно, окно напоминания 24ч
+    while True:
+        expiring = db.get_expiring_subscribers(within_hours=24)
+        for row in expiring:
+            lang = row["language"]
+            try:
+                await bot.send_message(
+                    row["tg_id"],
+                    t(lang, "expiry_reminder"),
+                    reply_markup=payment_keyboard(lang),
+                )
+                db.mark_reminder_sent(row["tg_id"], row["subscription_until"])
+            except TelegramAPIError:
+                pass
+        await asyncio.sleep(3600)
+
+
 async def main():
     db.init_db()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     asyncio.create_task(digest_worker(bot))
+    asyncio.create_task(subscription_reminder_worker(bot))
 
     if WEBAPP_URL:
         asyncio.create_task(webapp.run_web_server(bot, BOT_TOKEN, PORT))
