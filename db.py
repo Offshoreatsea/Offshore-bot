@@ -64,6 +64,20 @@ def init_db():
     """)
 
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS candidates (
+            tg_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            nationality TEXT,
+            current_rank TEXT,
+            vessel_types TEXT,
+            years_experience TEXT,
+            availability TEXT,
+            documents TEXT,
+            updated_at TEXT
+        )
+    """)
+
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -82,6 +96,28 @@ def init_db():
     sub_cols = {row["name"] for row in conn.execute("PRAGMA table_info(subscribers)")}
     if "language" not in sub_cols:
         conn.execute("ALTER TABLE subscribers ADD COLUMN language TEXT")
+    if "subscription_until" not in sub_cols:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN subscription_until TEXT")
+    if "positions_locked" not in sub_cols:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN positions_locked INTEGER DEFAULT 0")
+    if "is_blocked" not in sub_cols:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN is_blocked INTEGER DEFAULT 0")
+    if "referred_by" not in sub_cols:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN referred_by INTEGER")
+    if "reminder_sent_for" not in sub_cols:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN reminder_sent_for TEXT")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER,
+            amount_stars INTEGER,
+            days INTEGER,
+            charge_id TEXT,
+            refunded INTEGER DEFAULT 0,
+            created_at TEXT
+        )
+    """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (
@@ -307,6 +343,226 @@ def get_subscriber_language(tg_id: int) -> str | None:
     return row["language"] if row else None
 
 
+def is_subscription_active(tg_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    if not row or not row["subscription_until"]:
+        return False
+    return datetime.fromisoformat(row["subscription_until"]) > datetime.now()
+
+
+def extend_subscription(tg_id: int, days: int):
+    """Продлевает платную подписку на N дней от текущего момента (или от
+    даты истечения, если она ещё не прошла — чтобы досрочная повторная
+    оплата не сгорала впустую)."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    now = datetime.now()
+    base = now
+    if row and row["subscription_until"]:
+        current = datetime.fromisoformat(row["subscription_until"])
+        if current > now:
+            base = current
+    new_until = (base + timedelta(days=days)).isoformat()
+    conn.execute(
+        "UPDATE subscribers SET subscription_until = ? WHERE tg_id = ?", (new_until, tg_id)
+    )
+    conn.commit()
+    conn.close()
+    return new_until
+
+
+def is_positions_locked(tg_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT positions_locked FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    return bool(row and row["positions_locked"])
+
+
+def lock_positions(tg_id: int):
+    conn = get_conn()
+    conn.execute("UPDATE subscribers SET positions_locked = 1 WHERE tg_id = ?", (tg_id,))
+    conn.commit()
+    conn.close()
+
+
+def unlock_positions(tg_id: int):
+    # вызывается при каждой новой оплате — на новый оплаченный период
+    # человек снова может скорректировать свои 2 должности
+    conn = get_conn()
+    conn.execute("UPDATE subscribers SET positions_locked = 0 WHERE tg_id = ?", (tg_id,))
+    conn.commit()
+    conn.close()
+
+
+def insert_payment(tg_id: int, amount_stars: int, days: int, charge_id: str):
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO payments (tg_id, amount_stars, days, charge_id, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (tg_id, amount_stars, days, charge_id, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_last_unrefunded_payment(tg_id: int):
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT * FROM payments WHERE tg_id = ? AND refunded = 0
+           ORDER BY id DESC LIMIT 1""",
+        (tg_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def mark_payment_refunded(payment_id: int):
+    conn = get_conn()
+    conn.execute("UPDATE payments SET refunded = 1 WHERE id = ?", (payment_id,))
+    conn.commit()
+    conn.close()
+
+
+def revenue_since(days: int):
+    conn = get_conn()
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    row = conn.execute(
+        """SELECT COALESCE(SUM(amount_stars), 0) as total, COUNT(*) as cnt
+           FROM payments WHERE created_at > ? AND refunded = 0""",
+        (cutoff,),
+    ).fetchone()
+    conn.close()
+    return row["total"], row["cnt"]
+
+
+def find_subscriber_by_handle(handle: str):
+    """Ищет по @username (без @) или по числовому tg_id — то, что админ
+    вводит после /grant, /refund, /blockuser."""
+    conn = get_conn()
+    handle = handle.lstrip("@")
+    if handle.isdigit():
+        row = conn.execute("SELECT * FROM subscribers WHERE tg_id = ?", (int(handle),)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM subscribers WHERE LOWER(username) = LOWER(?)", (handle,)
+        ).fetchone()
+    conn.close()
+    return row
+
+
+def set_blocked(tg_id: int, blocked: bool):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscribers SET is_blocked = ? WHERE tg_id = ?", (1 if blocked else 0, tg_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_blocked(tg_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT is_blocked FROM subscribers WHERE tg_id = ?", (tg_id,)).fetchone()
+    conn.close()
+    return bool(row and row["is_blocked"])
+
+
+def set_referred_by(tg_id: int, referrer_tg_id: int):
+    # пишем реферера только один раз — если уже есть запись об этом
+    # пользователе с referred_by, повторный /start?ref= его не перезапишет
+    conn = get_conn()
+    existing = conn.execute(
+        "SELECT referred_by FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    if existing and existing["referred_by"]:
+        conn.close()
+        return
+    if not existing:
+        # человек совсем новый — это /start ДО выбора языка, записи в
+        # subscribers ещё нет вообще; создаём заготовку, upsert_subscriber
+        # потом просто дозаполнит остальные поля
+        conn.execute(
+            "INSERT INTO subscribers (tg_id, subscribed_at) VALUES (?, ?)",
+            (tg_id, datetime.now().isoformat()),
+        )
+    conn.execute("UPDATE subscribers SET referred_by = ? WHERE tg_id = ?", (referrer_tg_id, tg_id))
+    conn.commit()
+    conn.close()
+
+
+def get_referrer(tg_id: int):
+    conn = get_conn()
+    row = conn.execute("SELECT referred_by FROM subscribers WHERE tg_id = ?", (tg_id,)).fetchone()
+    conn.close()
+    return row["referred_by"] if row else None
+
+
+def count_payments(tg_id: int) -> int:
+    conn = get_conn()
+    row = conn.execute("SELECT COUNT(*) c FROM payments WHERE tg_id = ?", (tg_id,)).fetchone()
+    conn.close()
+    return row["c"]
+
+
+def get_expiring_subscribers(within_hours: int = 24):
+    """Те, у кого подписка истекает в ближайшие N часов и кому ещё не
+    отправляли напоминание именно про этот срок (reminder_sent_for)."""
+    conn = get_conn()
+    now = datetime.now()
+    soon = now + timedelta(hours=within_hours)
+    rows = conn.execute(
+        """SELECT tg_id, subscription_until, language FROM subscribers
+           WHERE subscription_until IS NOT NULL
+             AND subscription_until > ? AND subscription_until <= ?
+             AND (reminder_sent_for IS NULL OR reminder_sent_for != subscription_until)""",
+        (now.isoformat(), soon.isoformat()),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def mark_reminder_sent(tg_id: int, subscription_until: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscribers SET reminder_sent_for = ? WHERE tg_id = ?",
+        (subscription_until, tg_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_subscribers_list():
+    """Полный список подписчиков для админа: ник, язык, должности, статус
+    платной подписки — в отличие от subscriber_stats(), которая даёт только
+    агрегированные счётчики."""
+    conn = get_conn()
+    subs = conn.execute(
+        "SELECT tg_id, username, language, subscription_until FROM subscribers "
+        "ORDER BY subscribed_at DESC"
+    ).fetchall()
+    result = []
+    for s in subs:
+        positions = conn.execute(
+            "SELECT position_tag FROM subscriptions WHERE tg_id = ?", (s["tg_id"],)
+        ).fetchall()
+        result.append({
+            "tg_id": s["tg_id"],
+            "username": s["username"],
+            "language": s["language"],
+            "subscription_until": s["subscription_until"],
+            "positions": [p["position_tag"] for p in positions],
+        })
+    conn.close()
+    return result
+
+
 def toggle_subscription(tg_id: int, position_tag: str) -> bool:
     """Переключает подписку на должность (добавляет, если не было — убирает,
     если уже была). Возвращает True, если после вызова подписка ДОБАВЛЕНА
@@ -352,9 +608,16 @@ def subscriber_stats():
 
 
 def get_subscribers_for_tag(position_tag: str):
+    # рассылка вакансий — платная фича: шлём только тем, у кого подписка
+    # ещё не истекла, а не всем, кто когда-либо выбирал эту должность
     conn = get_conn()
     rows = conn.execute(
-        "SELECT tg_id FROM subscriptions WHERE position_tag = ?", (position_tag,)
+        """SELECT subscriptions.tg_id FROM subscriptions
+           JOIN subscribers ON subscribers.tg_id = subscriptions.tg_id
+           WHERE subscriptions.position_tag = ?
+             AND subscribers.subscription_until IS NOT NULL
+             AND subscribers.subscription_until > ?""",
+        (position_tag, datetime.now().isoformat()),
     ).fetchall()
     conn.close()
     return [r["tg_id"] for r in rows]
@@ -453,6 +716,55 @@ def list_recent_applications(limit: int = 20):
     return rows
 
 
+def get_applications_for_candidate(candidate_tg_id: int, limit: int = 50):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT applications.*, vacancies.position AS vacancy_position,
+                  vacancies.vessel AS vacancy_vessel
+           FROM applications
+           LEFT JOIN vacancies ON vacancies.id = applications.vacancy_id
+           WHERE applications.candidate_tg_id = ?
+           ORDER BY applications.id DESC LIMIT ?""",
+        (candidate_tg_id, limit),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_candidate_profile(tg_id: int):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM candidates WHERE tg_id = ?", (tg_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def upsert_candidate_profile(tg_id: int, fields: dict):
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO candidates
+           (tg_id, full_name, nationality, current_rank, vessel_types,
+            years_experience, availability, documents, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(tg_id) DO UPDATE SET
+               full_name = excluded.full_name,
+               nationality = excluded.nationality,
+               current_rank = excluded.current_rank,
+               vessel_types = excluded.vessel_types,
+               years_experience = excluded.years_experience,
+               availability = excluded.availability,
+               documents = excluded.documents,
+               updated_at = excluded.updated_at""",
+        (
+            tg_id, fields.get("full_name"), fields.get("nationality"),
+            fields.get("current_rank"), fields.get("vessel_types"),
+            fields.get("years_experience"), fields.get("availability"),
+            fields.get("documents"), datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
 def list_contacts():
     """Уникальные контакты (email/агентства) из всех сохранённых вакансий,
     с числом вакансий и датой последней публикации по каждому."""
@@ -468,3 +780,19 @@ def list_contacts():
     """).fetchall()
     conn.close()
     return rows
+
+
+def list_contacts_since(days: int = 7):
+    """Контакты (email/агентства) только из вакансий, опубликованных за
+    последние N дней — используется для email-дайджеста админу при /start."""
+    conn = get_conn()
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    rows = conn.execute(
+        """SELECT DISTINCT contact FROM vacancies
+           WHERE status = 'published' AND created_at > ?
+             AND contact IS NOT NULL AND contact != ''
+           ORDER BY contact""",
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+    return [r["contact"] for r in rows]
