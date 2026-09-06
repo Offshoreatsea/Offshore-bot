@@ -688,20 +688,25 @@ async def cmd_start(message: Message, command: CommandObject):
             "(доступна любому, не только вам)\n"
             "/subscribers — сколько людей подписалось и разбивка по должностям\n"
             "/subscriberslist — полный список подписчиков (ник, должности, статус оплаты)\n"
-            "/grant <@ник или id> [дней] — выдать доступ вручную, если оплатили не через Stars\n"
-            "/refund <@ник или id> — вернуть последний неоплаченный возвратом платёж\n"
+            "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не через Stars\n"
+            "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
             "/revenue [дней] — доход в Stars за период (по умолчанию 7 дней)\n"
-            "/blockuser <@ник или id> — заблокировать (бот перестанет отвечать)\n"
-            "/unblockuser <@ник или id> — снять блокировку\n"
+            "/blockuser [@ник или id] — заблокировать (бот перестанет отвечать)\n"
+            "/unblockuser [@ник или id] — снять блокировку\n"
             f"/autopublish on|off — автопубликация без подтверждения (сейчас {mode})"
         )
-        # email-дайджест за неделю — только тебе, никто другой это не увидит
-        contacts = db.list_contacts_since(7)
-        emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
-        if emails:
-            await message.answer(
-                f"📧 Email за последние 7 дней ({len(emails)}):\n\n" + "\n".join(emails)
-            )
+        # email-дайджест за неделю — только тебе, никто другой это не увидит.
+        # Обёрнуто в try/except: если тут что-то сломается, это не должно
+        # выглядеть как "бот вообще не ответил" — основной текст выше уже ушёл
+        try:
+            contacts = db.list_contacts_since(7)
+            emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
+            if emails:
+                await message.answer(
+                    f"📧 Email за последние 7 дней ({len(emails)}):\n\n" + "\n".join(emails)
+                )
+        except Exception as e:
+            await message.answer(f"⚠️ Не удалось собрать email-дайджест: {e}")
         return
 
     # любой другой человек (не админ, без apply_-диплинка) — это кандидат,
@@ -1193,7 +1198,7 @@ async def cmd_grant(message: Message, command: CommandObject):
         return
     args = (command.args or "").split()
     if not args:
-        await message.answer("Использование: /grant <@username или id> [дней, по умолчанию 7]")
+        await message.answer("Использование: /grant [@username или id] [дней, по умолчанию 7]")
         return
     handle = args[0]
     days = int(args[1]) if len(args) > 1 and args[1].isdigit() else SUBSCRIPTION_DAYS
@@ -1225,7 +1230,7 @@ async def cmd_refund(message: Message, command: CommandObject):
         return
     handle = (command.args or "").strip()
     if not handle:
-        await message.answer("Использование: /refund <@username или id>")
+        await message.answer("Использование: /refund [@username или id]")
         return
     row = db.find_subscriber_by_handle(handle)
     if not row:
@@ -1263,7 +1268,7 @@ async def cmd_block_user(message: Message, command: CommandObject):
         return
     handle = (command.args or "").strip()
     if not handle:
-        await message.answer("Использование: /blockuser <@username или id>")
+        await message.answer("Использование: /blockuser [@username или id]")
         return
     row = db.find_subscriber_by_handle(handle)
     if not row:
@@ -1279,7 +1284,7 @@ async def cmd_unblock_user(message: Message, command: CommandObject):
         return
     handle = (command.args or "").strip()
     if not handle:
-        await message.answer("Использование: /unblockuser <@username или id>")
+        await message.answer("Использование: /unblockuser [@username или id]")
         return
     row = db.find_subscriber_by_handle(handle)
     if not row:
