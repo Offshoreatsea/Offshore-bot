@@ -80,7 +80,7 @@ async def handle_vacancies(request: web.Request) -> web.Response:
     return web.json_response([vacancy_to_dict(r) for r in rows])
 
 
-def create_app(bot, bot_token: str, on_stripe_payment=None) -> web.Application:
+def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_payment=None) -> web.Application:
     app = web.Application()
 
     def get_authenticated_tg_id(init_data: str) -> int | None:
@@ -113,12 +113,21 @@ def create_app(bot, bot_token: str, on_stripe_payment=None) -> web.Application:
 
         if event["type"] == "checkout.session.completed":
             session = event["data"]["object"]
-            tg_id_raw = session.get("client_reference_id")
-            if tg_id_raw and tg_id_raw.isdigit() and on_stripe_payment:
-                tg_id = int(tg_id_raw)
-                amount = (session.get("amount_total") or 0) / 100  # центы → доллары
-                currency = (session.get("currency") or "usd").upper()
-                charge_id = session.get("payment_intent") or session.get("id")
+            ref = session.get("client_reference_id") or ""
+            amount = (session.get("amount_total") or 0) / 100  # центы → доллары
+            currency = (session.get("currency") or "usd").upper()
+            charge_id = session.get("payment_intent") or session.get("id")
+
+            if ref.startswith("digest_") and on_stripe_digest_payment:
+                tg_id_raw = ref.replace("digest_", "", 1)
+                if tg_id_raw.isdigit():
+                    tg_id = int(tg_id_raw)
+                    try:
+                        await on_stripe_digest_payment(bot, tg_id, amount, currency, charge_id)
+                    except Exception as e:
+                        print(f"[stripe webhook] Ошибка доставки дайджеста для tg_id={tg_id}: {e}")
+            elif ref.isdigit() and on_stripe_payment:
+                tg_id = int(ref)
                 try:
                     await on_stripe_payment(bot, tg_id, STRIPE_SUBSCRIPTION_DAYS, amount, currency, charge_id)
                 except Exception as e:
@@ -250,8 +259,8 @@ def create_app(bot, bot_token: str, on_stripe_payment=None) -> web.Application:
     return app
 
 
-async def run_web_server(bot, bot_token: str, port: int, on_stripe_payment=None):
-    app = create_app(bot, bot_token, on_stripe_payment)
+async def run_web_server(bot, bot_token: str, port: int, on_stripe_payment=None, on_stripe_digest_payment=None):
+    app = create_app(bot, bot_token, on_stripe_payment, on_stripe_digest_payment)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=port)

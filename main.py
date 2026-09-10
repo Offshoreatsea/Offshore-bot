@@ -42,6 +42,7 @@ CONSULT_LINK = os.getenv("CONSULT_LINK", "https://t.me/Offshore_atsea")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 WEBAPP_URL = os.getenv("WEBAPP_URL")  # публичный https-адрес мини-приложения, см. README
 STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK")  # готовая ссылка из Stripe Dashboard, напр. https://buy.stripe.com/...
+STRIPE_DIGEST_PAYMENT_LINK = os.getenv("STRIPE_DIGEST_PAYMENT_LINK")  # отдельная ссылка на разовую покупку email-дайджеста ($5)
 PORT = int(os.getenv("PORT", "8080"))
 SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "800"))
 SUBSCRIPTION_DAYS = 30
@@ -826,16 +827,19 @@ async def cmd_get_emails(message: Message):
     if db.is_blocked(tg_id):
         return
     lang = db.get_subscriber_language(tg_id)
+    rows = [[InlineKeyboardButton(
+        text=t(lang, "digest_pay_button", price=EMAIL_DIGEST_PRICE_STARS),
+        callback_data="pay_digest",
+    )]]
+    if STRIPE_DIGEST_PAYMENT_LINK:
+        # digest_ префикс в client_reference_id — так вебхук в webapp.py
+        # отличает разовую покупку дайджеста от продления подписки
+        stripe_url = f"{STRIPE_DIGEST_PAYMENT_LINK}?client_reference_id=digest_{tg_id}"
+        rows.append([InlineKeyboardButton(text=t(lang, "pay_button_card"), url=stripe_url)])
+    rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
     await message.answer(
         t(lang, "digest_intro", price=EMAIL_DIGEST_PRICE_STARS),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text=t(lang, "digest_pay_button", price=EMAIL_DIGEST_PRICE_STARS),
-                callback_data="pay_digest",
-            )],
-            # сюда тоже добавится кнопка Stripe, как только пришлёшь ключи
-            [InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)],
-        ]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
 
@@ -860,10 +864,12 @@ async def cb_pay_digest(callback: CallbackQuery):
     await callback.answer()
 
 
-async def deliver_email_digest(bot: Bot, tg_id: int, charge_id: str):
+async def deliver_email_digest(bot: Bot, tg_id: int, charge_id: str,
+                                amount=None, currency: str = "XTR", provider: str = "stars"):
     """Общая точка доставки купленного дайджеста — используется и для оплаты
-    звёздами, и (когда подключим) для Stripe, чтобы не дублировать логику."""
-    db.insert_payment(tg_id, EMAIL_DIGEST_PRICE_STARS, 0, charge_id)
+    звёздами, и для Stripe."""
+    amount = amount if amount is not None else EMAIL_DIGEST_PRICE_STARS
+    db.insert_payment(tg_id, amount, 0, charge_id, provider=provider, currency=currency)
     lang = db.get_subscriber_language(tg_id)
     contacts = db.list_contacts_since(7)
     emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
@@ -876,10 +882,11 @@ async def deliver_email_digest(bot: Bot, tg_id: int, charge_id: str):
 
     username_row = db.find_subscriber_by_handle(str(tg_id))
     handle = f"@{username_row['username']}" if username_row and username_row["username"] else f"id{tg_id}"
+    symbol = "⭐" if provider == "stars" else currency
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
-                admin_id, f"💰 Продажа email-дайджеста: {handle} — {EMAIL_DIGEST_PRICE_STARS}⭐"
+                admin_id, f"💰 Продажа email-дайджеста ({provider}): {handle} — {amount}{symbol}"
             )
         except TelegramAPIError:
             pass
@@ -975,6 +982,13 @@ async def handle_stripe_subscription_activated(bot: Bot, tg_id: int, days: int,
     await finalize_subscription_payment(
         bot, tg_id, days, amount, currency, charge_id, "stripe", username,
     )
+
+
+async def handle_stripe_digest_paid(bot: Bot, tg_id: int, amount: float, currency: str, charge_id: str):
+    """Аналогичный колбэк, но для разовой покупки email-дайджеста через
+    Stripe (не продление подписки) — webapp.py различает их по префиксу
+    "digest_" в client_reference_id."""
+    await deliver_email_digest(bot, tg_id, charge_id, amount=amount, currency=currency, provider="stripe")
 
 
 @router.callback_query(F.data == "showlang")
@@ -1695,7 +1709,9 @@ async def main():
     asyncio.create_task(subscription_reminder_worker(bot))
 
     if WEBAPP_URL:
-        asyncio.create_task(webapp.run_web_server(bot, BOT_TOKEN, PORT, handle_stripe_subscription_activated))
+        asyncio.create_task(webapp.run_web_server(
+            bot, BOT_TOKEN, PORT, handle_stripe_subscription_activated, handle_stripe_digest_paid
+        ))
         try:
             await bot.set_chat_menu_button(
                 menu_button=MenuButtonWebApp(text="Jobs", web_app=WebAppInfo(url=WEBAPP_URL))
