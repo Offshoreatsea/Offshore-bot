@@ -127,6 +127,7 @@ TR = {
         "revoked_notice": "Your job alerts subscription has been cancelled by the admin.",
         "digest_intro": "📧 Get every contact email from vacancies posted in the channel over the last 7 days — {price} Stars, one-time purchase.",
         "digest_pay_button": "⭐ Pay {price} Stars",
+        "digest_menu_button": "📧 Get weekly email digest",
         "digest_delivered": "✅ Here are {count} emails from the last 7 days:",
         "digest_empty": "No vacancies with contact emails were posted in the last 7 days.",
         "pay_active_until": "✅ Your subscription is active until {until}.",
@@ -172,6 +173,7 @@ TR = {
         "revoked_notice": "Ваша подписка на уведомления отменена администратором.",
         "digest_intro": "📧 Получите все email из вакансий, опубликованных в канале за последние 7 дней — {price} Stars, разовая покупка.",
         "digest_pay_button": "⭐ Оплатить {price} Stars",
+        "digest_menu_button": "📧 Получить email-дайджест за неделю",
         "digest_delivered": "✅ Вот {count} email за последние 7 дней:",
         "digest_empty": "За последние 7 дней не было вакансий с контактным email.",
         "pay_active_until": "✅ Подписка активна до {until}.",
@@ -217,6 +219,7 @@ TR = {
         "revoked_notice": "Вашу підписку на сповіщення скасовано адміністратором.",
         "digest_intro": "📧 Отримайте всі email з вакансій, опублікованих у каналі за останні 7 днів — {price} Stars, разова покупка.",
         "digest_pay_button": "⭐ Оплатити {price} Stars",
+        "digest_menu_button": "📧 Отримати email-дайджест за тиждень",
         "digest_delivered": "✅ Ось {count} email за останні 7 днів:",
         "digest_empty": "За останні 7 днів не було вакансій із контактним email.",
         "pay_active_until": "✅ Підписку активовано до {until}.",
@@ -763,6 +766,7 @@ def payment_keyboard(lang: str | None = None, tg_id: int | None = None) -> Inlin
         stripe_url = f"{STRIPE_PAYMENT_LINK}?client_reference_id={tg_id}"
         rows.append([InlineKeyboardButton(text=t(lang, "pay_button_card"), url=stripe_url)])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
+    rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
     rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -824,6 +828,20 @@ async def cb_pay_subscription(callback: CallbackQuery):
 
 
 @router.message(Command("getemails"))
+def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        text=t(lang, "digest_pay_button", price=EMAIL_DIGEST_PRICE_STARS),
+        callback_data="pay_digest",
+    )]]
+    if STRIPE_DIGEST_PAYMENT_LINK and tg_id:
+        # digest_ префикс в client_reference_id — так вебхук в webapp.py
+        # отличает разовую покупку дайджеста от продления подписки
+        stripe_url = f"{STRIPE_DIGEST_PAYMENT_LINK}?client_reference_id=digest_{tg_id}"
+        rows.append([InlineKeyboardButton(text=t(lang, "pay_button_card"), url=stripe_url)])
+    rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def cmd_get_emails(message: Message):
     # доступно всем, не только тебе — это платный продукт для кандидатов/
     # других крюингов, отдельный от основной подписки на вакансии
@@ -831,20 +849,27 @@ async def cmd_get_emails(message: Message):
     if db.is_blocked(tg_id):
         return
     lang = db.get_subscriber_language(tg_id)
-    rows = [[InlineKeyboardButton(
-        text=t(lang, "digest_pay_button", price=EMAIL_DIGEST_PRICE_STARS),
-        callback_data="pay_digest",
-    )]]
-    if STRIPE_DIGEST_PAYMENT_LINK:
-        # digest_ префикс в client_reference_id — так вебхук в webapp.py
-        # отличает разовую покупку дайджеста от продления подписки
-        stripe_url = f"{STRIPE_DIGEST_PAYMENT_LINK}?client_reference_id=digest_{tg_id}"
-        rows.append([InlineKeyboardButton(text=t(lang, "pay_button_card"), url=stripe_url)])
-    rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
     await message.answer(
         t(lang, "digest_intro", price=EMAIL_DIGEST_PRICE_STARS),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        reply_markup=digest_keyboard(lang, tg_id),
     )
+
+
+@router.callback_query(F.data == "show_digest")
+async def cb_show_digest(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
+    if db.is_blocked(tg_id):
+        await callback.answer()
+        return
+    lang = db.get_subscriber_language(tg_id)
+    await callback.message.answer(
+        t(lang, "digest_intro", price=EMAIL_DIGEST_PRICE_STARS),
+        reply_markup=digest_keyboard(lang, tg_id),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "pay_digest")
@@ -1173,6 +1198,7 @@ def department_keyboard(lang: str | None = None, selected: set[str] | None = Non
         rows.append(row)
     rows.append([InlineKeyboardButton(text=t(lang, "done"), callback_data="subdone")])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
+    rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1208,6 +1234,7 @@ def after_subscribe_keyboard(lang: str | None = None, tg_id: int | None = None) 
         share_url = f"https://t.me/share/url?url={ref_link}&text=" + t(lang, "referral_share_text")
         rows.append([InlineKeyboardButton(text=t(lang, "invite_friend"), url=share_url)])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
+    rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
