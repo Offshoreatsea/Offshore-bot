@@ -124,6 +124,7 @@ TR = {
         "invite_friend": "🎁 Invite a friend, get 3 free days",
         "referral_share_text": "Get job alerts by position on OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Your job alerts subscription ends in less than 24 hours. Renew to keep getting instant notifications:",
+        "revoked_notice": "Your job alerts subscription has been cancelled by the admin.",
         "digest_intro": "📧 Get every contact email from vacancies posted in the channel over the last 7 days — {price} Stars, one-time purchase.",
         "digest_pay_button": "⭐ Pay {price} Stars",
         "digest_delivered": "✅ Here are {count} emails from the last 7 days:",
@@ -168,6 +169,7 @@ TR = {
         "invite_friend": "🎁 Пригласить друга, получить 3 дня бесплатно",
         "referral_share_text": "Уведомления о вакансиях по должности в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша подписка на уведомления заканчивается меньше чем через 24 часа. Продлите, чтобы не пропускать вакансии:",
+        "revoked_notice": "Ваша подписка на уведомления отменена администратором.",
         "digest_intro": "📧 Получите все email из вакансий, опубликованных в канале за последние 7 дней — {price} Stars, разовая покупка.",
         "digest_pay_button": "⭐ Оплатить {price} Stars",
         "digest_delivered": "✅ Вот {count} email за последние 7 дней:",
@@ -212,6 +214,7 @@ TR = {
         "invite_friend": "🎁 Запросити друга, отримати 3 дні безкоштовно",
         "referral_share_text": "Сповіщення про вакансії за посадою в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша підписка на сповіщення закінчується менш ніж за 24 години. Продовжте, щоб не пропускати вакансії:",
+        "revoked_notice": "Вашу підписку на сповіщення скасовано адміністратором.",
         "digest_intro": "📧 Отримайте всі email з вакансій, опублікованих у каналі за останні 7 днів — {price} Stars, разова покупка.",
         "digest_pay_button": "⭐ Оплатити {price} Stars",
         "digest_delivered": "✅ Ось {count} email за останні 7 днів:",
@@ -704,6 +707,7 @@ async def cmd_start(message: Message, command: CommandObject):
             "/subscriberslist — полный список подписчиков (ник, должности, статус оплаты)\n"
             "/getemails — платный email-дайджест за неделю (доступна любому, не только вам)\n"
             "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не через Stars\n"
+            "/revoke [@ник или id] — отписать вручную, доступ прекращается немедленно\n"
             "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
             "/revenue [дней] — доход в Stars за период (по умолчанию 7 дней)\n"
             "/blockuser [@ник или id] — заблокировать (бот перестанет отвечать)\n"
@@ -1358,6 +1362,28 @@ async def cmd_grant(message: Message, command: CommandObject):
             tg_id, t(lang, "payment_thanks", until=until_str),
             reply_markup=department_keyboard(lang, set(db.get_subscriber_positions(tg_id))),
         )
+    except TelegramAPIError:
+        pass
+
+
+@router.message(Command("revoke"))
+async def cmd_revoke(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    handle = (command.args or "").strip()
+    if not handle:
+        await message.answer("Использование: /revoke [@username или id]")
+        return
+    row = db.find_subscriber_by_handle(handle)
+    if not row:
+        await message.answer(f"Не нашёл {handle} в базе подписчиков.")
+        return
+    tg_id = row["tg_id"]
+    db.revoke_subscription(tg_id)
+    await message.answer(f"✅ Подписка {handle} отозвана — доступ к вакансиям по должности прекращён немедленно.")
+    lang = db.get_subscriber_language(tg_id)
+    try:
+        await message.bot.send_message(tg_id, t(lang, "revoked_notice"))
     except TelegramAPIError:
         pass
 

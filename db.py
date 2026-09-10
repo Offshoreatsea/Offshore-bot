@@ -426,6 +426,18 @@ def unlock_positions(tg_id: int):
     conn.close()
 
 
+def revoke_subscription(tg_id: int):
+    """Ручной отзыв доступа (команда /revoke) — ставим дату истечения в
+    прошлое, а не NULL: так человек не получит повторный бесплатный триал,
+    если он у него уже был. Подписки на должности (какие выбирал) не
+    трогаем — если оплатит заново, они разблокируются как обычно."""
+    conn = get_conn()
+    past = (datetime.now() - timedelta(days=1)).isoformat()
+    conn.execute("UPDATE subscribers SET subscription_until = ? WHERE tg_id = ?", (past, tg_id))
+    conn.commit()
+    conn.close()
+
+
 def insert_payment(tg_id: int, amount: float, days: int, charge_id: str,
                     provider: str = "stars", currency: str = "XTR"):
     conn = get_conn()
