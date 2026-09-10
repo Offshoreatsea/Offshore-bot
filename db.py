@@ -115,9 +115,16 @@ def init_db():
             days INTEGER,
             charge_id TEXT,
             refunded INTEGER DEFAULT 0,
-            created_at TEXT
+            created_at TEXT,
+            provider TEXT DEFAULT 'stars',
+            currency TEXT DEFAULT 'XTR'
         )
     """)
+    pay_cols = {row["name"] for row in conn.execute("PRAGMA table_info(payments)")}
+    if "provider" not in pay_cols:
+        conn.execute("ALTER TABLE payments ADD COLUMN provider TEXT DEFAULT 'stars'")
+    if "currency" not in pay_cols:
+        conn.execute("ALTER TABLE payments ADD COLUMN currency TEXT DEFAULT 'XTR'")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (
@@ -377,6 +384,23 @@ def extend_subscription(tg_id: int, days: int):
     return new_until
 
 
+def start_trial_if_new(tg_id: int, days: int) -> bool:
+    """Если у человека ещё никогда не было ни триала, ни оплаты
+    (subscription_until пустой) — выдаёт бесплатный доступ на N дней без
+    всякой оплаты и возвращает True. Если что-то уже было (даже истёкшее) —
+    ничего не делает и возвращает False, чтобы не выдавать триал повторно."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    if row and row["subscription_until"]:
+        conn.close()
+        return False
+    conn.close()
+    extend_subscription(tg_id, days)
+    return True
+
+
 def is_positions_locked(tg_id: int) -> bool:
     conn = get_conn()
     row = conn.execute(
@@ -402,12 +426,13 @@ def unlock_positions(tg_id: int):
     conn.close()
 
 
-def insert_payment(tg_id: int, amount_stars: int, days: int, charge_id: str):
+def insert_payment(tg_id: int, amount: float, days: int, charge_id: str,
+                    provider: str = "stars", currency: str = "XTR"):
     conn = get_conn()
     conn.execute(
-        """INSERT INTO payments (tg_id, amount_stars, days, charge_id, created_at)
-           VALUES (?, ?, ?, ?, ?)""",
-        (tg_id, amount_stars, days, charge_id, datetime.now().isoformat()),
+        """INSERT INTO payments (tg_id, amount_stars, days, charge_id, created_at, provider, currency)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (tg_id, amount, days, charge_id, datetime.now().isoformat(), provider, currency),
     )
     conn.commit()
     conn.close()
@@ -434,13 +459,14 @@ def mark_payment_refunded(payment_id: int):
 def revenue_since(days: int):
     conn = get_conn()
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-    row = conn.execute(
-        """SELECT COALESCE(SUM(amount_stars), 0) as total, COUNT(*) as cnt
-           FROM payments WHERE created_at > ? AND refunded = 0""",
+    rows = conn.execute(
+        """SELECT provider, currency, COALESCE(SUM(amount_stars), 0) as total, COUNT(*) as cnt
+           FROM payments WHERE created_at > ? AND refunded = 0
+           GROUP BY provider, currency""",
         (cutoff,),
-    ).fetchone()
+    ).fetchall()
     conn.close()
-    return row["total"], row["cnt"]
+    return rows
 
 
 def find_subscriber_by_handle(handle: str):

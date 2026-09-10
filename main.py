@@ -41,13 +41,14 @@ APPLY_BOT_LINK = os.getenv("APPLY_BOT_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 CONSULT_LINK = os.getenv("CONSULT_LINK", "https://t.me/Offshore_atsea")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 WEBAPP_URL = os.getenv("WEBAPP_URL")  # публичный https-адрес мини-приложения, см. README
+STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK")  # готовая ссылка из Stripe Dashboard, напр. https://buy.stripe.com/...
 PORT = int(os.getenv("PORT", "8080"))
-SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "250"))
-SUBSCRIPTION_DAYS = 7
+SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "800"))
+SUBSCRIPTION_DAYS = 30
 MAX_POSITIONS = 2
-SUBSCRIPTION_DAYS_MONTH = 30
-SUBSCRIPTION_PRICE_STARS_MONTH = int(os.getenv("SUBSCRIPTION_PRICE_STARS_MONTH", "800"))  # вместо 4×250=1000 — скидка за месяц
 REFERRAL_BONUS_DAYS = 3
+TRIAL_DAYS = 3
+EMAIL_DIGEST_PRICE_STARS = int(os.getenv("EMAIL_DIGEST_PRICE_STARS", "165"))  # ориентир: ~$5
 
 DIGEST_TIMES = ["09:00", "14:00", "19:00"]
 
@@ -112,16 +113,20 @@ TR = {
         "no_selection": "You haven't picked any position yet — tap one above.",
         "subscribed_summary": "Your alerts are set up for: {tags}",
         "contact_admin": "🆘 Contact admin",
-        "pay_intro": "Job alerts by position are a paid feature: {price} Stars "
-                     "gets you 7 days of instant notifications for the positions "
-                     "you choose, plus everything already posted in the last 7 days.",
-        "pay_button": "⭐ Pay {price} Stars for 7 days",
-        "pay_button_month": "⭐ Pay {price} Stars for 30 days (save vs weekly)",
+        "pay_intro": "Your free trial has ended. {price} Stars gets you 30 more days "
+                     "of instant notifications for the positions you choose.",
+        "pay_button": "⭐ Pay {price} Stars for 30 days",
+        "pay_button_card": "💳 Pay by card",
         "pay_contact_admin": "💬 Can't pay with Stars? Message admin",
+        "trial_started": "🎉 You get {days} days free — no card needed. Choose your positions:",
         "referral_bonus": "🎁 A friend you invited just paid — you got +{days} days, now active until {until}!",
         "invite_friend": "🎁 Invite a friend, get 3 free days",
         "referral_share_text": "Get job alerts by position on OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Your job alerts subscription ends in less than 24 hours. Renew to keep getting instant notifications:",
+        "digest_intro": "📧 Get every contact email from vacancies posted in the channel over the last 7 days — {price} Stars, one-time purchase.",
+        "digest_pay_button": "⭐ Pay {price} Stars",
+        "digest_delivered": "✅ Here are {count} emails from the last 7 days:",
+        "digest_empty": "No vacancies with contact emails were posted in the last 7 days.",
         "pay_active_until": "✅ Your subscription is active until {until}.",
         "payment_thanks": "✅ Payment received — active until {until}. Now pick your positions:",
         "max_positions": "You can pick up to {max} positions. Remove one first to add another.",
@@ -152,16 +157,20 @@ TR = {
         "no_selection": "Вы ещё не выбрали ни одной должности — нажмите на любую выше.",
         "subscribed_summary": "Ваши подписки: {tags}",
         "contact_admin": "🆘 Написать администратору",
-        "pay_intro": "Уведомления по должности — платная функция: {price} ⭐ "
-                     "дают 7 дней мгновенных уведомлений по выбранным должностям, "
-                     "плюс всё, что уже публиковалось за последние 7 дней.",
-        "pay_button": "⭐ Оплатить {price} Stars за 7 дней",
-        "pay_button_month": "⭐ Оплатить {price} Stars за 30 дней (выгоднее понедельной)",
+        "pay_intro": "Ваш бесплатный период закончился. {price} ⭐ дают ещё 30 дней "
+                     "мгновенных уведомлений по выбранным должностям.",
+        "pay_button": "⭐ Оплатить {price} Stars за 30 дней",
+        "pay_button_card": "💳 Оплатить картой",
         "pay_contact_admin": "💬 Не можете оплатить Stars? Написать администратору",
+        "trial_started": "🎉 Вам доступны {days} дня бесплатно — без карты. Выберите должности:",
         "referral_bonus": "🎁 Приглашённый вами друг оплатил — вам +{days} дня, теперь активно до {until}!",
         "invite_friend": "🎁 Пригласить друга, получить 3 дня бесплатно",
         "referral_share_text": "Уведомления о вакансиях по должности в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша подписка на уведомления заканчивается меньше чем через 24 часа. Продлите, чтобы не пропускать вакансии:",
+        "digest_intro": "📧 Получите все email из вакансий, опубликованных в канале за последние 7 дней — {price} Stars, разовая покупка.",
+        "digest_pay_button": "⭐ Оплатить {price} Stars",
+        "digest_delivered": "✅ Вот {count} email за последние 7 дней:",
+        "digest_empty": "За последние 7 дней не было вакансий с контактным email.",
         "pay_active_until": "✅ Подписка активна до {until}.",
         "payment_thanks": "✅ Оплата прошла — активно до {until}. Теперь выберите должности:",
         "max_positions": "Можно выбрать не больше {max} должностей. Сначала уберите одну, чтобы добавить другую.",
@@ -192,16 +201,20 @@ TR = {
         "no_selection": "Ви ще не обрали жодної посади — натисніть на будь-яку вище.",
         "subscribed_summary": "Ваші підписки: {tags}",
         "contact_admin": "🆘 Написати адміністратору",
-        "pay_intro": "Сповіщення за посадою — платна функція: {price} ⭐ дають "
-                     "7 днів миттєвих сповіщень за обраними посадами, плюс усе, "
-                     "що вже публікувалося за останні 7 днів.",
-        "pay_button": "⭐ Оплатити {price} Stars за 7 днів",
-        "pay_button_month": "⭐ Оплатити {price} Stars за 30 днів (вигідніше за тижневу)",
+        "pay_intro": "Ваш безкоштовний період закінчився. {price} ⭐ дають ще 30 днів "
+                     "миттєвих сповіщень за обраними посадами.",
+        "pay_button": "⭐ Оплатити {price} Stars за 30 днів",
+        "pay_button_card": "💳 Оплатити карткою",
         "pay_contact_admin": "💬 Не можете оплатити Stars? Напишіть адміністратору",
+        "trial_started": "🎉 Вам доступні {days} дні безкоштовно — без картки. Оберіть посади:",
         "referral_bonus": "🎁 Запрошений вами друг оплатив — вам +{days} дні, тепер активно до {until}!",
         "invite_friend": "🎁 Запросити друга, отримати 3 дні безкоштовно",
         "referral_share_text": "Сповіщення про вакансії за посадою в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша підписка на сповіщення закінчується менш ніж за 24 години. Продовжте, щоб не пропускати вакансії:",
+        "digest_intro": "📧 Отримайте всі email з вакансій, опублікованих у каналі за останні 7 днів — {price} Stars, разова покупка.",
+        "digest_pay_button": "⭐ Оплатити {price} Stars",
+        "digest_delivered": "✅ Ось {count} email за останні 7 днів:",
+        "digest_empty": "За останні 7 днів не було вакансій із контактним email.",
         "pay_active_until": "✅ Підписку активовано до {until}.",
         "payment_thanks": "✅ Оплату отримано — активно до {until}. Тепер оберіть посади:",
         "max_positions": "Можна обрати не більше {max} посад. Спочатку приберіть одну, щоб додати іншу.",
@@ -688,6 +701,7 @@ async def cmd_start(message: Message, command: CommandObject):
             "(доступна любому, не только вам)\n"
             "/subscribers — сколько людей подписалось и разбивка по должностям\n"
             "/subscriberslist — полный список подписчиков (ник, должности, статус оплаты)\n"
+            "/getemails — платный email-дайджест за неделю (доступна любому, не только вам)\n"
             "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не через Stars\n"
             "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
             "/revenue [дней] — доход в Stars за период (по умолчанию 7 дней)\n"
@@ -733,31 +747,40 @@ async def cmd_start(message: Message, command: CommandObject):
     )
 
 
-def payment_keyboard(lang: str | None = None) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=t(lang, "pay_button", price=SUBSCRIPTION_PRICE_STARS),
-            callback_data=f"pay_sub:{SUBSCRIPTION_DAYS}:{SUBSCRIPTION_PRICE_STARS}",
-        )],
-        [InlineKeyboardButton(
-            text=t(lang, "pay_button_month", price=SUBSCRIPTION_PRICE_STARS_MONTH),
-            callback_data=f"pay_sub:{SUBSCRIPTION_DAYS_MONTH}:{SUBSCRIPTION_PRICE_STARS_MONTH}",
-        )],
-        [InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")],
-        [InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)],
-    ])
+def payment_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        text=t(lang, "pay_button", price=SUBSCRIPTION_PRICE_STARS),
+        callback_data=f"pay_sub:{SUBSCRIPTION_DAYS}:{SUBSCRIPTION_PRICE_STARS}",
+    )]]
+    if STRIPE_PAYMENT_LINK and tg_id:
+        # client_reference_id — единственный способ Stripe сообщить вебхуком,
+        # какому именно tg_id принадлежит платёж
+        stripe_url = f"{STRIPE_PAYMENT_LINK}?client_reference_id={tg_id}"
+        rows.append([InlineKeyboardButton(text=t(lang, "pay_button_card"), url=stripe_url)])
+    rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
+    rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit: bool):
     """target — либо Message (обычный ответ), либо CallbackQuery.message (для
-    edit_text). Показывает: экран оплаты (нет активной подписки), сводку
+    edit_text). Показывает: экран оплаты (подписка/триал истекли), сводку
     без редактирования (должности уже зафиксированы на этот период), либо
-    список департаментов для выбора (оплачено, но ещё не выбрано/разблокировано)."""
+    список департаментов для выбора (доступ активен, ещё не выбрано/разблокировано)."""
     if db.is_blocked(tg_id):
         return  # заблокированный — просто молчим, не даём вообще никакого экрана
     if not db.is_subscription_active(tg_id):
-        text = t(lang, "pay_intro", price=SUBSCRIPTION_PRICE_STARS)
-        markup = payment_keyboard(lang)
+        # у человека вообще никогда не было ни триала, ни оплаты — выдаём
+        # 3 дня бесплатно без всякой привязки карты, сразу к выбору должностей
+        if db.start_trial_if_new(tg_id, TRIAL_DAYS):
+            selected = set(db.get_subscriber_positions(tg_id))
+            text = t(lang, "trial_started", days=TRIAL_DAYS)
+            markup = department_keyboard(lang, selected)
+        else:
+            # триал уже был использован (или истекла платная подписка) —
+            # теперь показываем настоящий экран оплаты
+            text = t(lang, "pay_intro", price=SUBSCRIPTION_PRICE_STARS)
+            markup = payment_keyboard(lang, tg_id)
     elif db.is_positions_locked(tg_id):
         selected = db.get_subscriber_positions(tg_id)
         text = t(lang, "positions_locked_notice", tags=", ".join(selected))
@@ -795,35 +818,99 @@ async def cb_pay_subscription(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.message(Command("getemails"))
+async def cmd_get_emails(message: Message):
+    # доступно всем, не только тебе — это платный продукт для кандидатов/
+    # других крюингов, отдельный от основной подписки на вакансии
+    tg_id = message.from_user.id
+    if db.is_blocked(tg_id):
+        return
+    lang = db.get_subscriber_language(tg_id)
+    await message.answer(
+        t(lang, "digest_intro", price=EMAIL_DIGEST_PRICE_STARS),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=t(lang, "digest_pay_button", price=EMAIL_DIGEST_PRICE_STARS),
+                callback_data="pay_digest",
+            )],
+            # сюда тоже добавится кнопка Stripe, как только пришлёшь ключи
+            [InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "pay_digest")
+async def cb_pay_digest(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
+    if db.is_blocked(tg_id):
+        await callback.answer()
+        return
+    await callback.bot.send_invoice(
+        chat_id=tg_id,
+        title="OffshoreAtSea — Weekly Email Digest",
+        description="All contact emails from vacancies posted in the channel over the last 7 days.",
+        payload=f"digest_{tg_id}",
+        currency="XTR",
+        prices=[LabeledPrice(label="Weekly Email Digest", amount=EMAIL_DIGEST_PRICE_STARS)],
+        provider_token="",
+    )
+    await callback.answer()
+
+
+async def deliver_email_digest(bot: Bot, tg_id: int, charge_id: str):
+    """Общая точка доставки купленного дайджеста — используется и для оплаты
+    звёздами, и (когда подключим) для Stripe, чтобы не дублировать логику."""
+    db.insert_payment(tg_id, EMAIL_DIGEST_PRICE_STARS, 0, charge_id)
+    lang = db.get_subscriber_language(tg_id)
+    contacts = db.list_contacts_since(7)
+    emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
+    if emails:
+        await bot.send_message(
+            tg_id, t(lang, "digest_delivered", count=len(emails)) + "\n\n" + "\n".join(emails)
+        )
+    else:
+        await bot.send_message(tg_id, t(lang, "digest_empty"))
+
+    username_row = db.find_subscriber_by_handle(str(tg_id))
+    handle = f"@{username_row['username']}" if username_row and username_row["username"] else f"id{tg_id}"
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id, f"💰 Продажа email-дайджеста: {handle} — {EMAIL_DIGEST_PRICE_STARS}⭐"
+            )
+        except TelegramAPIError:
+            pass
+
+
 @router.pre_checkout_query()
 async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
     # обязательно ответить в течение ~10 секунд, иначе Telegram отменит платёж
     await pre_checkout_query.answer(ok=True)
 
 
-@router.message(F.successful_payment)
-async def process_successful_payment(message: Message):
-    tg_id = message.from_user.id
-    sp = message.successful_payment
-    # payload несёт реальные дни/цену конкретного тарифа — не полагаемся на
-    # константы по умолчанию, человек мог оплатить недельный или месячный
-    try:
-        _, _, days_str, price_str = sp.invoice_payload.split("_")
-        days, price = int(days_str), int(price_str)
-    except (ValueError, AttributeError):
-        days, price = SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS
-
+async def finalize_subscription_payment(bot: Bot, tg_id: int, days: int, amount, currency: str,
+                                         charge_id: str, provider: str, username: str | None):
+    """Общая точка после успешной оплаты подписки — не важно, пришла она из
+    Stars (process_successful_payment) или из Stripe (вебхук в webapp.py).
+    Делает: запись платежа, продление подписки, разблокировку должностей,
+    сообщение кандидату, реферальный бонус, уведомление админу."""
     is_first_payment = db.count_payments(tg_id) == 0
-    db.insert_payment(tg_id, price, days, sp.telegram_payment_charge_id)
+    db.insert_payment(tg_id, amount, days, charge_id, provider=provider, currency=currency)
     new_until = db.extend_subscription(tg_id, days)
     db.unlock_positions(tg_id)  # новый оплаченный период — можно скорректировать выбор
     lang = db.get_subscriber_language(tg_id)
     until_str = datetime.fromisoformat(new_until).strftime("%d.%m.%Y")
     selected = set(db.get_subscriber_positions(tg_id))
-    await message.answer(
-        t(lang, "payment_thanks", until=until_str),
-        reply_markup=department_keyboard(lang, selected),
-    )
+    try:
+        await bot.send_message(
+            tg_id, t(lang, "payment_thanks", until=until_str),
+            reply_markup=department_keyboard(lang, selected),
+        )
+    except TelegramAPIError:
+        pass
 
     # реферальный бонус — только за самую первую оплату приглашённого,
     # чтобы не начислять его повторно за каждое продление
@@ -834,7 +921,7 @@ async def process_successful_payment(message: Message):
             ref_lang = db.get_subscriber_language(referrer_id)
             ref_until_str = datetime.fromisoformat(ref_until).strftime("%d.%m.%Y")
             try:
-                await message.bot.send_message(
+                await bot.send_message(
                     referrer_id, t(ref_lang, "referral_bonus", days=REFERRAL_BONUS_DAYS, until=ref_until_str)
                 )
             except TelegramAPIError:
@@ -842,15 +929,52 @@ async def process_successful_payment(message: Message):
 
     # уведомление тебе в реальном времени о каждой оплате — без захода в
     # /subscriberslist руками
-    username = f"@{message.from_user.username}" if message.from_user.username else f"id{tg_id}"
+    handle = f"@{username}" if username else f"id{tg_id}"
+    symbol = "⭐" if provider == "stars" else currency
     for admin_id in ADMIN_IDS:
         try:
-            await message.bot.send_message(
+            await bot.send_message(
                 admin_id,
-                f"💰 Оплата: {username} — {price}⭐ за {days} дней, активно до {until_str}",
+                f"💰 Оплата ({provider}): {handle} — {amount}{symbol} за {days} дней, активно до {until_str}",
             )
         except TelegramAPIError:
             pass
+
+
+@router.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    tg_id = message.from_user.id
+    sp = message.successful_payment
+    payload = sp.invoice_payload or ""
+
+    if payload.startswith("digest_"):
+        await deliver_email_digest(message.bot, tg_id, sp.telegram_payment_charge_id)
+        return
+
+    # payload несёт реальные дни/цену конкретного тарифа — не полагаемся на
+    # константы по умолчанию на случай если тарифы ещё поменяются
+    try:
+        _, _, days_str, price_str = payload.split("_")
+        days, price = int(days_str), int(price_str)
+    except (ValueError, AttributeError):
+        days, price = SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS
+
+    await finalize_subscription_payment(
+        message.bot, tg_id, days, price, "XTR", sp.telegram_payment_charge_id,
+        "stars", message.from_user.username,
+    )
+
+
+async def handle_stripe_subscription_activated(bot: Bot, tg_id: int, days: int,
+                                                 amount: float, currency: str, charge_id: str):
+    """Колбэк, который webapp.py вызывает из вебхука Stripe после проверки
+    подписи — main.py не импортирует webapp напрямую в эту сторону, поэтому
+    вся телеграм-логика (уведомления, локализация) остаётся здесь."""
+    row = db.find_subscriber_by_handle(str(tg_id))
+    username = row["username"] if row else None
+    await finalize_subscription_payment(
+        bot, tg_id, days, amount, currency, charge_id, "stripe", username,
+    )
 
 
 @router.callback_query(F.data == "showlang")
@@ -1257,9 +1381,16 @@ async def cmd_revenue(message: Message, command: CommandObject):
         return
     arg = (command.args or "").strip()
     days = int(arg) if arg.isdigit() else 7
-    total, count = db.revenue_since(days)
+    rows = db.revenue_since(days)
     label = "неделю" if days == 7 else f"{days} дней"
-    await message.answer(f"💰 Доход за последние {label}: {total}⭐ ({count} оплат)")
+    if not rows:
+        await message.answer(f"💰 Доход за последние {label}: пока пусто")
+        return
+    lines = [f"💰 Доход за последние {label}:"]
+    for r in rows:
+        symbol = "⭐" if r["provider"] == "stars" else r["currency"]
+        lines.append(f"• {r['provider']}: {r['total']}{symbol} ({r['cnt']} оплат)")
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("blockuser"))
@@ -1547,7 +1678,7 @@ async def subscription_reminder_worker(bot: Bot):
                 await bot.send_message(
                     row["tg_id"],
                     t(lang, "expiry_reminder"),
-                    reply_markup=payment_keyboard(lang),
+                    reply_markup=payment_keyboard(lang, row["tg_id"]),
                 )
                 db.mark_reminder_sent(row["tg_id"], row["subscription_until"])
             except TelegramAPIError:
@@ -1564,7 +1695,7 @@ async def main():
     asyncio.create_task(subscription_reminder_worker(bot))
 
     if WEBAPP_URL:
-        asyncio.create_task(webapp.run_web_server(bot, BOT_TOKEN, PORT))
+        asyncio.create_task(webapp.run_web_server(bot, BOT_TOKEN, PORT, handle_stripe_subscription_activated))
         try:
             await bot.set_chat_menu_button(
                 menu_button=MenuButtonWebApp(text="Jobs", web_app=WebAppInfo(url=WEBAPP_URL))
