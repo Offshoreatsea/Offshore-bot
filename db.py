@@ -361,6 +361,15 @@ def is_subscription_active(tg_id: int) -> bool:
     return datetime.fromisoformat(row["subscription_until"]) > datetime.now()
 
 
+def get_subscription_until(tg_id: int):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    return row["subscription_until"] if row else None
+
+
 def extend_subscription(tg_id: int, days: int):
     """Продлевает платную подписку на N дней от текущего момента (или от
     даты истечения, если она ещё не прошла — чтобы досрочная повторная

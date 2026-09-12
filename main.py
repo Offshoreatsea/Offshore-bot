@@ -16,6 +16,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
@@ -43,21 +44,94 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 WEBAPP_URL = os.getenv("WEBAPP_URL")  # публичный https-адрес мини-приложения, см. README
 STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK")  # готовая ссылка из Stripe Dashboard, напр. https://buy.stripe.com/...
 STRIPE_DIGEST_PAYMENT_LINK = os.getenv("STRIPE_DIGEST_PAYMENT_LINK")  # отдельная ссылка на разовую покупку email-дайджеста ($5)
+BANNER_PATH = os.path.join(os.path.dirname(__file__), "assets", "promo_banner.jpg")
+_banner_file_id: str | None = None  # заполняется после первой отправки — дальше шлём по file_id, не перезаливая файл
 PORT = int(os.getenv("PORT", "8080"))
 SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "800"))
 SUBSCRIPTION_DAYS = 30
 MAX_POSITIONS = 2
 REFERRAL_BONUS_DAYS = 3
 TRIAL_DAYS = 3
-EMAIL_DIGEST_PRICE_STARS = int(os.getenv("EMAIL_DIGEST_PRICE_STARS", "165"))  # ориентир: ~$5
+TRIAL_BACKFILL_DAYS = 4  # чтобы не сливать всю базу разом при первом выборе должности
+EMAIL_DIGEST_PRICE_STARS = int(os.getenv("EMAIL_DIGEST_PRICE_STARS", "165"))  # оставлено для обратной совместимости с уже существующим Stars-инвойсом, если понадобится вернуть
+EMAIL_DIGEST_PRICE_USD = int(os.getenv("EMAIL_DIGEST_PRICE_USD", "5"))
 
 DIGEST_TIMES = ["09:00", "14:00", "19:00"]
 
-# Фиксированный список должностей — единственный источник правды для тегов
-# #Position и для матчинга в /subscribe. Если встретится реально новая
-# должность, которой тут нет, — просто допишите строку в список, ничего
-# больше менять не нужно.
-RANK_TAGS = [
+# Таксономия: департамент -> [(tag, человекочитаемый label)]. Раньше здесь
+# было деление на два флота (Merchant Fleet/Offshore) — Merchant Fleet убрали
+# по просьбе владельца, остался только Offshore. Верхний уровень FLEET_POSITIONS
+# оставлен как словарь из одного ключа "Offshore", чтобы минимально трогать
+# остальной код (department_keyboard/subscribe_keyboard всё ещё принимают
+# fleet-параметр, просто он теперь всегда равен "Offshore").
+FLEET_POSITIONS = {
+    "Offshore": {
+        "Bridge Officers": [
+            ("OFF_Master", "Master / SDPO"),
+            ("OFF_ChiefOfficer", "Chief Officer / SDPO / DPO"),
+            ("OFF_SecondOfficer", "Second Officer / DPO / JDPO"),
+            ("OFF_ThirdOfficer", "3rd Officer / JDPO"),
+            ("OFF_SafetyOfficer", "Safety Officer"),
+            ("OFF_HLO", "HLO"),
+        ],
+        "Engine Officers": [
+            ("OFF_ChiefEngineer", "Chief Engineer / Single Engineer"),
+            ("OFF_SecondEngineer", "Second Engineer / Single Engineer"),
+            ("OFF_ThirdEngineer", "3rd Engineer / EOOW"),
+            ("OFF_JuniorEngineer", "Junior Engineer / EOOW"),
+            ("OFF_ETO", "ETO / Electrician / ETO Assistant"),
+        ],
+        "Deck Ratings": [
+            ("OFF_Bosun", "Bosun"),
+            ("OFF_AB", "AB / OS / Roustabout"),
+            ("OFF_CraneOperator", "Crane Operator"),
+            ("OFF_GangwayOperator", "Gangway Operator"),
+            ("OFF_HLO", "HLO"),
+            ("OFF_Rigger", "Rigger"),
+            ("OFF_FitterWelder", "Fitter / Welder"),
+            ("OFF_DeckCadet", "Deck Cadet"),
+        ],
+        "Engine Ratings": [
+            ("OFF_Oiler", "Oiler"),
+            ("OFF_Wiper", "Wiper"),
+            ("OFF_Motorman", "Motorman"),
+            ("OFF_FitterWelder", "Fitter / Welder"),
+            ("OFF_EngineCadet", "Engine Cadet"),
+        ],
+        "Catering": [
+            ("OFF_Cook", "Cook / Night Cook"),
+            ("OFF_CampBoss", "Camp Boss"),
+            ("OFF_Steward", "Steward / Stewardess"),
+            ("OFF_ChiefSteward", "Chief Steward"),
+            ("OFF_Messman", "Messman"),
+            ("OFF_Baker", "Baker"),
+        ],
+        "Survey / Other": [
+            ("OFF_ROV", "ROV"),
+            ("OFF_ClientRep", "Client Representative"),
+            ("OFF_OnlineSurvey", "Online Survey"),
+            ("OFF_SurveyEngineer", "Survey Engineer"),
+            ("OFF_Diver", "Diver"),
+            ("OFF_Scaffolder", "Scaffolder"),
+            ("OFF_WinchOperator", "Winch Operator"),
+        ],
+    },
+}
+
+# Плоский список всех новых тегов — единственный источник правды для промпта
+# разбора и для валидации. Каждый тег встречается в списке один раз, даже
+# если он в двух департаментах одного флота (например Fitter/Welder).
+RANK_TAGS = sorted({tag for depts in FLEET_POSITIONS.values() for tags in depts.values() for tag, _ in tags})
+
+# Человекочитаемый label по тегу — нужен там, где показываем тег человеку,
+# а не строим кнопку из FLEET_POSITIONS напрямую (например /subscriberslist).
+TAG_LABELS = {tag: label for depts in FLEET_POSITIONS.values() for tags in depts.values() for tag, label in tags}
+
+# Старая таксономия (до разделения на флоты) — оставлена только для
+# обратной совместимости: уже опубликованные вакансии и уже подписанные
+# люди могут ссылаться на эти теги. Новым вакансиям и новым подпискам они
+# больше никогда не присваиваются (их нет в RANK_TAGS/FLEET_POSITIONS выше).
+LEGACY_RANK_TAGS = [
     "Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "DeckCadet",
     "ChiefEngineer", "SecondEngineer", "ThirdEngineer", "FourthEngineer", "EngineCadet",
     "ETO", "Electrician", "Bosun", "AB", "OS", "Motorman", "Oiler", "Fitter",
@@ -65,21 +139,8 @@ RANK_TAGS = [
     "CraneOperator", "DPOperator", "ROVPilot", "Rigger", "Welder", "Scaffolder",
     "ClientRepresentative", "SafetyOfficer", "Surveyor",
 ]
+ALL_VALID_POSITION_TAGS = set(RANK_TAGS) | set(LEGACY_RANK_TAGS)
 
-# Группировка тегов по департаментам — чисто вопрос навигации в /subscribe,
-# на матчинг вакансий и хранение подписок не влияет (там как был, так и
-# остался плоский position_tag). Допишите сюда любую новую должность из
-# RANK_TAGS в подходящий департамент, иначе она не попадёт ни в один экран.
-DEPARTMENTS = {
-    "Bridge": ["Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "DeckCadet"],
-    "Engine": ["ChiefEngineer", "SecondEngineer", "ThirdEngineer", "FourthEngineer",
-               "EngineCadet", "ETO", "Electrician"],
-    "Ratings": ["Bosun", "AB", "OS", "Motorman", "Oiler", "Fitter"],
-    "Catering": ["Cook", "Steward", "Campboss", "ChiefSteward"],
-    "Offshore & Specialist": ["CraneOperator", "DPOperator", "ROVPilot", "Rigger",
-                              "Welder", "Scaffolder", "ClientRepresentative",
-                              "SafetyOfficer", "Surveyor"],
-}
 
 # Фиксированный список типов судов — тоже единый источник правды для тегов
 # и матчинга.
@@ -102,6 +163,8 @@ TR = {
                   "the employer and are not responsible for working conditions "
                   "at the companies listed.",
         "choose_department": "Choose a department to see its positions:",
+        "choose_fleet": "Choose your fleet:",
+        "back_to_fleets": "⬅ Fleets",
         "choose_position": "Choose one or more positions — tap to select, tap "
                             "again to remove. I'll send matching vacancies from "
                             "the last 7 days for each, then new ones as they're posted:",
@@ -125,16 +188,17 @@ TR = {
         "referral_share_text": "Get job alerts by position on OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Your job alerts subscription ends in less than 24 hours. Renew to keep getting instant notifications:",
         "revoked_notice": "Your job alerts subscription has been cancelled by the admin.",
-        "digest_intro": "📧 Get every contact email from vacancies posted in the channel over the last 7 days — {price} Stars, one-time purchase.",
+        "digest_intro": "📧 Get all the recruiter emails from vacancies posted in the channel this week — ${price}, one-time purchase.",
         "digest_pay_button": "⭐ Pay {price} Stars",
-        "digest_menu_button": "📧 Get weekly email digest",
+        "digest_menu_button": "📧 Get recruiter emails from this week",
         "digest_delivered": "✅ Here are {count} emails from the last 7 days:",
         "digest_empty": "No vacancies with contact emails were posted in the last 7 days.",
         "pay_active_until": "✅ Your subscription is active until {until}.",
         "payment_thanks": "✅ Payment received — active until {until}. Now pick your positions:",
+        "payment_thanks_locked": "✅ Payment received — active until {until}. Your positions stay: {tags}",
         "max_positions": "You can pick up to {max} positions. Remove one first to add another.",
-        "positions_locked_notice": "Your positions are locked in for this period: {tags}. "
-                                    "Contact admin if you need to change them.",
+        "positions_locked_notice": "Your positions: {tags}.\n⏳ {days_left} days left on your subscription. "
+                                    "Contact admin if you need to change your positions.",
         "send_cv": "Send your CV to: {v}",
         "open_form": "Open the application form:",
         "how_to_apply": "How to apply: {v}",
@@ -148,6 +212,8 @@ TR = {
                  "работодателем и не несём ответственности за условия труда "
                  "у указанных компаний.",
         "choose_department": "Выберите департамент, чтобы увидеть должности:",
+        "choose_fleet": "Выберите флот:",
+        "back_to_fleets": "⬅ Флоты",
         "choose_position": "Выберите одну или несколько должностей — нажмите, "
                             "чтобы добавить, ещё раз — чтобы убрать. Пришлю вакансии "
                             "за последние 7 дней по каждой, и дальше — все новые:",
@@ -171,16 +237,17 @@ TR = {
         "referral_share_text": "Уведомления о вакансиях по должности в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша подписка на уведомления заканчивается меньше чем через 24 часа. Продлите, чтобы не пропускать вакансии:",
         "revoked_notice": "Ваша подписка на уведомления отменена администратором.",
-        "digest_intro": "📧 Получите все email из вакансий, опубликованных в канале за последние 7 дней — {price} Stars, разовая покупка.",
+        "digest_intro": "📧 Все email рекрутёров из вакансий, опубликованных в канале за эту неделю — ${price}, разовая покупка.",
         "digest_pay_button": "⭐ Оплатить {price} Stars",
-        "digest_menu_button": "📧 Получить email-дайджест за неделю",
+        "digest_menu_button": "📧 Получить email рекрутёров за неделю",
         "digest_delivered": "✅ Вот {count} email за последние 7 дней:",
         "digest_empty": "За последние 7 дней не было вакансий с контактным email.",
         "pay_active_until": "✅ Подписка активна до {until}.",
         "payment_thanks": "✅ Оплата прошла — активно до {until}. Теперь выберите должности:",
+        "payment_thanks_locked": "✅ Оплата прошла — активно до {until}. Ваши должности остаются: {tags}",
         "max_positions": "Можно выбрать не больше {max} должностей. Сначала уберите одну, чтобы добавить другую.",
-        "positions_locked_notice": "Ваши должности зафиксированы на этот период: {tags}. "
-                                    "Если нужно изменить — напишите администратору.",
+        "positions_locked_notice": "Ваши должности: {tags}.\n⏳ Осталось дней подписки: {days_left}. "
+                                    "Если нужно поменять должности — напишите администратору.",
         "send_cv": "Отправьте резюме на: {v}",
         "open_form": "Откройте форму отклика:",
         "how_to_apply": "Как откликнуться: {v}",
@@ -194,6 +261,8 @@ TR = {
                  "роботодавцем і не несемо відповідальності за умови праці "
                  "у зазначених компаніях.",
         "choose_department": "Оберіть департамент, щоб побачити посади:",
+        "choose_fleet": "Оберіть флот:",
+        "back_to_fleets": "⬅ Флоти",
         "choose_position": "Оберіть одну або кілька посад — натисніть, щоб додати, "
                             "ще раз — щоб прибрати. Надішлю вакансії за останні 7 днів "
                             "по кожній, а далі — всі нові:",
@@ -217,16 +286,17 @@ TR = {
         "referral_share_text": "Сповіщення про вакансії за посадою в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша підписка на сповіщення закінчується менш ніж за 24 години. Продовжте, щоб не пропускати вакансії:",
         "revoked_notice": "Вашу підписку на сповіщення скасовано адміністратором.",
-        "digest_intro": "📧 Отримайте всі email з вакансій, опублікованих у каналі за останні 7 днів — {price} Stars, разова покупка.",
+        "digest_intro": "📧 Усі email рекрутерів з вакансій, опублікованих у каналі цього тижня — ${price}, разова покупка.",
         "digest_pay_button": "⭐ Оплатити {price} Stars",
-        "digest_menu_button": "📧 Отримати email-дайджест за тиждень",
+        "digest_menu_button": "📧 Отримати email рекрутерів за тиждень",
         "digest_delivered": "✅ Ось {count} email за останні 7 днів:",
         "digest_empty": "За останні 7 днів не було вакансій із контактним email.",
         "pay_active_until": "✅ Підписку активовано до {until}.",
         "payment_thanks": "✅ Оплату отримано — активно до {until}. Тепер оберіть посади:",
+        "payment_thanks_locked": "✅ Оплату отримано — активно до {until}. Ваші посади залишаються: {tags}",
         "max_positions": "Можна обрати не більше {max} посад. Спочатку приберіть одну, щоб додати іншу.",
-        "positions_locked_notice": "Ваші посади зафіксовано на цей період: {tags}. "
-                                    "Якщо потрібно змінити — напишіть адміністратору.",
+        "positions_locked_notice": "Ваші посади: {tags}.\n⏳ Залишилось днів підписки: {days_left}. "
+                                    "Якщо потрібно змінити посади — напишіть адміністратору.",
         "send_cv": "Надішліть резюме на: {v}",
         "open_form": "Відкрийте форму відгуку:",
         "how_to_apply": "Як відгукнутися: {v}",
@@ -318,35 +388,50 @@ For each vacancy, extract:
 - position_tag: map the position to EXACTLY ONE tag from this fixed list (pick the closest
   match — treat abbreviations, informal titles, and near-synonyms as the same rank):
   {rank_tags}
-  Common mappings to use as a guide (not exhaustive — apply the same logic to anything
-  similar that isn't listed here):
-    "Master", "Captain", "Skipper" -> Master
-    "C/O", "Chief Officer", "Chief Mate", "First Mate", "1/O" -> ChiefOfficer
-    "2/O", "2nd Officer", "Second Officer", "Second Mate", "SDPO" -> SecondOfficer
-    "3/O", "3rd Officer", "Third Officer", "Third Mate" -> ThirdOfficer
-    "Deck Cadet", "Deck Trainee", "Navigation Cadet" -> DeckCadet
-    "C/E", "Chief Engineer" -> ChiefEngineer
-    "2/E", "Second Engineer", "First Assistant Engineer" -> SecondEngineer
-    "3/E", "Third Engineer", "Second Assistant Engineer" -> ThirdEngineer
-    "4/E", "Fourth Engineer", "Third Assistant Engineer" -> FourthEngineer
-    "Engine Cadet", "Engine Trainee", "Motor Cadet" -> EngineCadet
-    "Junior ETO", "Electro-Technical Officer", "Electrical Officer", "Electrical"
-    (as a job title, not a requirement) -> ETO
-    "Ship's Electrician", "Electrical Rating" -> Electrician
-    "Boatswain", "Bosun's Mate" -> Bosun
-    "AB", "Able Seaman", "Able Bodied Seaman", "Deck Hand", "Deckhand" -> AB
-    "OS", "Ordinary Seaman" -> OS
-    "Motorman", "Engine Rating" -> Motorman
-    "Oiler", "Wiper" -> Oiler
-    "Fitter", "Engine Fitter" -> Fitter
-    "Cook", "Ship's Cook", "Chief Cook", "Galley Cook" -> Cook
-    "Steward", "Mess Man", "Messman" -> Steward
-    "Camp Boss", "Campboss", "Catering Manager" -> Campboss
-    "Chief Steward", "Chief Steward/ess" -> ChiefSteward
+
+  Use this guide (not exhaustive — apply the same logic to anything similar that isn't
+  listed here):
+    "Master", "Captain", "Skipper", "SDPO" -> OFF_Master
+    "C/O", "Chief Officer", "Chief Mate", "First Mate", "1/O", "DPO" alone -> OFF_ChiefOfficer
+    "2/O", "2nd Officer", "Second Officer", "Second Mate" -> OFF_SecondOfficer
+    "JDPO", "3/O", "3rd Officer", "Third Officer", "Third Mate" -> OFF_ThirdOfficer
+    "Safety Officer" -> OFF_SafetyOfficer
+    "HLO", "Helicopter Landing Officer" -> OFF_HLO
+    "Deck Cadet", "Deck Trainee", "Navigation Cadet" -> OFF_DeckCadet
+    "C/E", "Chief Engineer" -> OFF_ChiefEngineer
+    "2/E", "Second Engineer", "First Assistant Engineer" -> OFF_SecondEngineer
+    "3/E", "Third Engineer", "EOOW" -> OFF_ThirdEngineer
+    "4/E", "Fourth Engineer", "Junior Engineer" -> OFF_JuniorEngineer
+    "Junior ETO", "Electro-Technical Officer", "Electrical Officer", "Ship's Electrician"
+    (as a job title, not a requirement) -> OFF_ETO
+    "Boatswain", "Bosun's Mate" -> OFF_Bosun
+    "AB", "Able Seaman", "Able Bodied Seaman", "Deck Hand", "Deckhand", "OS",
+    "Ordinary Seaman", "Roustabout" -> OFF_AB
+    "Crane Operator" -> OFF_CraneOperator
+    "Gangway Operator" -> OFF_GangwayOperator
+    "Rigger" -> OFF_Rigger
+    "Fitter", "Welder", "Engine Fitter" -> OFF_FitterWelder
+    "Motorman", "Engine Rating" -> OFF_Motorman
+    "Oiler" -> OFF_Oiler
+    "Wiper" -> OFF_Wiper
+    "Engine Cadet", "Engine Trainee", "Motor Cadet" -> OFF_EngineCadet
+    "Cook", "Ship's Cook", "Chief Cook", "Galley Cook", "Night Cook" -> OFF_Cook
+    "Steward", "Stewardess" -> OFF_Steward
+    "Messman", "Mess Man" -> OFF_Messman
+    "Baker" -> OFF_Baker
+    "Camp Boss", "Campboss", "Catering Manager" -> OFF_CampBoss
+    "Chief Steward", "Chief Steward/ess" -> OFF_ChiefSteward
+    "ROV", "ROV Pilot", "ROV Technician" -> OFF_ROV
+    "Client Rep", "Client Representative" -> OFF_ClientRep
+    "Online Survey", "Survey" (remote/online) -> OFF_OnlineSurvey
+    "Survey Engineer" -> OFF_SurveyEngineer
+    "Diver", "Saturation Diver" -> OFF_Diver
+    "Scaffolder" -> OFF_Scaffolder
+    "Winch Operator" -> OFF_WinchOperator
     "OOW" (Officer of the Watch) or a bare "Mate" with no rank number given is ambiguous
     between SecondOfficer and ThirdOfficer — infer from context (years of experience
     required, COC class, whether it's described as senior/junior watch); if there is truly
-    no way to tell, default to SecondOfficer rather than Other.
+    no way to tell, default to OFF_SecondOfficer rather than Other.
   If truly nothing in the list or the guidance above fits, use "Other".
 - vessel: vessel/rig type or name, as written/implied in the source, or null
 - vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list (e.g. "OSV",
@@ -457,7 +542,7 @@ def ai_parse_batch(raw: str) -> list[dict]:
         # синоним) — подстраховываемся: если тега нет в фиксированном списке,
         # откатываемся на Other, а не тащим в канал произвольный текст как тег
         position_tag = item.get("position_tag") or FALLBACK_TAG
-        if position_tag not in RANK_TAGS:
+        if position_tag not in ALL_VALID_POSITION_TAGS:
             position_tag = FALLBACK_TAG
         vessel_tag = item.get("vessel_tag") or FALLBACK_TAG
         if vessel_tag not in VESSEL_TAGS:
@@ -562,7 +647,7 @@ def apply_button_url(vacancy_id: int) -> str:
 def channel_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
-            text="🎯 Get Matched Jobs", url=f"https://t.me/{BOT_USERNAME}?start=join"
+            text="🎯 Get More Offers", url=f"https://t.me/{BOT_USERNAME}?start=join"
         )
     ]])
 
@@ -635,15 +720,32 @@ def next_digest_slot() -> datetime:
 
 
 async def do_publish(bot: Bot, vacancy_id: int):
+    global _banner_file_id
     row = db.get_vacancy(vacancy_id)
     fields = dict(row)
     text = render_template(fields)
 
-    sent = await bot.send_message(
-        chat_id=CHANNEL_ID, text=text,
-        reply_markup=channel_keyboard(vacancy_id),
-    )
-    db.set_status(vacancy_id, "published", sent.message_id)
+    photo = _banner_file_id or FSInputFile(BANNER_PATH)
+    CAPTION_LIMIT = 1024
+    if len(text) <= CAPTION_LIMIT:
+        sent = await bot.send_photo(
+            chat_id=CHANNEL_ID, photo=photo, caption=text,
+            reply_markup=channel_keyboard(vacancy_id),
+        )
+        db.set_status(vacancy_id, "published", sent.message_id)
+    else:
+        # подпись к фото у Telegram ограничена 1024 символами — обрезаем её
+        # с пометкой, а полный текст со всеми деталями шлём вторым обычным
+        # сообщением сразу следом, туда же переносим кнопки
+        caption = text[:1000].rstrip() + "…\n\n👇 Full details below"
+        sent = await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=caption)
+        await bot.send_message(
+            chat_id=CHANNEL_ID, text=text,
+            reply_markup=channel_keyboard(vacancy_id),
+        )
+        db.set_status(vacancy_id, "published", sent.message_id)
+    if not _banner_file_id and sent.photo:
+        _banner_file_id = sent.photo[-1].file_id  # кэшируем на все следующие публикации в этом процессе
 
     # публикация в канал уже состоялась и подтверждена выше — рассылка
     # подписчикам оборачивается отдельно, чтобы её сбой ни в коем случае
@@ -732,7 +834,7 @@ async def cmd_start(message: Message, command: CommandObject):
         return
 
     # любой другой человек (не админ, без apply_-диплинка) — это кандидат,
-    # который либо перешёл по кнопке «🎯 Get Matched Jobs» из канала, либо
+    # который либо перешёл по кнопке «🎯 Get More Offers» из канала, либо
     # написал боту сам.
     tg_id = message.from_user.id
     if db.is_blocked(tg_id):
@@ -756,10 +858,7 @@ async def cmd_start(message: Message, command: CommandObject):
 
 
 def payment_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(
-        text=t(lang, "pay_button", price=SUBSCRIPTION_PRICE_STARS),
-        callback_data=f"pay_sub:{SUBSCRIPTION_DAYS}:{SUBSCRIPTION_PRICE_STARS}",
-    )]]
+    rows = []
     if STRIPE_PAYMENT_LINK and tg_id:
         # client_reference_id — единственный способ Stripe сообщить вебхуком,
         # какому именно tg_id принадлежит платёж
@@ -784,7 +883,7 @@ async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit:
         if db.start_trial_if_new(tg_id, TRIAL_DAYS):
             selected = set(db.get_subscriber_positions(tg_id))
             text = t(lang, "trial_started", days=TRIAL_DAYS)
-            markup = department_keyboard(lang, selected)
+            markup = department_keyboard(lang, "Offshore", selected)
         else:
             # триал уже был использован (или истекла платная подписка) —
             # теперь показываем настоящий экран оплаты
@@ -792,11 +891,13 @@ async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit:
             markup = payment_keyboard(lang, tg_id)
     elif db.is_positions_locked(tg_id):
         selected = db.get_subscriber_positions(tg_id)
-        text = t(lang, "positions_locked_notice", tags=", ".join(selected))
+        until_raw = db.get_subscription_until(tg_id)
+        days_left = (datetime.fromisoformat(until_raw) - datetime.now()).days if until_raw else 0
+        text = t(lang, "positions_locked_notice", tags=", ".join(selected), days_left=max(days_left, 0))
         markup = after_subscribe_keyboard(lang, tg_id)
     else:
         selected = set(db.get_subscriber_positions(tg_id))
-        text, markup = t(lang, "choose_department"), department_keyboard(lang, selected)
+        text, markup = t(lang, "choose_department"), department_keyboard(lang, "Offshore", selected)
     if edit:
         await target.edit_text(text, reply_markup=markup)
     else:
@@ -829,10 +930,7 @@ async def cb_pay_subscription(callback: CallbackQuery):
 
 @router.message(Command("getemails"))
 def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(
-        text=t(lang, "digest_pay_button", price=EMAIL_DIGEST_PRICE_STARS),
-        callback_data="pay_digest",
-    )]]
+    rows = []
     if STRIPE_DIGEST_PAYMENT_LINK and tg_id:
         # digest_ префикс в client_reference_id — так вебхук в webapp.py
         # отличает разовую покупку дайджеста от продления подписки
@@ -850,7 +948,7 @@ async def cmd_get_emails(message: Message):
         return
     lang = db.get_subscriber_language(tg_id)
     await message.answer(
-        t(lang, "digest_intro", price=EMAIL_DIGEST_PRICE_STARS),
+        t(lang, "digest_intro", price=EMAIL_DIGEST_PRICE_USD),
         reply_markup=digest_keyboard(lang, tg_id),
     )
 
@@ -866,7 +964,7 @@ async def cb_show_digest(callback: CallbackQuery):
         return
     lang = db.get_subscriber_language(tg_id)
     await callback.message.answer(
-        t(lang, "digest_intro", price=EMAIL_DIGEST_PRICE_STARS),
+        t(lang, "digest_intro", price=EMAIL_DIGEST_PRICE_USD),
         reply_markup=digest_keyboard(lang, tg_id),
     )
     await callback.answer()
@@ -931,20 +1029,24 @@ async def finalize_subscription_payment(bot: Bot, tg_id: int, days: int, amount,
                                          charge_id: str, provider: str, username: str | None):
     """Общая точка после успешной оплаты подписки — не важно, пришла она из
     Stars (process_successful_payment) или из Stripe (вебхук в webapp.py).
-    Делает: запись платежа, продление подписки, разблокировку должностей,
-    сообщение кандидату, реферальный бонус, уведомление админу."""
+    Делает: запись платежа, продление подписки, сообщение кандидату,
+    реферальный бонус, уведомление админу. Должности НЕ разблокируются —
+    выбор постоянный, продление лишь продлевает доступ по уже выбранным
+    должностям (см. permanent lock, cb_subscribe_done)."""
     is_first_payment = db.count_payments(tg_id) == 0
     db.insert_payment(tg_id, amount, days, charge_id, provider=provider, currency=currency)
     new_until = db.extend_subscription(tg_id, days)
-    db.unlock_positions(tg_id)  # новый оплаченный период — можно скорректировать выбор
     lang = db.get_subscriber_language(tg_id)
     until_str = datetime.fromisoformat(new_until).strftime("%d.%m.%Y")
-    selected = set(db.get_subscriber_positions(tg_id))
+    selected = db.get_subscriber_positions(tg_id)
+    if db.is_positions_locked(tg_id):
+        text = t(lang, "payment_thanks_locked", until=until_str, tags=", ".join(selected))
+        markup = after_subscribe_keyboard(lang, tg_id)
+    else:
+        text = t(lang, "payment_thanks", until=until_str)
+        markup = department_keyboard(lang, "Offshore", set(selected))
     try:
-        await bot.send_message(
-            tg_id, t(lang, "payment_thanks", until=until_str),
-            reply_markup=department_keyboard(lang, selected),
-        )
+        await bot.send_message(tg_id, text, reply_markup=markup)
     except TelegramAPIError:
         pass
 
@@ -1043,9 +1145,10 @@ async def cb_show_positions(callback: CallbackQuery):
     await callback.answer()
 
 
+
 @router.callback_query(F.data.startswith("subdept:"))
 async def cb_show_department(callback: CallbackQuery):
-    dept = callback.data.split(":", 1)[1]
+    _, fleet, dept = callback.data.split(":", 2)
     tg_id = callback.from_user.id
     if throttled(tg_id):
         await callback.answer()
@@ -1057,13 +1160,14 @@ async def cb_show_department(callback: CallbackQuery):
         return
     selected = set(db.get_subscriber_positions(tg_id))
     await callback.message.edit_text(
-        t(lang, "choose_position"), reply_markup=subscribe_keyboard(dept, lang, selected)
+        t(lang, "choose_position"), reply_markup=subscribe_keyboard(fleet, dept, lang, selected)
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "subdeptback")
+@router.callback_query(F.data.startswith("subdeptback:"))
 async def cb_department_back(callback: CallbackQuery):
+    fleet = callback.data.split(":", 1)[1]
     tg_id = callback.from_user.id
     if throttled(tg_id):
         await callback.answer()
@@ -1071,7 +1175,7 @@ async def cb_department_back(callback: CallbackQuery):
     lang = db.get_subscriber_language(tg_id)
     selected = set(db.get_subscriber_positions(tg_id))
     await callback.message.edit_text(
-        t(lang, "choose_department"), reply_markup=department_keyboard(lang, selected)
+        t(lang, "choose_department"), reply_markup=department_keyboard(lang, fleet, selected)
     )
     await callback.answer()
 
@@ -1183,14 +1287,17 @@ def language_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
-def department_keyboard(lang: str | None = None, selected: set[str] | None = None) -> InlineKeyboardMarkup:
+
+def department_keyboard(lang: str | None = None, fleet: str = "Offshore",
+                         selected: set[str] | None = None) -> InlineKeyboardMarkup:
     selected = selected or set()
     rows = []
     row = []
-    for dept, tags in DEPARTMENTS.items():
-        count = len(selected & set(tags))
+    for dept, tags in FLEET_POSITIONS[fleet].items():
+        tag_set = {tag for tag, _ in tags}
+        count = len(selected & tag_set)
         label = f"{dept} ({count})" if count else dept
-        row.append(InlineKeyboardButton(text=label, callback_data=f"subdept:{dept}"))
+        row.append(InlineKeyboardButton(text=label, callback_data=f"subdept:{fleet}:{dept}"))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -1203,24 +1310,26 @@ def department_keyboard(lang: str | None = None, selected: set[str] | None = Non
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def subscribe_keyboard(dept: str, lang: str | None = None, selected: set[str] | None = None) -> InlineKeyboardMarkup:
-    # клавиатура должностей ВНУТРИ одного департамента — dept закодирован в
-    # callback_data (subpos:<dept>:<tag>), чтобы toggle-хендлер знал, какой
-    # именно экран перерисовывать после нажатия
+def subscribe_keyboard(fleet: str, dept: str, lang: str | None = None,
+                        selected: set[str] | None = None) -> InlineKeyboardMarkup:
+    # клавиатура должностей ВНУТРИ одного департамента одного флота — оба
+    # закодированы в callback_data (subpos:<fleet>:<dept>:<tag>), чтобы
+    # toggle-хендлер знал, какой именно экран перерисовывать после нажатия
     selected = selected or set()
     rows = []
     row = []
-    for tag in DEPARTMENTS[dept]:
-        label = f"✅ {tag}" if tag in selected else tag
-        row.append(InlineKeyboardButton(text=label, callback_data=f"subpos:{dept}:{tag}"))
-        if len(row) == 3:
+    for tag, label_text in FLEET_POSITIONS[fleet][dept]:
+        label = f"✅ {label_text}" if tag in selected else label_text
+        row.append(InlineKeyboardButton(text=label, callback_data=f"subpos:{fleet}:{dept}:{tag}"))
+        if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton(text=t(lang, "back_to_departments"), callback_data="subdeptback")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_to_departments"), callback_data=f"subdeptback:{fleet}")])
     rows.append([InlineKeyboardButton(text=t(lang, "done"), callback_data="subdone")])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
+    rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1361,6 +1470,31 @@ async def cmd_subscribers_list(message: Message):
         await message.answer(text[i:i + 3500])
 
 
+@router.message(Command("unlockpositions"))
+async def cmd_unlock_positions(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    handle = (command.args or "").strip()
+    if not handle:
+        await message.answer("Использование: /unlockpositions [@username или id]")
+        return
+    row = db.find_subscriber_by_handle(handle)
+    if not row:
+        await message.answer(f"Не нашёл {handle} в базе подписчиков.")
+        return
+    tg_id = row["tg_id"]
+    db.unlock_positions(tg_id)
+    await message.answer(f"✅ {handle} может заново выбрать должности — подписка не тронута.")
+    lang = db.get_subscriber_language(tg_id)
+    try:
+        await message.bot.send_message(
+            tg_id, t(lang, "choose_department"),
+            reply_markup=department_keyboard(lang, "Offshore", set(db.get_subscriber_positions(tg_id))),
+        )
+    except TelegramAPIError:
+        pass
+
+
 @router.message(Command("grant"))
 async def cmd_grant(message: Message, command: CommandObject):
     if not admin_only(message.from_user.id):
@@ -1380,14 +1514,14 @@ async def cmd_grant(message: Message, command: CommandObject):
         return
     tg_id = row["tg_id"]
     new_until = db.extend_subscription(tg_id, days)
-    db.unlock_positions(tg_id)
+    db.unlock_positions(tg_id)  # /grant — единственный способ снять постоянную блокировку должностей
     until_str = datetime.fromisoformat(new_until).strftime("%d.%m.%Y")
     await message.answer(f"✅ Выдал доступ на {days} дней. Активно до {until_str}.")
     lang = db.get_subscriber_language(tg_id)
     try:
         await message.bot.send_message(
             tg_id, t(lang, "payment_thanks", until=until_str),
-            reply_markup=department_keyboard(lang, set(db.get_subscriber_positions(tg_id))),
+            reply_markup=department_keyboard(lang, "Offshore", set(db.get_subscriber_positions(tg_id))),
         )
     except TelegramAPIError:
         pass
@@ -1503,7 +1637,7 @@ async def cmd_subscribe(message: Message):
 
 @router.callback_query(F.data.startswith("subpos:"))
 async def cb_subscribe_position(callback: CallbackQuery):
-    _, dept, position_tag = callback.data.split(":", 2)
+    _, fleet, dept, position_tag = callback.data.split(":", 3)
     tg_id = callback.from_user.id
     if throttled(tg_id, seconds=1.0):
         await callback.answer()
@@ -1530,7 +1664,7 @@ async def cb_subscribe_position(callback: CallbackQuery):
     # всего мульти-выбора
     selected = set(db.get_subscriber_positions(tg_id))
     try:
-        await callback.message.edit_reply_markup(reply_markup=subscribe_keyboard(dept, lang, selected))
+        await callback.message.edit_reply_markup(reply_markup=subscribe_keyboard(fleet, dept, lang, selected))
     except TelegramAPIError:
         pass  # клавиатура уже в нужном состоянии — Telegram иногда так отвечает, это не ошибка
 
@@ -1539,7 +1673,7 @@ async def cb_subscribe_position(callback: CallbackQuery):
         return
 
     await callback.answer(t(lang, "subscribed", tag=position_tag))
-    backfill = db.get_recent_published_by_tag(position_tag, days=7)
+    backfill = db.get_recent_published_by_tag(position_tag, days=TRIAL_BACKFILL_DAYS)
     if not backfill:
         await callback.bot.send_message(tg_id, t(lang, "backfill_empty", tag=position_tag))
         return
