@@ -370,6 +370,18 @@ def get_subscription_until(tg_id: int):
     return row["subscription_until"] if row else None
 
 
+def get_all_subscriber_ids_with_subscription():
+    """tg_id всех, у кого subscription_until хоть раз проставлялся (были на
+    триале или платили) — независимо от того, истекла подписка сейчас или
+    нет. Используется массовым продлением /extendall."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT tg_id FROM subscribers WHERE subscription_until IS NOT NULL"
+    ).fetchall()
+    conn.close()
+    return [r["tg_id"] for r in rows]
+
+
 def extend_subscription(tg_id: int, days: int):
     """Продлевает платную подписку на N дней от текущего момента (или от
     даты истечения, если она ещё не прошла — чтобы досрочная повторная

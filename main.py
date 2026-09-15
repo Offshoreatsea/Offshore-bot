@@ -188,6 +188,7 @@ TR = {
         "referral_share_text": "Get job alerts by position on OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Your job alerts subscription ends in less than 24 hours. Renew to keep getting instant notifications:",
         "revoked_notice": "Your job alerts subscription has been cancelled by the admin.",
+        "bonus_extension": "🎁 We've added {days} free days to your subscription — now active until {until}!",
         "digest_intro": "📧 Get all the recruiter emails from vacancies posted in the channel this week — ${price}, one-time purchase.",
         "digest_pay_button": "⭐ Pay {price} Stars",
         "digest_menu_button": "📧 Get recruiter emails from this week",
@@ -237,6 +238,7 @@ TR = {
         "referral_share_text": "Уведомления о вакансиях по должности в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша подписка на уведомления заканчивается меньше чем через 24 часа. Продлите, чтобы не пропускать вакансии:",
         "revoked_notice": "Ваша подписка на уведомления отменена администратором.",
+        "bonus_extension": "🎁 Мы добавили вам {days} бесплатных дня подписки — теперь активно до {until}!",
         "digest_intro": "📧 Все email рекрутёров из вакансий, опубликованных в канале за эту неделю — ${price}, разовая покупка.",
         "digest_pay_button": "⭐ Оплатить {price} Stars",
         "digest_menu_button": "📧 Получить email рекрутёров за неделю",
@@ -286,6 +288,7 @@ TR = {
         "referral_share_text": "Сповіщення про вакансії за посадою в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша підписка на сповіщення закінчується менш ніж за 24 години. Продовжте, щоб не пропускати вакансії:",
         "revoked_notice": "Вашу підписку на сповіщення скасовано адміністратором.",
+        "bonus_extension": "🎁 Ми додали вам {days} безкоштовні дні підписки — тепер активно до {until}!",
         "digest_intro": "📧 Усі email рекрутерів з вакансій, опублікованих у каналі цього тижня — ${price}, разова покупка.",
         "digest_pay_button": "⭐ Оплатити {price} Stars",
         "digest_menu_button": "📧 Отримати email рекрутерів за тиждень",
@@ -812,6 +815,7 @@ async def cmd_start(message: Message, command: CommandObject):
             "/subscriberslist — полный список подписчиков (ник, должности, статус оплаты)\n"
             "/getemails — платный email-дайджест за неделю (доступна любому, не только вам)\n"
             "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не через Stars\n"
+            "/extendall [дней] — продлить подписку ВСЕМ подписчикам бесплатно (акция)\n"
             "/unlockpositions [@ник или id] — разблокировать должности без продления подписки\n"
             "/revoke [@ник или id] — отписать вручную, доступ прекращается немедленно\n"
             "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
@@ -1494,6 +1498,38 @@ async def cmd_unlock_positions(message: Message, command: CommandObject):
         )
     except TelegramAPIError:
         pass
+
+
+@router.message(Command("extendall"))
+async def cmd_extend_all(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await message.answer("Использование: /extendall [дней], например /extendall 4")
+        return
+    days = int(arg)
+    ids = db.get_all_subscriber_ids_with_subscription()
+    if not ids:
+        await message.answer("Пока ни у кого нет подписки — продлевать некому.")
+        return
+
+    await message.answer(f"⏳ Продлеваю подписку на {days} дней у {len(ids)} человек...")
+    sent, failed = 0, 0
+    for tg_id in ids:
+        db.extend_subscription(tg_id, days)
+        lang = db.get_subscriber_language(tg_id)
+        until_str = datetime.fromisoformat(db.get_subscription_until(tg_id)).strftime("%d.%m.%Y")
+        try:
+            await message.bot.send_message(
+                tg_id, t(lang, "bonus_extension", days=days, until=until_str)
+            )
+            sent += 1
+        except TelegramAPIError:
+            failed += 1
+        await asyncio.sleep(0.05)  # не спамим Telegram API пачкой без пауз
+
+    await message.answer(f"✅ Готово. Продлено: {len(ids)}. Уведомлено: {sent}, не доставлено: {failed}.")
 
 
 @router.message(Command("grant"))
