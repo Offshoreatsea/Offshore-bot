@@ -106,6 +106,8 @@ def init_db():
         conn.execute("ALTER TABLE subscribers ADD COLUMN referred_by INTEGER")
     if "reminder_sent_for" not in sub_cols:
         conn.execute("ALTER TABLE subscribers ADD COLUMN reminder_sent_for TEXT")
+    if "stripe_customer_id" not in sub_cols:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN stripe_customer_id TEXT")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -380,6 +382,24 @@ def get_all_subscriber_ids_with_subscription():
     ).fetchall()
     conn.close()
     return [r["tg_id"] for r in rows]
+
+
+def set_stripe_customer_id(tg_id: int, customer_id: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscribers SET stripe_customer_id = ? WHERE tg_id = ?", (customer_id, tg_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def find_tg_id_by_stripe_customer(customer_id: str):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT tg_id FROM subscribers WHERE stripe_customer_id = ?", (customer_id,)
+    ).fetchone()
+    conn.close()
+    return row["tg_id"] if row else None
 
 
 def extend_subscription(tg_id: int, days: int):

@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta
 
 import anthropic
+import stripe
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -43,6 +44,7 @@ CONSULT_LINK = os.getenv("CONSULT_LINK", "https://t.me/Offshore_atsea")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 WEBAPP_URL = os.getenv("WEBAPP_URL")  # публичный https-адрес мини-приложения, см. README
 STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK")  # готовая ссылка из Stripe Dashboard, напр. https://buy.stripe.com/...
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_DIGEST_PAYMENT_LINK = os.getenv("STRIPE_DIGEST_PAYMENT_LINK")  # отдельная ссылка на разовую покупку email-дайджеста ($5)
 BANNER_PATH = os.path.join(os.path.dirname(__file__), "assets", "promo_banner.jpg")
 _banner_file_id: str | None = None  # заполняется после первой отправки — дальше шлём по file_id, не перезаливая файл
@@ -188,7 +190,16 @@ TR = {
         "referral_share_text": "Get job alerts by position on OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Your job alerts subscription ends in less than 24 hours. Renew to keep getting instant notifications:",
         "revoked_notice": "Your job alerts subscription has been cancelled by the admin.",
-        "bonus_extension": "🎁 We've added {days} free days to your subscription — now active until {until}!",
+        "bonus_extension": "🎁 We're giving you {days} days of access as a gift! Now active until {until}.",
+        "upcoming_charge": "⏳ Heads up: {amount} {currency} will be charged in a few days to renew your subscription. Manage or cancel anytime with /managesubscription.",
+        "no_stripe_subscription": "You don't have a card subscription to manage — either you haven't paid by card yet, or you paid with Stars (Stars don't auto-renew, so there's nothing to cancel).",
+        "portal_error": "Couldn't open the subscription management page right now. Please try again in a moment or contact admin.",
+        "manage_subscription_link": "Manage your subscription (change card, cancel auto-renewal) here:",
+        "manage_subscription_button": "💳 Manage subscription",
+        "my_subscription_active": "📋 Your subscription: {days_left} days left.",
+        "my_subscription_none": "📋 You don't have an active subscription right now.",
+        "my_subscription_button": "📋 My subscription",
+        "renew_button": "🔁 Renew subscription",
         "digest_intro": "📧 Get all the recruiter emails from vacancies posted in the channel this week — ${price}, one-time purchase.",
         "digest_pay_button": "⭐ Pay {price} Stars",
         "digest_menu_button": "📧 Get recruiter emails from this week",
@@ -238,7 +249,16 @@ TR = {
         "referral_share_text": "Уведомления о вакансиях по должности в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша подписка на уведомления заканчивается меньше чем через 24 часа. Продлите, чтобы не пропускать вакансии:",
         "revoked_notice": "Ваша подписка на уведомления отменена администратором.",
-        "bonus_extension": "🎁 Мы добавили вам {days} бесплатных дня подписки — теперь активно до {until}!",
+        "bonus_extension": "Даём доступ на {days} дня в подарок 🎁\nТеперь активно до {until}.",
+        "upcoming_charge": "⏳ Через несколько дней спишется {amount} {currency} за продление подписки. Управлять или отменить можно в любой момент: /managesubscription.",
+        "no_stripe_subscription": "У вас нет подписки картой для управления — либо вы ещё не платили картой, либо платили звёздами (у Stars нет автосписания, отменять там нечего).",
+        "portal_error": "Не получилось сейчас открыть страницу управления подпиской. Попробуйте чуть позже или напишите администратору.",
+        "manage_subscription_link": "Управление подпиской (смена карты, отмена автопродления) здесь:",
+        "manage_subscription_button": "💳 Управлять подпиской",
+        "my_subscription_active": "📋 Ваша подписка: осталось {days_left} дней.",
+        "my_subscription_none": "📋 У вас сейчас нет активной подписки.",
+        "my_subscription_button": "📋 Моя подписка",
+        "renew_button": "🔁 Продлить подписку",
         "digest_intro": "📧 Все email рекрутёров из вакансий, опубликованных в канале за эту неделю — ${price}, разовая покупка.",
         "digest_pay_button": "⭐ Оплатить {price} Stars",
         "digest_menu_button": "📧 Получить email рекрутёров за неделю",
@@ -288,7 +308,16 @@ TR = {
         "referral_share_text": "Сповіщення про вакансії за посадою в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша підписка на сповіщення закінчується менш ніж за 24 години. Продовжте, щоб не пропускати вакансії:",
         "revoked_notice": "Вашу підписку на сповіщення скасовано адміністратором.",
-        "bonus_extension": "🎁 Ми додали вам {days} безкоштовні дні підписки — тепер активно до {until}!",
+        "bonus_extension": "Даруємо доступ на {days} дні у подарунок 🎁\nТепер активно до {until}.",
+        "upcoming_charge": "⏳ Через кілька днів спишеться {amount} {currency} за продовження підписки. Керувати або скасувати можна будь-коли: /managesubscription.",
+        "no_stripe_subscription": "У вас немає підписки карткою для керування — або ви ще не платили карткою, або платили Stars (у Stars немає автосписання, скасовувати нема чого).",
+        "portal_error": "Не вдалося зараз відкрити сторінку керування підпискою. Спробуйте трохи пізніше або напишіть адміністратору.",
+        "manage_subscription_link": "Керування підпискою (зміна картки, скасування автопродовження) тут:",
+        "manage_subscription_button": "💳 Керувати підпискою",
+        "my_subscription_active": "📋 Ваша підписка: залишилось {days_left} днів.",
+        "my_subscription_none": "📋 У вас зараз немає активної підписки.",
+        "my_subscription_button": "📋 Моя підписка",
+        "renew_button": "🔁 Продовжити підписку",
         "digest_intro": "📧 Усі email рекрутерів з вакансій, опублікованих у каналі цього тижня — ${price}, разова покупка.",
         "digest_pay_button": "⭐ Оплатити {price} Stars",
         "digest_menu_button": "📧 Отримати email рекрутерів за тиждень",
@@ -648,11 +677,14 @@ def apply_button_url(vacancy_id: int) -> str:
 
 
 def channel_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
             text="🎯 Get More Offers", url=f"https://t.me/{BOT_USERNAME}?start=join"
-        )
-    ]])
+        )],
+        [InlineKeyboardButton(
+            text="📋 Manage Subscription", url=f"https://t.me/{BOT_USERNAME}?start=mysub"
+        )],
+    ])
 
 
 
@@ -814,6 +846,8 @@ async def cmd_start(message: Message, command: CommandObject):
             "/subscribers — сколько людей подписалось и разбивка по должностям\n"
             "/subscriberslist — полный список подписчиков (ник, должности, статус оплаты)\n"
             "/getemails — платный email-дайджест за неделю (доступна любому, не только вам)\n"
+            "/managesubscription — управление/отмена подписки картой (доступна любому)\n"
+            "/mysubscription — сколько дней осталось + кнопка продлить (доступна любому)\n"
             "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не через Stars\n"
             "/extendall [дней] — продлить подписку ВСЕМ подписчикам бесплатно (акция)\n"
             "/unlockpositions [@ник или id] — разблокировать должности без продления подписки\n"
@@ -854,6 +888,15 @@ async def cmd_start(message: Message, command: CommandObject):
                 db.set_referred_by(tg_id, referrer_id)
         except ValueError:
             pass
+
+    # диплинк с кнопки "📋 Manage Subscription" под постом в канале — если
+    # человек уже проходил онбординг раньше (есть сохранённый язык), сразу
+    # показываем ему статус подписки, а не начинаем всё заново
+    if command.args == "mysub":
+        existing_lang = db.get_subscriber_language(tg_id)
+        if existing_lang:
+            await send_my_subscription(message.bot, tg_id, existing_lang)
+            return
 
     # Онбординг начинается с выбора языка.
     await message.answer(
@@ -933,6 +976,101 @@ async def cb_pay_subscription(callback: CallbackQuery):
     await callback.answer()
 
 
+async def send_manage_subscription_link(bot: Bot, tg_id: int, lang: str | None):
+    row = db.find_subscriber_by_handle(str(tg_id))
+    customer_id = row["stripe_customer_id"] if row else None
+    if not customer_id:
+        # человек либо не платил вообще, либо платил звёздами (у звёзд нет
+        # автосписания и Stripe-портала — отменять там нечего)
+        await bot.send_message(tg_id, t(lang, "no_stripe_subscription"))
+        return
+    try:
+        portal = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=f"https://t.me/{BOT_USERNAME}",
+        )
+    except Exception as e:
+        await bot.send_message(tg_id, t(lang, "portal_error"))
+        print(f"[send_manage_subscription_link] Ошибка создания портала для tg_id={tg_id}: {e}")
+        return
+    await bot.send_message(
+        tg_id, t(lang, "manage_subscription_link"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "manage_subscription_button"), url=portal.url)]
+        ]),
+    )
+
+
+@router.message(Command("managesubscription"))
+async def cmd_manage_subscription(message: Message):
+    tg_id = message.from_user.id
+    if db.is_blocked(tg_id):
+        return
+    lang = db.get_subscriber_language(tg_id)
+    await send_my_subscription(message.bot, tg_id, lang)
+
+
+@router.callback_query(F.data == "manage_sub")
+async def cb_manage_subscription(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
+    lang = db.get_subscriber_language(tg_id)
+    await send_manage_subscription_link(callback.bot, tg_id, lang)
+    await callback.answer()
+
+
+def subscription_status_keyboard(lang: str | None, tg_id: int, has_stripe_customer: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if STRIPE_PAYMENT_LINK:
+        stripe_url = f"{STRIPE_PAYMENT_LINK}?client_reference_id={tg_id}"
+        rows.append([InlineKeyboardButton(text=t(lang, "renew_button"), url=stripe_url)])
+    if has_stripe_customer:
+        rows.append([InlineKeyboardButton(text=t(lang, "manage_subscription_button"), callback_data="manage_sub")])
+    rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
+    rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
+    rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_my_subscription(bot: Bot, tg_id: int, lang: str | None):
+    if db.is_blocked(tg_id):
+        return
+    if db.is_subscription_active(tg_id):
+        until_raw = db.get_subscription_until(tg_id)
+        days_left = (datetime.fromisoformat(until_raw) - datetime.now()).days
+        text = t(lang, "my_subscription_active", days_left=max(days_left, 0))
+        row = db.find_subscriber_by_handle(str(tg_id))
+        has_customer = bool(row and row["stripe_customer_id"])
+        await bot.send_message(tg_id, text, reply_markup=subscription_status_keyboard(lang, tg_id, has_customer))
+    else:
+        # подписки нет вообще (или истекла) — обычный экран оплаты, там уже
+        # есть кнопка Stripe
+        text = t(lang, "pay_intro", price=SUBSCRIPTION_PRICE_STARS)
+        await bot.send_message(tg_id, text, reply_markup=payment_keyboard(lang, tg_id))
+
+
+@router.message(Command("mysubscription"))
+async def cmd_my_subscription(message: Message):
+    tg_id = message.from_user.id
+    if db.is_blocked(tg_id):
+        return
+    lang = db.get_subscriber_language(tg_id)
+    await send_my_subscription(message.bot, tg_id, lang)
+
+
+@router.callback_query(F.data == "show_mysub")
+async def cb_my_subscription(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
+    lang = db.get_subscriber_language(tg_id)
+    await send_my_subscription(callback.bot, tg_id, lang)
+    await callback.answer()
+
+
 @router.message(Command("getemails"))
 def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
     rows = []
@@ -942,6 +1080,8 @@ def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> Inline
         stripe_url = f"{STRIPE_DIGEST_PAYMENT_LINK}?client_reference_id=digest_{tg_id}"
         rows.append([InlineKeyboardButton(text=t(lang, "pay_button_card"), url=stripe_url)])
     rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
+    if tg_id:
+        rows.append([InlineKeyboardButton(text=t(lang, "my_subscription_button"), callback_data="show_mysub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1109,15 +1249,50 @@ async def process_successful_payment(message: Message):
 
 
 async def handle_stripe_subscription_activated(bot: Bot, tg_id: int, days: int,
-                                                 amount: float, currency: str, charge_id: str):
+                                                 amount: float, currency: str, charge_id: str,
+                                                 customer_id: str | None = None):
     """Колбэк, который webapp.py вызывает из вебхука Stripe после проверки
     подписи — main.py не импортирует webapp напрямую в эту сторону, поэтому
     вся телеграм-логика (уведомления, локализация) остаётся здесь."""
+    if customer_id:
+        # сохраняем сразу — понадобится для продлений (invoice.paid) и
+        # напоминаний (invoice.upcoming), которые приходят по customer_id,
+        # а не по client_reference_id
+        db.set_stripe_customer_id(tg_id, customer_id)
     row = db.find_subscriber_by_handle(str(tg_id))
     username = row["username"] if row else None
     await finalize_subscription_payment(
         bot, tg_id, days, amount, currency, charge_id, "stripe", username,
     )
+
+
+async def handle_stripe_renewal(bot: Bot, customer_id: str, days: int, amount: float,
+                                 currency: str, charge_id: str):
+    """Stripe продлил подписку сам (автосписание) — этот колбэк приходит по
+    customer_id, не по tg_id, поэтому сначала ищем человека по сохранённому
+    stripe_customer_id."""
+    tg_id = db.find_tg_id_by_stripe_customer(customer_id)
+    if not tg_id:
+        print(f"[handle_stripe_renewal] Не нашёл tg_id для customer={customer_id}")
+        return
+    row = db.find_subscriber_by_handle(str(tg_id))
+    username = row["username"] if row else None
+    await finalize_subscription_payment(
+        bot, tg_id, days, amount, currency, charge_id, "stripe", username,
+    )
+
+
+async def handle_stripe_upcoming(bot: Bot, customer_id: str, amount: float, currency: str):
+    """Stripe сам сообщает за несколько дней до автосписания — просто
+    пересылаем это человеку, не считаем сроки сами."""
+    tg_id = db.find_tg_id_by_stripe_customer(customer_id)
+    if not tg_id:
+        return
+    lang = db.get_subscriber_language(tg_id)
+    try:
+        await bot.send_message(tg_id, t(lang, "upcoming_charge", amount=amount, currency=currency))
+    except TelegramAPIError:
+        pass
 
 
 async def handle_stripe_digest_paid(bot: Bot, tg_id: int, amount: float, currency: str, charge_id: str):
@@ -1312,6 +1487,7 @@ def department_keyboard(lang: str | None = None, fleet: str = "Offshore",
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
+    rows.append([InlineKeyboardButton(text=t(lang, "my_subscription_button"), callback_data="show_mysub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1336,6 +1512,7 @@ def subscribe_keyboard(fleet: str, dept: str, lang: str | None = None,
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
+    rows.append([InlineKeyboardButton(text=t(lang, "my_subscription_button"), callback_data="show_mysub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1350,6 +1527,9 @@ def after_subscribe_keyboard(lang: str | None = None, tg_id: int | None = None) 
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
+    # широкая кнопка последней строкой — единая точка входа в статус подписки
+    # отовсюду, дублируется и под каждым постом в канале (channel_keyboard)
+    rows.append([InlineKeyboardButton(text=t(lang, "my_subscription_button"), callback_data="show_mysub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1934,7 +2114,8 @@ async def main():
 
     if WEBAPP_URL:
         asyncio.create_task(webapp.run_web_server(
-            bot, BOT_TOKEN, PORT, handle_stripe_subscription_activated, handle_stripe_digest_paid
+            bot, BOT_TOKEN, PORT, handle_stripe_subscription_activated, handle_stripe_digest_paid,
+            handle_stripe_renewal, handle_stripe_upcoming
         ))
         try:
             await bot.set_chat_menu_button(

@@ -80,7 +80,8 @@ async def handle_vacancies(request: web.Request) -> web.Response:
     return web.json_response([vacancy_to_dict(r) for r in rows])
 
 
-def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_payment=None) -> web.Application:
+def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_payment=None,
+               on_stripe_renewal=None, on_stripe_upcoming=None) -> web.Application:
     app = web.Application()
 
     def get_authenticated_tg_id(init_data: str) -> int | None:
@@ -111,12 +112,18 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
             # отклоняем, чтобы кто угодно не мог подделать "я оплатил"
             return web.Response(status=400, text="Invalid signature")
 
-        if event["type"] == "checkout.session.completed":
-            session = event["data"]["object"]
-            ref = session.get("client_reference_id") or ""
-            amount = (session.get("amount_total") or 0) / 100  # центы → доллары
-            currency = (session.get("currency") or "usd").upper()
-            charge_id = session.get("payment_intent") or session.get("id")
+        event_type = event["type"]
+        obj = event["data"]["object"]
+
+        if event_type == "checkout.session.completed":
+            # ПЕРВАЯ оплата подписки/дайджеста — Stripe создаёт checkout-сессию
+            # только один раз, при следующих продлениях этого события больше
+            # не будет (см. invoice.paid ниже)
+            ref = obj.get("client_reference_id") or ""
+            amount = (obj.get("amount_total") or 0) / 100  # центы → доллары
+            currency = (obj.get("currency") or "usd").upper()
+            charge_id = obj.get("payment_intent") or obj.get("id")
+            customer_id = obj.get("customer")
 
             if ref.startswith("digest_") and on_stripe_digest_payment:
                 tg_id_raw = ref.replace("digest_", "", 1)
@@ -129,9 +136,41 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
             elif ref.isdigit() and on_stripe_payment:
                 tg_id = int(ref)
                 try:
-                    await on_stripe_payment(bot, tg_id, STRIPE_SUBSCRIPTION_DAYS, amount, currency, charge_id)
+                    await on_stripe_payment(
+                        bot, tg_id, STRIPE_SUBSCRIPTION_DAYS, amount, currency, charge_id, customer_id
+                    )
                 except Exception as e:
                     print(f"[stripe webhook] Ошибка обработки оплаты для tg_id={tg_id}: {e}")
+
+        elif event_type == "invoice.paid":
+            # АВТОМАТИЧЕСКОЕ ПРОДЛЕНИЕ — Stripe списал деньги за следующий
+            # период сам, без нового checkout. Без этого обработчика подписка
+            # в боте считалась бы истёкшей, хотя деньги уже списаны
+            customer_id = obj.get("customer")
+            amount = (obj.get("amount_paid") or 0) / 100
+            currency = (obj.get("currency") or "usd").upper()
+            charge_id = obj.get("id")
+            # первый счёт подписки (тот же checkout) тоже приходит как invoice.paid —
+            # пропускаем его, если это billing_reason=subscription_create, чтобы не
+            # продлевать дважды за одну и ту же оплату (checkout.session.completed
+            # её уже обработал выше)
+            if obj.get("billing_reason") != "subscription_create" and on_stripe_renewal and customer_id:
+                try:
+                    await on_stripe_renewal(bot, customer_id, STRIPE_SUBSCRIPTION_DAYS, amount, currency, charge_id)
+                except Exception as e:
+                    print(f"[stripe webhook] Ошибка обработки продления для customer={customer_id}: {e}")
+
+        elif event_type == "invoice.upcoming":
+            # Stripe шлёт это за несколько дней до автосписания — используем
+            # как готовое напоминание "скоро спишется", не считаем сами
+            customer_id = obj.get("customer")
+            amount = (obj.get("amount_due") or 0) / 100
+            currency = (obj.get("currency") or "usd").upper()
+            if on_stripe_upcoming and customer_id:
+                try:
+                    await on_stripe_upcoming(bot, customer_id, amount, currency)
+                except Exception as e:
+                    print(f"[stripe webhook] Ошибка обработки напоминания для customer={customer_id}: {e}")
 
         return web.Response(status=200, text="ok")
 
@@ -259,8 +298,10 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
     return app
 
 
-async def run_web_server(bot, bot_token: str, port: int, on_stripe_payment=None, on_stripe_digest_payment=None):
-    app = create_app(bot, bot_token, on_stripe_payment, on_stripe_digest_payment)
+async def run_web_server(bot, bot_token: str, port: int, on_stripe_payment=None, on_stripe_digest_payment=None,
+                          on_stripe_renewal=None, on_stripe_upcoming=None):
+    app = create_app(bot, bot_token, on_stripe_payment, on_stripe_digest_payment,
+                      on_stripe_renewal, on_stripe_upcoming)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=port)
