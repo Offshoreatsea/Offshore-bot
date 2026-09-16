@@ -677,14 +677,11 @@ def apply_button_url(vacancy_id: int) -> str:
 
 
 def channel_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
             text="🎯 Get More Offers", url=f"https://t.me/{BOT_USERNAME}?start=join"
-        )],
-        [InlineKeyboardButton(
-            text="📋 Manage Subscription", url=f"https://t.me/{BOT_USERNAME}?start=mysub"
-        )],
-    ])
+        )
+    ]])
 
 
 
