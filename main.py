@@ -69,53 +69,53 @@ DIGEST_TIMES = ["09:00", "14:00", "19:00"]
 FLEET_POSITIONS = {
     "Offshore": {
         "Bridge Officers": [
-            ("OFF_Master", "Master / SDPO"),
-            ("OFF_ChiefOfficer", "Chief Officer / SDPO / DPO"),
-            ("OFF_SecondOfficer", "Second Officer / DPO / JDPO"),
-            ("OFF_ThirdOfficer", "3rd Officer / JDPO"),
-            ("OFF_SafetyOfficer", "Safety Officer"),
-            ("OFF_HLO", "HLO"),
+            ("Master", "Master / SDPO"),
+            ("ChiefOfficer", "Chief Officer / SDPO / DPO"),
+            ("SecondOfficer", "Second Officer / DPO / JDPO"),
+            ("ThirdOfficer", "3rd Officer / JDPO"),
+            ("SafetyOfficer", "Safety Officer"),
+            ("HLO", "HLO"),
         ],
         "Engine Officers": [
-            ("OFF_ChiefEngineer", "Chief Engineer / Single Engineer"),
-            ("OFF_SecondEngineer", "Second Engineer / Single Engineer"),
-            ("OFF_ThirdEngineer", "3rd Engineer / EOOW"),
-            ("OFF_JuniorEngineer", "Junior Engineer / EOOW"),
-            ("OFF_ETO", "ETO / Electrician / ETO Assistant"),
+            ("ChiefEngineer", "Chief Engineer / Single Engineer"),
+            ("SecondEngineer", "Second Engineer / Single Engineer"),
+            ("ThirdEngineer", "3rd Engineer / EOOW"),
+            ("JuniorEngineer", "Junior Engineer / EOOW"),
+            ("ETO", "ETO / Electrician / ETO Assistant"),
         ],
         "Deck Ratings": [
-            ("OFF_Bosun", "Bosun"),
-            ("OFF_AB", "AB / OS / Roustabout"),
-            ("OFF_CraneOperator", "Crane Operator"),
-            ("OFF_GangwayOperator", "Gangway Operator"),
-            ("OFF_HLO", "HLO"),
-            ("OFF_Rigger", "Rigger"),
-            ("OFF_FitterWelder", "Fitter / Welder"),
-            ("OFF_DeckCadet", "Deck Cadet"),
+            ("Bosun", "Bosun"),
+            ("AB", "AB / OS / Roustabout"),
+            ("CraneOperator", "Crane Operator"),
+            ("GangwayOperator", "Gangway Operator"),
+            ("HLO", "HLO"),
+            ("Rigger", "Rigger"),
+            ("FitterWelder", "Fitter / Welder"),
+            ("DeckCadet", "Deck Cadet"),
         ],
         "Engine Ratings": [
-            ("OFF_Oiler", "Oiler"),
-            ("OFF_Wiper", "Wiper"),
-            ("OFF_Motorman", "Motorman"),
-            ("OFF_FitterWelder", "Fitter / Welder"),
-            ("OFF_EngineCadet", "Engine Cadet"),
+            ("Oiler", "Oiler"),
+            ("Wiper", "Wiper"),
+            ("Motorman", "Motorman"),
+            ("FitterWelder", "Fitter / Welder"),
+            ("EngineCadet", "Engine Cadet"),
         ],
         "Catering": [
-            ("OFF_Cook", "Cook / Night Cook"),
-            ("OFF_CampBoss", "Camp Boss"),
-            ("OFF_Steward", "Steward / Stewardess"),
-            ("OFF_ChiefSteward", "Chief Steward"),
-            ("OFF_Messman", "Messman"),
-            ("OFF_Baker", "Baker"),
+            ("Cook", "Cook / Night Cook"),
+            ("CampBoss", "Camp Boss"),
+            ("Steward", "Steward / Stewardess"),
+            ("ChiefSteward", "Chief Steward"),
+            ("Messman", "Messman"),
+            ("Baker", "Baker"),
         ],
         "Survey / Other": [
-            ("OFF_ROV", "ROV"),
-            ("OFF_ClientRep", "Client Representative"),
-            ("OFF_OnlineSurvey", "Online Survey"),
-            ("OFF_SurveyEngineer", "Survey Engineer"),
-            ("OFF_Diver", "Diver"),
-            ("OFF_Scaffolder", "Scaffolder"),
-            ("OFF_WinchOperator", "Winch Operator"),
+            ("ROV", "ROV"),
+            ("ClientRep", "Client Representative"),
+            ("OnlineSurvey", "Online Survey"),
+            ("SurveyEngineer", "Survey Engineer"),
+            ("Diver", "Diver"),
+            ("Scaffolder", "Scaffolder"),
+            ("WinchOperator", "Winch Operator"),
         ],
     },
 }
@@ -423,47 +423,47 @@ For each vacancy, extract:
 
   Use this guide (not exhaustive — apply the same logic to anything similar that isn't
   listed here):
-    "Master", "Captain", "Skipper", "SDPO" -> OFF_Master
-    "C/O", "Chief Officer", "Chief Mate", "First Mate", "1/O", "DPO" alone -> OFF_ChiefOfficer
-    "2/O", "2nd Officer", "Second Officer", "Second Mate" -> OFF_SecondOfficer
-    "JDPO", "3/O", "3rd Officer", "Third Officer", "Third Mate" -> OFF_ThirdOfficer
-    "Safety Officer" -> OFF_SafetyOfficer
-    "HLO", "Helicopter Landing Officer" -> OFF_HLO
-    "Deck Cadet", "Deck Trainee", "Navigation Cadet" -> OFF_DeckCadet
-    "C/E", "Chief Engineer" -> OFF_ChiefEngineer
-    "2/E", "Second Engineer", "First Assistant Engineer" -> OFF_SecondEngineer
-    "3/E", "Third Engineer", "EOOW" -> OFF_ThirdEngineer
-    "4/E", "Fourth Engineer", "Junior Engineer" -> OFF_JuniorEngineer
+    "Master", "Captain", "Skipper", "SDPO" -> Master
+    "C/O", "Chief Officer", "Chief Mate", "First Mate", "1/O", "DPO" alone -> ChiefOfficer
+    "2/O", "2nd Officer", "Second Officer", "Second Mate" -> SecondOfficer
+    "JDPO", "3/O", "3rd Officer", "Third Officer", "Third Mate" -> ThirdOfficer
+    "Safety Officer" -> SafetyOfficer
+    "HLO", "Helicopter Landing Officer" -> HLO
+    "Deck Cadet", "Deck Trainee", "Navigation Cadet" -> DeckCadet
+    "C/E", "Chief Engineer" -> ChiefEngineer
+    "2/E", "Second Engineer", "First Assistant Engineer" -> SecondEngineer
+    "3/E", "Third Engineer", "EOOW" -> ThirdEngineer
+    "4/E", "Fourth Engineer", "Junior Engineer" -> JuniorEngineer
     "Junior ETO", "Electro-Technical Officer", "Electrical Officer", "Ship's Electrician"
-    (as a job title, not a requirement) -> OFF_ETO
-    "Boatswain", "Bosun's Mate" -> OFF_Bosun
+    (as a job title, not a requirement) -> ETO
+    "Boatswain", "Bosun's Mate" -> Bosun
     "AB", "Able Seaman", "Able Bodied Seaman", "Deck Hand", "Deckhand", "OS",
-    "Ordinary Seaman", "Roustabout" -> OFF_AB
-    "Crane Operator" -> OFF_CraneOperator
-    "Gangway Operator" -> OFF_GangwayOperator
-    "Rigger" -> OFF_Rigger
-    "Fitter", "Welder", "Engine Fitter" -> OFF_FitterWelder
-    "Motorman", "Engine Rating" -> OFF_Motorman
-    "Oiler" -> OFF_Oiler
-    "Wiper" -> OFF_Wiper
-    "Engine Cadet", "Engine Trainee", "Motor Cadet" -> OFF_EngineCadet
-    "Cook", "Ship's Cook", "Chief Cook", "Galley Cook", "Night Cook" -> OFF_Cook
-    "Steward", "Stewardess" -> OFF_Steward
-    "Messman", "Mess Man" -> OFF_Messman
-    "Baker" -> OFF_Baker
-    "Camp Boss", "Campboss", "Catering Manager" -> OFF_CampBoss
-    "Chief Steward", "Chief Steward/ess" -> OFF_ChiefSteward
-    "ROV", "ROV Pilot", "ROV Technician" -> OFF_ROV
-    "Client Rep", "Client Representative" -> OFF_ClientRep
-    "Online Survey", "Survey" (remote/online) -> OFF_OnlineSurvey
-    "Survey Engineer" -> OFF_SurveyEngineer
-    "Diver", "Saturation Diver" -> OFF_Diver
-    "Scaffolder" -> OFF_Scaffolder
-    "Winch Operator" -> OFF_WinchOperator
+    "Ordinary Seaman", "Roustabout" -> AB
+    "Crane Operator" -> CraneOperator
+    "Gangway Operator" -> GangwayOperator
+    "Rigger" -> Rigger
+    "Fitter", "Welder", "Engine Fitter" -> FitterWelder
+    "Motorman", "Engine Rating" -> Motorman
+    "Oiler" -> Oiler
+    "Wiper" -> Wiper
+    "Engine Cadet", "Engine Trainee", "Motor Cadet" -> EngineCadet
+    "Cook", "Ship's Cook", "Chief Cook", "Galley Cook", "Night Cook" -> Cook
+    "Steward", "Stewardess" -> Steward
+    "Messman", "Mess Man" -> Messman
+    "Baker" -> Baker
+    "Camp Boss", "Campboss", "Catering Manager" -> CampBoss
+    "Chief Steward", "Chief Steward/ess" -> ChiefSteward
+    "ROV", "ROV Pilot", "ROV Technician" -> ROV
+    "Client Rep", "Client Representative" -> ClientRep
+    "Online Survey", "Survey" (remote/online) -> OnlineSurvey
+    "Survey Engineer" -> SurveyEngineer
+    "Diver", "Saturation Diver" -> Diver
+    "Scaffolder" -> Scaffolder
+    "Winch Operator" -> WinchOperator
     "OOW" (Officer of the Watch) or a bare "Mate" with no rank number given is ambiguous
     between SecondOfficer and ThirdOfficer — infer from context (years of experience
     required, COC class, whether it's described as senior/junior watch); if there is truly
-    no way to tell, default to OFF_SecondOfficer rather than Other.
+    no way to tell, default to SecondOfficer rather than Other.
   If truly nothing in the list or the guidance above fits, use "Other".
 - vessel: vessel/rig type or name, as written/implied in the source, or null
 - vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list (e.g. "OSV",
@@ -1623,6 +1623,32 @@ async def cmd_subscribers(message: Message):
         lines.append("")
         lines.append("По должностям:")
         lines += [f"• {row['tag']} — {row['c']}" for row in by_tag]
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("testmatch"))
+async def cmd_test_match(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    tag = (command.args or "").strip()
+    if not tag:
+        await message.answer("Использование: /testmatch ChiefOfficer")
+        return
+
+    lines = [f"🔍 Диагностика тега: {tag!r}"]
+    lines.append(f"Валиден (есть в RANK_TAGS+LEGACY): {tag in ALL_VALID_POSITION_TAGS}")
+    lines.append(f"Валиден (есть в новых RANK_TAGS): {tag in RANK_TAGS}")
+
+    all_subs = db.get_all_subscriptions_for_tag_raw(tag)
+    lines.append(f"\nВсего строк subscriptions с этим тегом: {len(all_subs)}")
+    for s in all_subs:
+        handle = f"@{s['username']}" if s['username'] else f"id{s['tg_id']}"
+        active = "активна" if s['subscription_until'] and datetime.fromisoformat(s['subscription_until']) > datetime.now() else "НЕ активна"
+        lines.append(f"  • {handle} — subscription_until={s['subscription_until']!r} ({active})")
+
+    matched = db.get_subscribers_for_tag(tag)
+    lines.append(f"\nРеально получат рассылку (get_subscribers_for_tag): {matched}")
+
     await message.answer("\n".join(lines))
 
 

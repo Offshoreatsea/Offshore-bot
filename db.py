@@ -157,6 +157,8 @@ def init_db():
     conn.commit()
     conn.close()
 
+    migrate_legacy_position_tags()
+
 
 def get_setting(key: str, default: str) -> str:
     conn = get_conn()
@@ -686,6 +688,23 @@ def subscriber_stats():
     return total, by_tag
 
 
+def get_all_subscriptions_for_tag_raw(position_tag: str):
+    """Диагностика /testmatch — все строки subscriptions с этим тегом,
+    вместе с username и subscription_until, БЕЗ фильтра по активности —
+    чтобы увидеть, действительно ли строка вообще существует и почему она
+    не прошла фильтр в get_subscribers_for_tag."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT subscriptions.tg_id, subscribers.username, subscribers.subscription_until
+           FROM subscriptions
+           LEFT JOIN subscribers ON subscribers.tg_id = subscriptions.tg_id
+           WHERE subscriptions.position_tag = ?""",
+        (position_tag,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 def get_subscribers_for_tag(position_tag: str):
     # рассылка вакансий — платная фича: шлём только тем, у кого подписка
     # ещё не истекла, а не всем, кто когда-либо выбирал эту должность
@@ -875,3 +894,90 @@ def list_contacts_since(days: int = 7):
     ).fetchall()
     conn.close()
     return [r["contact"] for r in rows]
+
+
+# Соответствие старых плоских тегов (до перехода на таксономию флот+
+# департамент) новым OFF_-тегам. Нужно, потому что новые вакансии теперь
+# публикуются только с новыми тегами, а у подписчиков, оформивших подписку
+# ДО этого перехода, в базе остались старые — без миграции рассылка для них
+# просто переставала совпадать и переставала работать.
+LEGACY_TAG_MIGRATION = {
+    "Master": "Master",
+    "ChiefOfficer": "ChiefOfficer",
+    "SecondOfficer": "SecondOfficer",
+    "ThirdOfficer": "ThirdOfficer",
+    "DeckCadet": "DeckCadet",
+    "ChiefEngineer": "ChiefEngineer",
+    "SecondEngineer": "SecondEngineer",
+    "ThirdEngineer": "ThirdEngineer",
+    "FourthEngineer": "JuniorEngineer",
+    "EngineCadet": "EngineCadet",
+    "ETO": "ETO",
+    "Electrician": "ETO",
+    "Bosun": "Bosun",
+    "AB": "AB",
+    "OS": "AB",
+    "Motorman": "Motorman",
+    "Oiler": "Oiler",
+    "Fitter": "FitterWelder",
+    "Cook": "Cook",
+    "Steward": "Steward",
+    "Campboss": "CampBoss",
+    "ChiefSteward": "ChiefSteward",
+    "CraneOperator": "CraneOperator",
+    "DPOperator": "SecondOfficer",  # приблизительно — DP-роль в новой таксономии размазана по офицерским рангам
+    "ROVPilot": "ROV",
+    "Rigger": "Rigger",
+    "Welder": "FitterWelder",
+    "Scaffolder": "Scaffolder",
+    "ClientRepresentative": "ClientRep",
+    "SafetyOfficer": "SafetyOfficer",
+    "Surveyor": "SurveyEngineer",
+}
+
+
+def migrate_legacy_position_tags():
+    """Переносит старые теги в subscriptions на новые — идемпотентно
+    (повторный запуск ничего не ломает, старых тегов после первого раза
+    уже не останется). Вызывается один раз при каждом старте бота."""
+    conn = get_conn()
+    migrated = 0
+    for old_tag, new_tag in LEGACY_TAG_MIGRATION.items():
+        if old_tag == new_tag:
+            # самомап (тег и так уже в актуальном плоском виде) — менять
+            # нечего; ВАЖНО не выполнять UPDATE+DELETE ниже для таких пар,
+            # иначе DELETE WHERE position_tag = old_tag снёс бы и только что
+            # оставленные без изменений валидные подписки
+            continue
+        # UPDATE OR IGNORE — если у человека почему-то уже есть и старый, и
+        # новый тег одновременно (маловероятно, но возможно после ручных
+        # правок), не ломаем UNIQUE-ограничение дублем, просто оставляем
+        # новый как есть и убираем старую строку отдельно
+        cur = conn.execute(
+            "UPDATE OR IGNORE subscriptions SET position_tag = ? WHERE position_tag = ?",
+            (new_tag, old_tag),
+        )
+        migrated += cur.rowcount
+        conn.execute("DELETE FROM subscriptions WHERE position_tag = ?", (old_tag,))
+
+    # отдельный шаг: у кого уже стоят теги с префиксом OFF_ (сохранились от
+    # прошлой версии таксономии, когда было два флота) — снимаем префикс.
+    # Коллизий с плоскими тегами не будет: до этой строки все совсем старые
+    # (дофлотные) теги уже приведены к такому же плоскому виду выше.
+    off_rows = conn.execute(
+        "SELECT DISTINCT position_tag FROM subscriptions WHERE position_tag LIKE 'OFF\\_%' ESCAPE '\\'"
+    ).fetchall()
+    for row in off_rows:
+        old_tag = row["position_tag"]
+        new_tag = old_tag.replace("OFF_", "", 1)
+        cur = conn.execute(
+            "UPDATE OR IGNORE subscriptions SET position_tag = ? WHERE position_tag = ?",
+            (new_tag, old_tag),
+        )
+        migrated += cur.rowcount
+        conn.execute("DELETE FROM subscriptions WHERE position_tag = ?", (old_tag,))
+
+    conn.commit()
+    conn.close()
+    if migrated:
+        print(f"[migrate_legacy_position_tags] Перенесено подписок на новую таксономию: {migrated}")
