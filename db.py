@@ -478,6 +478,15 @@ def unlock_positions(tg_id: int):
     conn.close()
 
 
+def get_all_locked_subscriber_ids():
+    """tg_id всех, у кого сейчас positions_locked = 1 — используется
+    массовой разблокировкой /unlockall."""
+    conn = get_conn()
+    rows = conn.execute("SELECT tg_id FROM subscribers WHERE positions_locked = 1").fetchall()
+    conn.close()
+    return [r["tg_id"] for r in rows]
+
+
 def revoke_subscription(tg_id: int):
     """Ручной отзыв доступа (команда /revoke) — ставим дату истечения в
     прошлое, а не NULL: так человек не получит повторный бесплатный триал,

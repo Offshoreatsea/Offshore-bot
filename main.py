@@ -847,8 +847,10 @@ async def cmd_start(message: Message, command: CommandObject):
             "/mysubscription — сколько дней осталось + кнопка продлить (доступна любому)\n"
             "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не через Stars\n"
             "/extendall [дней] — продлить подписку ВСЕМ подписчикам бесплатно (акция)\n"
-            "/broadcast [текст] — разослать своё сообщение всем, кто пользовался ботом\n"
+            "/broadcast [текст] — всем, кто пользовался ботом; /broadcast @ник [текст] — только ему\n"
             "/unlockpositions [@ник или id] — разблокировать должности без продления подписки\n"
+            "/lockpositions [@ник или id] — принудительно зафиксировать выбранные должности\n"
+            "/unlockall — разблокировать должности СРАЗУ ВСЕМ подписчикам\n"
             "/revoke [@ник или id] — отписать вручную, доступ прекращается немедленно\n"
             "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
             "/revenue [дней] — доход в Stars за период (по умолчанию 7 дней)\n"
@@ -1704,19 +1706,99 @@ async def cmd_unlock_positions(message: Message, command: CommandObject):
         pass
 
 
+@router.message(Command("lockpositions"))
+async def cmd_lock_positions(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    handle = (command.args or "").strip()
+    if not handle:
+        await message.answer("Использование: /lockpositions [@username или id]")
+        return
+    row = db.find_subscriber_by_handle(handle)
+    if not row:
+        await message.answer(f"Не нашёл {handle} в базе подписчиков.")
+        return
+    tg_id = row["tg_id"]
+    selected = db.get_subscriber_positions(tg_id)
+    if not selected:
+        await message.answer(f"У {handle} пока не выбрано ни одной должности — блокировать нечего.")
+        return
+    db.lock_positions(tg_id)
+    await message.answer(f"✅ Должности {handle} зафиксированы: {', '.join(selected)}.")
+    lang = db.get_subscriber_language(tg_id)
+    until_raw = db.get_subscription_until(tg_id)
+    days_left = (datetime.fromisoformat(until_raw) - datetime.now()).days if until_raw else 0
+    try:
+        await message.bot.send_message(
+            tg_id, t(lang, "positions_locked_notice", tags=", ".join(selected), days_left=max(days_left, 0))
+        )
+    except TelegramAPIError:
+        pass
+
+
+@router.message(Command("unlockall"))
+async def cmd_unlock_all(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    ids = db.get_all_locked_subscriber_ids()
+    if not ids:
+        await message.answer("Ни у кого сейчас нет заблокированных должностей — разблокировать некого.")
+        return
+
+    await message.answer(f"⏳ Разблокирую должности у {len(ids)} человек...")
+    sent, failed = 0, 0
+    for tg_id in ids:
+        db.unlock_positions(tg_id)
+        lang = db.get_subscriber_language(tg_id)
+        try:
+            await message.bot.send_message(
+                tg_id, t(lang, "choose_department"),
+                reply_markup=department_keyboard(lang, "Offshore", set(db.get_subscriber_positions(tg_id))),
+            )
+            sent += 1
+        except TelegramAPIError:
+            failed += 1
+        await asyncio.sleep(0.05)  # не спамим Telegram API пачкой без пауз
+
+    await message.answer(f"✅ Готово. Разблокировано: {len(ids)}. Уведомлено: {sent}, не доставлено: {failed}.")
+
+
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: Message, command: CommandObject):
     if not admin_only(message.from_user.id):
         return
-    text = (command.args or "").strip()
-    if not text:
+    raw = (command.args or "").strip()
+    if not raw:
         await message.answer(
-            "Использование: /broadcast Текст сообщения\n\n"
-            "Можно писать несколько строк — всё, что после команды, уйдёт "
-            "как есть. Разошлётся всем, кто хоть раз писал боту."
+            "Использование:\n"
+            "/broadcast Текст — всем, кто пользовался ботом\n"
+            "/broadcast @ник Текст — только этому человеку\n\n"
+            "Можно писать несколько строк — всё после ника уйдёт как есть."
         )
         return
 
+    # если первое слово похоже на адресата (@ник или числовой id) и реально
+    # находится в базе — считаем это точечной рассылкой одному человеку,
+    # а не частью текста сообщения
+    first_word, _, rest = raw.partition(" ")
+    target_row = None
+    if first_word.startswith("@") or first_word.isdigit():
+        target_row = db.find_subscriber_by_handle(first_word)
+
+    if target_row:
+        text = rest.strip()
+        if not text:
+            await message.answer(f"Использование: /broadcast {first_word} Текст сообщения")
+            return
+        tg_id = target_row["tg_id"]
+        try:
+            await message.bot.send_message(tg_id, text)
+            await message.answer(f"✅ Отправлено {first_word}.")
+        except TelegramAPIError as e:
+            await message.answer(f"❌ Не удалось отправить {first_word}: {e}")
+        return
+
+    text = raw
     ids = db.get_all_bot_users()
     if not ids:
         await message.answer("Пока никто не пользовался ботом — рассылать некому.")
