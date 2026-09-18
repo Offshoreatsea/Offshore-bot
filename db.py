@@ -386,6 +386,15 @@ def get_all_subscriber_ids_with_subscription():
     return [r["tg_id"] for r in rows]
 
 
+def get_all_bot_users():
+    """tg_id вообще всех, кто хоть раз писал боту (прошёл выбор языка) —
+    шире, чем платящие подписчики. Используется рассылкой /broadcast."""
+    conn = get_conn()
+    rows = conn.execute("SELECT tg_id FROM subscribers").fetchall()
+    conn.close()
+    return [r["tg_id"] for r in rows]
+
+
 def set_stripe_customer_id(tg_id: int, customer_id: str):
     conn = get_conn()
     conn.execute(

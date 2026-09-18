@@ -847,6 +847,7 @@ async def cmd_start(message: Message, command: CommandObject):
             "/mysubscription — сколько дней осталось + кнопка продлить (доступна любому)\n"
             "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не через Stars\n"
             "/extendall [дней] — продлить подписку ВСЕМ подписчикам бесплатно (акция)\n"
+            "/broadcast [текст] — разослать своё сообщение всем, кто пользовался ботом\n"
             "/unlockpositions [@ник или id] — разблокировать должности без продления подписки\n"
             "/revoke [@ник или id] — отписать вручную, доступ прекращается немедленно\n"
             "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
@@ -1701,6 +1702,37 @@ async def cmd_unlock_positions(message: Message, command: CommandObject):
         )
     except TelegramAPIError:
         pass
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer(
+            "Использование: /broadcast Текст сообщения\n\n"
+            "Можно писать несколько строк — всё, что после команды, уйдёт "
+            "как есть. Разошлётся всем, кто хоть раз писал боту."
+        )
+        return
+
+    ids = db.get_all_bot_users()
+    if not ids:
+        await message.answer("Пока никто не пользовался ботом — рассылать некому.")
+        return
+
+    await message.answer(f"⏳ Рассылаю сообщение {len(ids)} пользователям...")
+    sent, failed = 0, 0
+    for tg_id in ids:
+        try:
+            await message.bot.send_message(tg_id, text)
+            sent += 1
+        except TelegramAPIError:
+            failed += 1
+        await asyncio.sleep(0.05)  # не спамим Telegram API пачкой без пауз
+
+    await message.answer(f"✅ Готово. Разослано: {sent}, не доставлено: {failed} (из {len(ids)}).")
 
 
 @router.message(Command("extendall"))
