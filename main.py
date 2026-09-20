@@ -1,5 +1,6 @@
 import asyncio
 import io
+import random
 import json
 import os
 import re
@@ -150,6 +151,7 @@ VESSEL_TAGS = [
     "Tanker", "Container", "Bulk", "LNG", "LPG", "Chemical",
     "Offshore", "OSV", "CSV", "DSV", "MPV", "MPSV", "AHTS", "PSV", "SOV",
     "CableLayer", "Dredger", "Cruise", "RoRo", "Ferry", "Yacht", "FPSO", "JackUp",
+    "Tug", "Pipelay",
 ]
 
 FALLBACK_TAG = "Other"
@@ -161,6 +163,11 @@ TR = {
     "en": {
         "intro": "This bot sends you offshore & maritime job vacancies for the "
                   "position you choose — no need to scroll the channel.\n\n"
+                  "What I can do:\n"
+                  "📋 Instant alerts for up to 2 positions you pick\n"
+                  "📧 Weekly list of recruiter emails from the channel\n"
+                  "🎁 3 days free to try, no card needed\n"
+                  "🔁 See your subscription status and renew anytime\n\n"
                   "⚠️ OffshoreAtSea is a vacancy aggregator only — we are not "
                   "the employer and are not responsible for working conditions "
                   "at the companies listed.",
@@ -191,7 +198,7 @@ TR = {
         "expiry_reminder": "⏳ Your job alerts subscription ends in less than 24 hours. Renew to keep getting instant notifications:",
         "revoked_notice": "Your job alerts subscription has been cancelled by the admin.",
         "bonus_extension": "🎁 We're giving you {days} days of access as a gift! Now active until {until}.",
-        "upcoming_charge": "⏳ Heads up: {amount} {currency} will be charged in a few days to renew your subscription. Manage or cancel anytime with /managesubscription.",
+        "upcoming_charge": "⏳ Your subscription ends in a few days — please renew to keep getting alerts. Want to cancel instead? Message admin.",
         "no_stripe_subscription": "You don't have a card subscription to manage — either you haven't paid by card yet, or you paid with Stars (Stars don't auto-renew, so there's nothing to cancel).",
         "portal_error": "Couldn't open the subscription management page right now. Please try again in a moment or contact admin.",
         "manage_subscription_link": "Manage your subscription (change card, cancel auto-renewal) here:",
@@ -200,6 +207,13 @@ TR = {
         "my_subscription_none": "📋 You don't have an active subscription right now.",
         "my_subscription_button": "📋 My subscription",
         "renew_button": "🔁 Renew subscription",
+        "contact_locked": "📩 Contact: 🔒 hidden — subscribe to unlock recruiter contacts instantly: /managesubscription",
+        "my_id_button": "🆔 My ID",
+        "my_id_text": "Your Telegram ID: {id}",
+        "digest_count_button": "🔢 How many emails available?",
+        "digest_count_text": "📊 {count} recruiter emails available right now.",
+        "digest_demo_button": "👀 Free demo — 5 random emails",
+        "digest_demo_text": "🎁 Here's a free taste — 5 random emails out of {count} available:",
         "digest_intro": "📧 Get all the recruiter emails from vacancies posted in the channel this week — ${price}, one-time purchase.",
         "digest_pay_button": "⭐ Pay {price} Stars",
         "digest_menu_button": "📧 Get recruiter emails from this week",
@@ -220,6 +234,11 @@ TR = {
     "ru": {
         "intro": "Этот бот присылает вакансии в офшоре и морской индустрии по "
                  "выбранной должности — не нужно листать канал.\n\n"
+                 "Что я умею:\n"
+                 "📋 Мгновенные уведомления по 2 выбранным должностям\n"
+                 "📧 Список email рекрутёров за неделю из канала\n"
+                 "🎁 3 дня бесплатно, карта не нужна\n"
+                 "🔁 Всегда видно статус подписки, продление в один клик\n\n"
                  "⚠️ OffshoreAtSea — только агрегатор вакансий, мы не являемся "
                  "работодателем и не несём ответственности за условия труда "
                  "у указанных компаний.",
@@ -250,7 +269,7 @@ TR = {
         "expiry_reminder": "⏳ Ваша подписка на уведомления заканчивается меньше чем через 24 часа. Продлите, чтобы не пропускать вакансии:",
         "revoked_notice": "Ваша подписка на уведомления отменена администратором.",
         "bonus_extension": "Даём доступ на {days} дня в подарок 🎁\nТеперь активно до {until}.",
-        "upcoming_charge": "⏳ Через несколько дней спишется {amount} {currency} за продление подписки. Управлять или отменить можно в любой момент: /managesubscription.",
+        "upcoming_charge": "⏳ Через несколько дней у вас закончится подписка, пожалуйста продлите её. Если хотите отменить подписку — напишите админу.",
         "no_stripe_subscription": "У вас нет подписки картой для управления — либо вы ещё не платили картой, либо платили звёздами (у Stars нет автосписания, отменять там нечего).",
         "portal_error": "Не получилось сейчас открыть страницу управления подпиской. Попробуйте чуть позже или напишите администратору.",
         "manage_subscription_link": "Управление подпиской (смена карты, отмена автопродления) здесь:",
@@ -259,6 +278,13 @@ TR = {
         "my_subscription_none": "📋 У вас сейчас нет активной подписки.",
         "my_subscription_button": "📋 Моя подписка",
         "renew_button": "🔁 Продлить подписку",
+        "contact_locked": "📩 Контакт: 🔒 скрыт — оформите подписку, чтобы сразу видеть контакты рекрутёров: /managesubscription",
+        "my_id_button": "🆔 Мой ID",
+        "my_id_text": "Ваш Telegram ID: {id}",
+        "digest_count_button": "🔢 Сколько email доступно?",
+        "digest_count_text": "📊 Сейчас доступно {count} email рекрутёров.",
+        "digest_demo_button": "👀 Бесплатное демо — 5 случайных email",
+        "digest_demo_text": "🎁 Бесплатный пример — 5 случайных email из {count} доступных:",
         "digest_intro": "📧 Все email рекрутёров из вакансий, опубликованных в канале за эту неделю — ${price}, разовая покупка.",
         "digest_pay_button": "⭐ Оплатить {price} Stars",
         "digest_menu_button": "📧 Получить email рекрутёров за неделю",
@@ -279,6 +305,11 @@ TR = {
     "uk": {
         "intro": "Цей бот надсилає вакансії в офшорі та морській галузі за "
                  "обраною посадою — не потрібно гортати канал.\n\n"
+                 "Що я вмію:\n"
+                 "📋 Миттєві сповіщення за 2 обраними посадами\n"
+                 "📧 Список email рекрутерів за тиждень з каналу\n"
+                 "🎁 3 дні безкоштовно, картка не потрібна\n"
+                 "🔁 Завжди видно статус підписки, продовження в один клік\n\n"
                  "⚠️ OffshoreAtSea — лише агрегатор вакансій, ми не є "
                  "роботодавцем і не несемо відповідальності за умови праці "
                  "у зазначених компаніях.",
@@ -309,7 +340,7 @@ TR = {
         "expiry_reminder": "⏳ Ваша підписка на сповіщення закінчується менш ніж за 24 години. Продовжте, щоб не пропускати вакансії:",
         "revoked_notice": "Вашу підписку на сповіщення скасовано адміністратором.",
         "bonus_extension": "Даруємо доступ на {days} дні у подарунок 🎁\nТепер активно до {until}.",
-        "upcoming_charge": "⏳ Через кілька днів спишеться {amount} {currency} за продовження підписки. Керувати або скасувати можна будь-коли: /managesubscription.",
+        "upcoming_charge": "⏳ Через кілька днів у вас закінчиться підписка, будь ласка продовжте її. Якщо хочете скасувати підписку — напишіть адміну.",
         "no_stripe_subscription": "У вас немає підписки карткою для керування — або ви ще не платили карткою, або платили Stars (у Stars немає автосписання, скасовувати нема чого).",
         "portal_error": "Не вдалося зараз відкрити сторінку керування підпискою. Спробуйте трохи пізніше або напишіть адміністратору.",
         "manage_subscription_link": "Керування підпискою (зміна картки, скасування автопродовження) тут:",
@@ -318,6 +349,13 @@ TR = {
         "my_subscription_none": "📋 У вас зараз немає активної підписки.",
         "my_subscription_button": "📋 Моя підписка",
         "renew_button": "🔁 Продовжити підписку",
+        "contact_locked": "📩 Контакт: 🔒 приховано — оформіть підписку, щоб одразу бачити контакти рекрутерів: /managesubscription",
+        "my_id_button": "🆔 Мій ID",
+        "my_id_text": "Ваш Telegram ID: {id}",
+        "digest_count_button": "🔢 Скільки email доступно?",
+        "digest_count_text": "📊 Зараз доступно {count} email рекрутерів.",
+        "digest_demo_button": "👀 Безкоштовне демо — 5 випадкових email",
+        "digest_demo_text": "🎁 Безкоштовний приклад — 5 випадкових email із {count} доступних:",
         "digest_intro": "📧 Усі email рекрутерів з вакансій, опублікованих у каналі цього тижня — ${price}, разова покупка.",
         "digest_pay_button": "⭐ Оплатити {price} Stars",
         "digest_menu_button": "📧 Отримати email рекрутерів за тиждень",
@@ -434,6 +472,8 @@ For each vacancy, extract:
     "2/E", "Second Engineer", "First Assistant Engineer" -> SecondEngineer
     "3/E", "Third Engineer", "EOOW" -> ThirdEngineer
     "4/E", "Fourth Engineer", "Junior Engineer" -> JuniorEngineer
+    "Deck Engineer", "Deck Mechanic" -> ThirdEngineer (junior-sounding phrasing, explicit
+    "junior"/"trainee" wording -> JuniorEngineer instead)
     "Junior ETO", "Electro-Technical Officer", "Electrical Officer", "Ship's Electrician"
     (as a job title, not a requirement) -> ETO
     "Boatswain", "Bosun's Mate" -> Bosun
@@ -466,9 +506,32 @@ For each vacancy, extract:
     no way to tell, default to SecondOfficer rather than Other.
   If truly nothing in the list or the guidance above fits, use "Other".
 - vessel: vessel/rig type or name, as written/implied in the source, or null
-- vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list (e.g. "OSV",
-  "Offshore Support Vessel", "supply vessel" -> "OSV"; "product tanker" -> "Tanker"):
+- vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list:
   {vessel_tags}
+  Use this guide (not exhaustive — apply the same logic to anything similar that isn't
+  listed here):
+    "Offshore Support Vessel", "Supply Vessel" (generic, no more specific type given) -> OSV
+    "Platform Supply Vessel" -> PSV
+    "Anchor Handling Tug Supply", "AHTS vessel" -> AHTS
+    "Anchor Handling Tug" WITHOUT "Supply" (pure towing, no cargo deck) -> Tug
+    "Tug", "Tugboat", "Towing vessel", "Harbour Tug" -> Tug
+    "Diving Support Vessel" -> DSV
+    "Construction Support Vessel" -> CSV
+    "Multi-Purpose Support Vessel" -> MPSV
+    "Multi-Purpose Vessel" (not offshore-support-specific) -> MPV
+    "Service Operation Vessel" (wind farm crew transfer/service) -> SOV
+    "Dredger", "Dredging vessel", "Hopper Dredger", "Cutter Suction Dredger",
+    "Trailing Suction Hopper Dredger", "TSHD" -> Dredger
+    "Pipelay vessel", "Pipe-laying vessel", "Pipelayer", "S-lay vessel", "J-lay vessel" -> Pipelay
+    "Cable Layer", "Cable-laying vessel", "Cable Ship" -> CableLayer
+    "Product Tanker", "Crude Tanker", "Oil Tanker" -> Tanker
+    "Container ship", "Containership" -> Container
+    "Bulk Carrier", "Bulker" -> Bulk
+    "Ro-Ro", "Roll-on/Roll-off" -> RoRo
+    "Floating Production Storage and Offloading" -> FPSO
+    "Jack-up rig", "Jack-up platform" -> JackUp
+    If the text just says "offshore vessel"/"offshore project" with no more specific type,
+    use "Offshore".
   If vessel type isn't stated or nothing fits, use "Other".
 - region: country/region/location, or null
 - nationality: nationality/citizenship requirement if stated, or null
@@ -585,7 +648,7 @@ def ai_parse_batch(raw: str) -> list[dict]:
     return data
 
 
-def render_template(fields: dict) -> str:
+def render_template(fields: dict, hide_contact: bool = False, lang: str | None = None) -> str:
     def val(key):
         v = fields.get(key)
         return v if v else None
@@ -633,7 +696,10 @@ def render_template(fields: dict) -> str:
 
     if val("contact"):
         parts.append("")
-        parts.append(f"📩 Contact: {val('contact')}")
+        if hide_contact:
+            parts.append(t(lang, "contact_locked"))
+        else:
+            parts.append(f"📩 Contact: {val('contact')}")
 
     if fields.get("hashtags"):
         parts.append("")
@@ -700,13 +766,18 @@ def draft_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
 
 def queue_delay_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
     # выбор задержки показывается только ПОСЛЕ нажатия «В очередь» —
-    # ничего не публикуется и не планируется до этого второго нажатия
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="1ч", callback_data=f"queuedelay:{vacancy_id}:1"),
-        InlineKeyboardButton(text="2ч", callback_data=f"queuedelay:{vacancy_id}:2"),
-        InlineKeyboardButton(text="6ч", callback_data=f"queuedelay:{vacancy_id}:6"),
-        InlineKeyboardButton(text="12ч", callback_data=f"queuedelay:{vacancy_id}:12"),
-    ]])
+    # ничего не публикуется и не планируется до этого второго нажатия.
+    # 1-8 часов вместо старых 1/2/6/12 — чтобы можно было равномерно
+    # распределить публикации на весь день, а не скачками
+    row1 = [
+        InlineKeyboardButton(text=f"{h}ч", callback_data=f"queuedelay:{vacancy_id}:{h}")
+        for h in range(1, 5)
+    ]
+    row2 = [
+        InlineKeyboardButton(text=f"{h}ч", callback_data=f"queuedelay:{vacancy_id}:{h}")
+        for h in range(5, 9)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
 
 
 def duplicate_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
@@ -848,6 +919,9 @@ async def cmd_start(message: Message, command: CommandObject):
             "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не через Stars\n"
             "/extendall [дней] — продлить подписку ВСЕМ подписчикам бесплатно (акция)\n"
             "/broadcast [текст] — всем, кто пользовался ботом; /broadcast @ник [текст] — только ему\n"
+            "/addad ЧЧ:ММ [текст] — запланировать рекламный пост в канал каждый день в это время\n"
+            "/listads — список запланированной рекламы\n"
+            "/removead [id] — удалить рекламу из расписания\n"
             "/unlockpositions [@ник или id] — разблокировать должности без продления подписки\n"
             "/lockpositions [@ник или id] — принудительно зафиксировать выбранные должности\n"
             "/unlockall — разблокировать должности СРАЗУ ВСЕМ подписчикам\n"
@@ -1010,6 +1084,13 @@ async def cmd_manage_subscription(message: Message):
     await send_my_subscription(message.bot, tg_id, lang)
 
 
+@router.callback_query(F.data == "show_myid")
+async def cb_show_my_id(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    lang = db.get_subscriber_language(tg_id)
+    await callback.answer(t(lang, "my_id_text", id=tg_id), show_alert=True)
+
+
 @router.callback_query(F.data == "manage_sub")
 async def cb_manage_subscription(callback: CallbackQuery):
     tg_id = callback.from_user.id
@@ -1030,6 +1111,7 @@ def subscription_status_keyboard(lang: str | None, tg_id: int, has_stripe_custom
         rows.append([InlineKeyboardButton(text=t(lang, "manage_subscription_button"), callback_data="manage_sub")])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
+    rows.append([InlineKeyboardButton(text=t(lang, "my_id_button"), callback_data="show_myid")])
     rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1073,7 +1155,10 @@ async def cb_my_subscription(callback: CallbackQuery):
 
 @router.message(Command("getemails"))
 def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
-    rows = []
+    rows = [
+        [InlineKeyboardButton(text=t(lang, "digest_count_button"), callback_data="digest_count")],
+        [InlineKeyboardButton(text=t(lang, "digest_demo_button"), callback_data="digest_demo")],
+    ]
     if STRIPE_DIGEST_PAYMENT_LINK and tg_id:
         # digest_ префикс в client_reference_id — так вебхук в webapp.py
         # отличает разовую покупку дайджеста от продления подписки
@@ -1083,6 +1168,33 @@ def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> Inline
     if tg_id:
         rows.append([InlineKeyboardButton(text=t(lang, "my_subscription_button"), callback_data="show_mysub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "digest_count")
+async def cb_digest_count(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    lang = db.get_subscriber_language(tg_id)
+    count = len(db.list_contacts_since(7))
+    await callback.answer(t(lang, "digest_count_text", count=count), show_alert=True)
+
+
+@router.callback_query(F.data == "digest_demo")
+async def cb_digest_demo(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
+    lang = db.get_subscriber_language(tg_id)
+    contacts = db.list_contacts_since(7)
+    emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
+    if not emails:
+        await callback.answer(t(lang, "digest_empty"), show_alert=True)
+        return
+    sample = random.sample(emails, min(5, len(emails)))
+    await callback.message.answer(
+        t(lang, "digest_demo_text", count=len(emails)) + "\n\n" + "\n".join(sample)
+    )
+    await callback.answer()
 
 
 async def cmd_get_emails(message: Message):
@@ -1290,7 +1402,9 @@ async def handle_stripe_upcoming(bot: Bot, customer_id: str, amount: float, curr
         return
     lang = db.get_subscriber_language(tg_id)
     try:
-        await bot.send_message(tg_id, t(lang, "upcoming_charge", amount=amount, currency=currency))
+        await bot.send_message(
+            tg_id, t(lang, "upcoming_charge"), reply_markup=payment_keyboard(lang, tg_id)
+        )
     except TelegramAPIError:
         pass
 
@@ -1649,8 +1763,10 @@ async def cmd_test_match(message: Message, command: CommandObject):
         active = "активна" if s['subscription_until'] and datetime.fromisoformat(s['subscription_until']) > datetime.now() else "НЕ активна"
         lines.append(f"  • {handle} — subscription_until={s['subscription_until']!r} ({active})")
 
-    matched = db.get_subscribers_for_tag(tag)
-    lines.append(f"\nРеально получат рассылку (get_subscribers_for_tag): {matched}")
+    all_matched = db.get_all_subscribers_for_tag_any_status(tag)
+    with_contact = db.get_subscribers_for_tag(tag)
+    lines.append(f"\nПолучат вакансию (все, включая с скрытым контактом): {all_matched}")
+    lines.append(f"Из них увидят контакт (активна подписка): {with_contact}")
 
     await message.answer("\n".join(lines))
 
@@ -1761,6 +1877,61 @@ async def cmd_unlock_all(message: Message):
         await asyncio.sleep(0.05)  # не спамим Telegram API пачкой без пауз
 
     await message.answer(f"✅ Готово. Разблокировано: {len(ids)}. Уведомлено: {sent}, не доставлено: {failed}.")
+
+
+@router.message(Command("addad"))
+async def cmd_add_ad(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    raw = (command.args or "").strip()
+    time_part, _, text = raw.partition(" ")
+    text = text.strip()
+    if not time_part or not text or ":" not in time_part:
+        await message.answer(
+            "Использование: /addad ЧЧ:ММ Текст поста\n\n"
+            "Например: /addad 18:00 Попробуй бота — уведомления по твоей должности, 3 дня бесплатно!\n\n"
+            "Постится в канал каждый день в это время."
+        )
+        return
+    try:
+        hh, mm = time_part.split(":")
+        if not (0 <= int(hh) <= 23 and 0 <= int(mm) <= 59):
+            raise ValueError
+        time_hhmm = f"{int(hh):02d}:{int(mm):02d}"
+    except ValueError:
+        await message.answer("Время должно быть в формате ЧЧ:ММ, например 18:00.")
+        return
+    ad_id = db.add_scheduled_ad(time_hhmm, text)
+    await message.answer(f"✅ Реклама #{ad_id} запланирована на {time_hhmm} каждый день.")
+
+
+@router.message(Command("listads"))
+async def cmd_list_ads(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    ads = db.list_scheduled_ads()
+    if not ads:
+        await message.answer("Пока нет запланированной рекламы.")
+        return
+    lines = ["📅 Запланированная реклама:\n"]
+    for ad in ads:
+        preview = ad["text"][:60] + ("…" if len(ad["text"]) > 60 else "")
+        lines.append(f"#{ad['id']} — {ad['time_hhmm']} — {preview}")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("removead"))
+async def cmd_remove_ad(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await message.answer("Использование: /removead [id], id смотри в /listads")
+        return
+    if db.remove_scheduled_ad(int(arg)):
+        await message.answer(f"✅ Реклама #{arg} удалена из расписания.")
+    else:
+        await message.answer(f"Не нашёл рекламу #{arg}.")
 
 
 @router.message(Command("broadcast"))
@@ -2028,6 +2199,11 @@ async def cb_subscribe_position(callback: CallbackQuery):
 
     await callback.answer(t(lang, "subscribed", tag=position_tag))
     backfill = db.get_recent_published_by_tag(position_tag, days=TRIAL_BACKFILL_DAYS)
+    # не дублируем то, что этому человеку уже когда-то уходило — актуально
+    # при повторной подписке/оплате после отписки, когда он заново проходит
+    # тот же выбор должности
+    unsent_ids = db.filter_unsent_vacancy_ids(tg_id, [row["id"] for row in backfill])
+    backfill = [row for row in backfill if row["id"] in unsent_ids]
     if not backfill:
         await callback.bot.send_message(tg_id, t(lang, "backfill_empty", tag=position_tag))
         return
@@ -2038,6 +2214,7 @@ async def cb_subscribe_position(callback: CallbackQuery):
                 tg_id, render_template(fields),
                 reply_markup=channel_keyboard(row["id"]),
             )
+            db.mark_notification_sent(tg_id, row["id"])
             await asyncio.sleep(0.3)  # не спамим Telegram API пачкой без пауз
         except TelegramAPIError:
             pass
@@ -2063,19 +2240,25 @@ async def cb_subscribe_done(callback: CallbackQuery):
 
 
 async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
-    """Дублирует свежеопубликованную вакансию в личку подписчикам с таким же
-    position_tag. Вызывается ПОСЛЕ успешной публикации в канал и полностью
-    изолирована try/except-ом на уровне вызова — сбой рассылки никак не
-    должен влиять на основную публикацию, которая на этот момент уже прошла."""
+    """Дублирует свежеопубликованную вакансию в личку ВСЕМ, кто выбрал этот
+    position_tag — независимо от того, платят они сейчас или нет. Разница
+    только в самом тексте: у тех, чья подписка неактивна, поле "Контакт"
+    скрыто и заменено призывом оформить подписку (см. render_template).
+    Вызывается ПОСЛЕ успешной публикации в канал и полностью изолирована
+    try/except-ом на уровне вызова — сбой рассылки никак не должен влиять
+    на основную публикацию, которая на этот момент уже прошла."""
     position_tag = fields.get("position_tag")
     if not position_tag or position_tag == FALLBACK_TAG:
         return
-    for tg_id in db.get_subscribers_for_tag(position_tag):
+    for tg_id in db.get_all_subscribers_for_tag_any_status(position_tag):
         try:
+            lang = db.get_subscriber_language(tg_id)
+            hide_contact = not db.is_subscription_active(tg_id)
             await bot.send_message(
-                tg_id, render_template(fields),
+                tg_id, render_template(fields, hide_contact=hide_contact, lang=lang),
                 reply_markup=channel_keyboard(vacancy_id),
             )
+            db.mark_notification_sent(tg_id, vacancy_id)
             await asyncio.sleep(0.1)
         except TelegramAPIError:
             pass
@@ -2241,6 +2424,24 @@ async def subscription_reminder_worker(bot: Bot):
         await asyncio.sleep(3600)
 
 
+async def scheduled_ads_worker(bot: Bot):
+    # проверяем раз в минуту — только так можно точно попасть на нужную
+    # ЧЧ:ММ; сама защита от повторной отправки в течение той же минуты —
+    # через last_sent_date (проверяется по сегодняшней дате, не по времени)
+    while True:
+        now = datetime.now()
+        now_hhmm = now.strftime("%H:%M")
+        today = now.strftime("%Y-%m-%d")
+        due = db.get_due_scheduled_ads(now_hhmm, today)
+        for ad in due:
+            try:
+                await bot.send_message(chat_id=CHANNEL_ID, text=ad["text"])
+                db.mark_scheduled_ad_sent(ad["id"], today)
+            except TelegramAPIError as e:
+                print(f"[scheduled_ads_worker] Не удалось опубликовать рекламу #{ad['id']}: {e}")
+        await asyncio.sleep(60)
+
+
 async def main():
     db.init_db()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -2248,6 +2449,7 @@ async def main():
     dp.include_router(router)
     asyncio.create_task(digest_worker(bot))
     asyncio.create_task(subscription_reminder_worker(bot))
+    asyncio.create_task(scheduled_ads_worker(bot))
 
     if WEBAPP_URL:
         asyncio.create_task(webapp.run_web_server(

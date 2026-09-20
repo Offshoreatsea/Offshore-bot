@@ -154,6 +154,23 @@ def init_db():
             created_at TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sent_notifications (
+            tg_id INTEGER,
+            vacancy_id INTEGER,
+            sent_at TEXT,
+            PRIMARY KEY (tg_id, vacancy_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_ads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            time_hhmm TEXT,
+            text TEXT,
+            last_sent_date TEXT,
+            created_at TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -721,6 +738,104 @@ def get_all_subscriptions_for_tag_raw(position_tag: str):
     ).fetchall()
     conn.close()
     return rows
+
+
+def add_scheduled_ad(time_hhmm: str, text: str) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO scheduled_ads (time_hhmm, text, created_at) VALUES (?, ?, ?)",
+        (time_hhmm, text, datetime.now().isoformat()),
+    )
+    conn.commit()
+    ad_id = cur.lastrowid
+    conn.close()
+    return ad_id
+
+
+def list_scheduled_ads():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM scheduled_ads ORDER BY time_hhmm").fetchall()
+    conn.close()
+    return rows
+
+
+def remove_scheduled_ad(ad_id: int) -> bool:
+    conn = get_conn()
+    cur = conn.execute("DELETE FROM scheduled_ads WHERE id = ?", (ad_id,))
+    conn.commit()
+    removed = cur.rowcount > 0
+    conn.close()
+    return removed
+
+
+def get_due_scheduled_ads(now_hhmm: str, today: str):
+    """Реклама, чьё время совпадает с текущим (час:минута) и которая ещё не
+    отправлялась СЕГОДНЯ (last_sent_date != today) — чтобы не слать один и
+    тот же пост повторно в течение той же минуты/при частых проверках."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT * FROM scheduled_ads
+           WHERE time_hhmm = ? AND (last_sent_date IS NULL OR last_sent_date != ?)""",
+        (now_hhmm, today),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def mark_scheduled_ad_sent(ad_id: int, today: str):
+    conn = get_conn()
+    conn.execute("UPDATE scheduled_ads SET last_sent_date = ? WHERE id = ?", (today, ad_id))
+    conn.commit()
+    conn.close()
+
+
+def mark_notification_sent(tg_id: int, vacancy_id: int):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO sent_notifications (tg_id, vacancy_id, sent_at) VALUES (?, ?, ?)",
+        (tg_id, vacancy_id, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def was_notification_sent(tg_id: int, vacancy_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM sent_notifications WHERE tg_id = ? AND vacancy_id = ?", (tg_id, vacancy_id)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def filter_unsent_vacancy_ids(tg_id: int, vacancy_ids: list[int]) -> set[int]:
+    """Из списка id вакансий возвращает только те, что ЕЩЁ НЕ отправлялись
+    этому человеку — используется бэкфиллом, чтобы при повторной подписке
+    не присылать то же самое во второй раз."""
+    if not vacancy_ids:
+        return set()
+    conn = get_conn()
+    placeholders = ",".join("?" * len(vacancy_ids))
+    rows = conn.execute(
+        f"SELECT vacancy_id FROM sent_notifications WHERE tg_id = ? AND vacancy_id IN ({placeholders})",
+        (tg_id, *vacancy_ids),
+    ).fetchall()
+    conn.close()
+    already_sent = {r["vacancy_id"] for r in rows}
+    return set(vacancy_ids) - already_sent
+
+
+def get_all_subscribers_for_tag_any_status(position_tag: str):
+    """Все, кто выбрал эту должность — БЕЗ фильтра по оплате. Используется
+    новой моделью: сама вакансия уходит всем подписавшимся на должность,
+    а платит человек за то, чтобы видеть контакт внутри неё (см.
+    notify_subscribers/render_template с hide_contact)."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT tg_id FROM subscriptions WHERE position_tag = ?", (position_tag,)
+    ).fetchall()
+    conn.close()
+    return [r["tg_id"] for r in rows]
 
 
 def get_subscribers_for_tag(position_tag: str):
