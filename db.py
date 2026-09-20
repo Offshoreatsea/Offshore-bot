@@ -108,6 +108,8 @@ def init_db():
         conn.execute("ALTER TABLE subscribers ADD COLUMN reminder_sent_for TEXT")
     if "stripe_customer_id" not in sub_cols:
         conn.execute("ALTER TABLE subscribers ADD COLUMN stripe_customer_id TEXT")
+    if "digest_demo_uses" not in sub_cols:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN digest_demo_uses INTEGER DEFAULT 0")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -738,6 +740,29 @@ def get_all_subscriptions_for_tag_raw(position_tag: str):
     ).fetchall()
     conn.close()
     return rows
+
+
+def get_digest_demo_uses(tg_id: int) -> int:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT digest_demo_uses FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    return row["digest_demo_uses"] if row and row["digest_demo_uses"] else 0
+
+
+def increment_digest_demo_uses(tg_id: int) -> int:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscribers SET digest_demo_uses = COALESCE(digest_demo_uses, 0) + 1 WHERE tg_id = ?",
+        (tg_id,),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT digest_demo_uses FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    return row["digest_demo_uses"] if row else 0
 
 
 def add_scheduled_ad(time_hhmm: str, text: str) -> int:

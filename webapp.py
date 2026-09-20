@@ -81,7 +81,8 @@ async def handle_vacancies(request: web.Request) -> web.Response:
 
 
 def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_payment=None,
-               on_stripe_renewal=None, on_stripe_upcoming=None) -> web.Application:
+               on_stripe_renewal=None, on_stripe_upcoming=None,
+               on_stripe_unmatched_payment=None) -> web.Application:
     app = web.Application()
 
     def get_authenticated_tg_id(init_data: str) -> int | None:
@@ -141,6 +142,16 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
                     )
                 except Exception as e:
                     print(f"[stripe webhook] Ошибка обработки оплаты для tg_id={tg_id}: {e}")
+            elif on_stripe_unmatched_payment:
+                # ref пустой или не в ожидаемом формате — скорее всего,
+                # человек оплатил по голой ссылке из Stripe Dashboard
+                # (без client_reference_id), а не через кнопку в боте.
+                # Не можем понять, кому доставить — сообщаем админу вместо
+                # того чтобы просто промолчать
+                try:
+                    await on_stripe_unmatched_payment(bot, ref, amount, currency, charge_id)
+                except Exception as e:
+                    print(f"[stripe webhook] Ошибка уведомления о неопознанном платеже: {e}")
 
         elif event_type == "invoice.paid":
             # АВТОМАТИЧЕСКОЕ ПРОДЛЕНИЕ — Stripe списал деньги за следующий
@@ -299,9 +310,10 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
 
 
 async def run_web_server(bot, bot_token: str, port: int, on_stripe_payment=None, on_stripe_digest_payment=None,
-                          on_stripe_renewal=None, on_stripe_upcoming=None):
+                          on_stripe_renewal=None, on_stripe_upcoming=None,
+                          on_stripe_unmatched_payment=None):
     app = create_app(bot, bot_token, on_stripe_payment, on_stripe_digest_payment,
-                      on_stripe_renewal, on_stripe_upcoming)
+                      on_stripe_renewal, on_stripe_upcoming, on_stripe_unmatched_payment)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=port)

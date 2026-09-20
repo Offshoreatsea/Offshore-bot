@@ -214,6 +214,8 @@ TR = {
         "digest_count_text": "📊 {count} recruiter emails available right now.",
         "digest_demo_button": "👀 Free demo — 5 random emails",
         "digest_demo_text": "🎁 Here's a free taste — 5 random emails out of {count} available:",
+        "digest_demo_uses_left": "Free demo tries left: {left}",
+        "digest_demo_exhausted": "You've used both free demo tries. Buy the full list to see all emails.",
         "digest_intro": "📧 Get all the recruiter emails from vacancies posted in the channel this week — ${price}, one-time purchase.",
         "digest_pay_button": "⭐ Pay {price} Stars",
         "digest_menu_button": "📧 Get recruiter emails from this week",
@@ -285,6 +287,8 @@ TR = {
         "digest_count_text": "📊 Сейчас доступно {count} email рекрутёров.",
         "digest_demo_button": "👀 Бесплатное демо — 5 случайных email",
         "digest_demo_text": "🎁 Бесплатный пример — 5 случайных email из {count} доступных:",
+        "digest_demo_uses_left": "Осталось бесплатных попыток: {left}",
+        "digest_demo_exhausted": "Вы уже использовали обе бесплатные попытки. Оформите подписку, чтобы увидеть полный список.",
         "digest_intro": "📧 Все email рекрутёров из вакансий, опубликованных в канале за эту неделю — ${price}, разовая покупка.",
         "digest_pay_button": "⭐ Оплатить {price} Stars",
         "digest_menu_button": "📧 Получить email рекрутёров за неделю",
@@ -356,6 +360,8 @@ TR = {
         "digest_count_text": "📊 Зараз доступно {count} email рекрутерів.",
         "digest_demo_button": "👀 Безкоштовне демо — 5 випадкових email",
         "digest_demo_text": "🎁 Безкоштовний приклад — 5 випадкових email із {count} доступних:",
+        "digest_demo_uses_left": "Залишилось безкоштовних спроб: {left}",
+        "digest_demo_exhausted": "Ви вже використали обидві безкоштовні спроби. Оформіть підписку, щоб побачити повний список.",
         "digest_intro": "📧 Усі email рекрутерів з вакансій, опублікованих у каналі цього тижня — ${price}, разова покупка.",
         "digest_pay_button": "⭐ Оплатити {price} Stars",
         "digest_menu_button": "📧 Отримати email рекрутерів за тиждень",
@@ -1178,6 +1184,9 @@ async def cb_digest_count(callback: CallbackQuery):
     await callback.answer(t(lang, "digest_count_text", count=count), show_alert=True)
 
 
+DIGEST_DEMO_FREE_USES = 2
+
+
 @router.callback_query(F.data == "digest_demo")
 async def cb_digest_demo(callback: CallbackQuery):
     tg_id = callback.from_user.id
@@ -1185,14 +1194,21 @@ async def cb_digest_demo(callback: CallbackQuery):
         await callback.answer()
         return
     lang = db.get_subscriber_language(tg_id)
+    used = db.get_digest_demo_uses(tg_id)
+    if used >= DIGEST_DEMO_FREE_USES:
+        await callback.answer(t(lang, "digest_demo_exhausted"), show_alert=True)
+        return
     contacts = db.list_contacts_since(7)
     emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
     if not emails:
         await callback.answer(t(lang, "digest_empty"), show_alert=True)
         return
     sample = random.sample(emails, min(5, len(emails)))
+    new_used = db.increment_digest_demo_uses(tg_id)
+    left = max(DIGEST_DEMO_FREE_USES - new_used, 0)
     await callback.message.answer(
         t(lang, "digest_demo_text", count=len(emails)) + "\n\n" + "\n".join(sample)
+        + "\n\n" + t(lang, "digest_demo_uses_left", left=left)
     )
     await callback.answer()
 
@@ -1407,6 +1423,26 @@ async def handle_stripe_upcoming(bot: Bot, customer_id: str, amount: float, curr
         )
     except TelegramAPIError:
         pass
+
+
+async def handle_stripe_unmatched_payment(bot: Bot, ref: str, amount: float, currency: str, charge_id: str):
+    """Пришла настоящая оплата от Stripe, но client_reference_id пустой или
+    не в ожидаемом формате — обычно значит, что человек оплатил по голой
+    ссылке из Stripe Dashboard, а не по кнопке внутри бота (только кнопка в
+    боте подставляет tg_id). Понять, кому доставить, автоматически нельзя —
+    предупреждаем админов сразу, а не ждём, пока напишет расстроенный клиент."""
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"⚠️ Пришла оплата Stripe, которую не смог привязать к человеку "
+                f"(ref={ref!r}) — {amount}{currency}, charge_id={charge_id}.\n"
+                f"Скорее всего, оплатили по прямой ссылке из Stripe Dashboard, а не "
+                f"кнопкой в боте. Найди покупателя вручную (по имени/email в Stripe) "
+                f"и выдай доступ через /grant [@ник или id] [дней].",
+            )
+        except TelegramAPIError:
+            pass
 
 
 async def handle_stripe_digest_paid(bot: Bot, tg_id: int, amount: float, currency: str, charge_id: str):
@@ -2040,6 +2076,9 @@ async def cmd_grant(message: Message, command: CommandObject):
     tg_id = row["tg_id"]
     new_until = db.extend_subscription(tg_id, days)
     db.unlock_positions(tg_id)  # /grant — единственный способ снять постоянную блокировку должностей
+    # фиксируем сам факт оплаты — без этого /revenue и "первая оплата" в
+    # реферальной программе не видят тех, кому выдали доступ вручную
+    db.insert_payment(tg_id, 0, days, f"manual_grant_{datetime.now().timestamp()}", provider="manual", currency="—")
     until_str = datetime.fromisoformat(new_until).strftime("%d.%m.%Y")
     await message.answer(f"✅ Выдал доступ на {days} дней. Активно до {until_str}.")
     lang = db.get_subscriber_language(tg_id)
@@ -2451,10 +2490,25 @@ async def main():
     asyncio.create_task(subscription_reminder_worker(bot))
     asyncio.create_task(scheduled_ads_worker(bot))
 
+    # текст, видимый в ПУСТОМ чате до первого нажатия Start — ставится через
+    # Bot API, не хранится нигде в БД, просто применяется заново при каждом
+    # старте, чтобы не зависеть от ручной настройки через BotFather
+    try:
+        await bot.set_my_description(
+            "🚢 Этот бот присылает вам офшорные вакансии по должности, "
+            "которую вы выберете при подписке. Бесплатно 3 дня, дальше — "
+            "платная подписка. Нажмите Start, чтобы начать."
+        )
+        await bot.set_my_short_description(
+            "Офшорные вакансии по вашей должности — прямо в личные сообщения"
+        )
+    except TelegramAPIError as e:
+        print(f"[main] Не удалось установить описание бота: {e}")
+
     if WEBAPP_URL:
         asyncio.create_task(webapp.run_web_server(
             bot, BOT_TOKEN, PORT, handle_stripe_subscription_activated, handle_stripe_digest_paid,
-            handle_stripe_renewal, handle_stripe_upcoming
+            handle_stripe_renewal, handle_stripe_upcoming, handle_stripe_unmatched_payment
         ))
         try:
             await bot.set_chat_menu_button(
