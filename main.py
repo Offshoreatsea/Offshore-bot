@@ -70,41 +70,51 @@ DIGEST_TIMES = ["09:00", "14:00", "19:00"]
 FLEET_POSITIONS = {
     "Offshore": {
         "Bridge Officers": [
-            ("Master", "Master / SDPO"),
-            ("ChiefOfficer", "Chief Officer / SDPO / DPO"),
-            ("SecondOfficer", "Second Officer / DPO / JDPO"),
-            ("ThirdOfficer", "3rd Officer / JDPO"),
+            ("MasterSDPO", "Master/SDPO"),
+            ("Master", "Master"),
+            ("ChiefOfficerSDPO", "Chief Officer/SDPO"),
+            ("ChiefOfficer", "Chief Officer"),
+            ("SecondOfficerDPO", "Second Officer/DPO"),
+            ("SecondOfficerJDPO", "Second Officer/JDPO"),
+            ("SecondOfficer", "Second Officer"),
+            ("ThirdOfficerJDPO", "Third Officer/JDPO"),
+            ("ThirdOfficer", "Third Officer"),
             ("SafetyOfficer", "Safety Officer"),
             ("HLO", "HLO"),
         ],
         "Engine Officers": [
-            ("ChiefEngineer", "Chief Engineer / Single Engineer"),
-            ("SecondEngineer", "Second Engineer / Single Engineer"),
-            ("ThirdEngineer", "3rd Engineer / EOOW"),
-            ("JuniorEngineer", "Junior Engineer / EOOW"),
-            ("ETO", "ETO / Electrician / ETO Assistant"),
+            ("ChiefEngineer", "Chief Engineer"),
+            ("SecondEngineer", "Second Engineer"),
+            ("ThirdEngineer", "Third Engineer"),
+            ("JuniorEngineer", "Junior Engineer"),
+            ("ETO", "ETO"),
+            ("Electrician", "Electrician"),
+            ("ElectricianAssistant", "Electrician Assistant"),
         ],
         "Deck Ratings": [
+            ("AB", "AB"),
+            ("OS", "OS"),
             ("Bosun", "Bosun"),
-            ("AB", "AB / OS / Roustabout"),
+            ("Roustabout", "Roustabout"),
             ("CraneOperator", "Crane Operator"),
             ("GangwayOperator", "Gangway Operator"),
             ("HLO", "HLO"),
             ("Rigger", "Rigger"),
-            ("FitterWelder", "Fitter / Welder"),
+            ("FitterWelder", "Fitter/Welder"),
             ("DeckCadet", "Deck Cadet"),
         ],
         "Engine Ratings": [
+            ("Motorman", "Motorman"),
             ("Oiler", "Oiler"),
             ("Wiper", "Wiper"),
-            ("Motorman", "Motorman"),
-            ("FitterWelder", "Fitter / Welder"),
+            ("FitterWelder", "Fitter/Welder"),
             ("EngineCadet", "Engine Cadet"),
         ],
         "Catering": [
-            ("Cook", "Cook / Night Cook"),
+            ("Cook", "Cook"),
+            ("NightCook", "Night Cook"),
             ("CampBoss", "Camp Boss"),
-            ("Steward", "Steward / Stewardess"),
+            ("Steward", "Steward"),
             ("ChiefSteward", "Chief Steward"),
             ("Messman", "Messman"),
             ("Baker", "Baker"),
@@ -147,12 +157,26 @@ ALL_VALID_POSITION_TAGS = set(RANK_TAGS) | set(LEGACY_RANK_TAGS)
 
 # Фиксированный список типов судов — тоже единый источник правды для тегов
 # и матчинга.
-VESSEL_TAGS = [
+MERCHANT_VESSEL_TAGS = [
     "Tanker", "Container", "Bulk", "LNG", "LPG", "Chemical",
-    "Offshore", "OSV", "CSV", "DSV", "MPV", "MPSV", "AHTS", "PSV", "SOV",
-    "CableLayer", "Dredger", "Cruise", "RoRo", "Ferry", "Yacht", "FPSO", "JackUp",
-    "Tug", "Pipelay",
+    "Cruise", "RoRo", "Ferry", "Yacht",
 ]
+
+# Все типы судов, которые считаются офшорным флотом — если vessel_tag
+# оказался одним из этих, к хэштегам вакансии дополнительно добавляется
+# #OffshoreFleet (третий хэштег, см. render_template/extract_vacancies).
+OFFSHORE_VESSEL_TAGS = [
+    "Offshore", "OSV", "CSV", "DSV", "MPV", "MPSV", "AHTS", "AHT", "PSV", "SOV",
+    "CableLayer", "Dredger", "FPSO", "JackUp", "Tug", "Pipelay",
+    "UtilityVessel", "CrewBoat", "Workboat", "Multicat", "ROVVessel", "SurveyVessel",
+    "OCV", "ConstructionVessel", "ERRV", "GeophysicalVessel", "SeismicVessel",
+    "WTIV", "WFSV", "CSOV", "CLV", "CRV", "RockDumpingVessel", "SSCV",
+    "DrillingVessel", "FPV", "TrenchingVessel", "PLSV", "HLV", "CraneVessel",
+    "AccommodationVessel", "StandbyVessel", "OSRV", "FFV", "WSV", "WIV",
+    "WellTestingVessel", "FSO", "FPU", "FLNG", "FSRU",
+]
+
+VESSEL_TAGS = MERCHANT_VESSEL_TAGS + OFFSHORE_VESSEL_TAGS
 
 FALLBACK_TAG = "Other"
 
@@ -466,11 +490,22 @@ For each vacancy, extract:
   {rank_tags}
 
   Use this guide (not exhaustive — apply the same logic to anything similar that isn't
-  listed here):
-    "Master", "Captain", "Skipper", "SDPO" -> Master
-    "C/O", "Chief Officer", "Chief Mate", "First Mate", "1/O", "DPO" alone -> ChiefOfficer
-    "2/O", "2nd Officer", "Second Officer", "Second Mate" -> SecondOfficer
-    "JDPO", "3/O", "3rd Officer", "Third Officer", "Third Mate" -> ThirdOfficer
+  listed here). IMPORTANT: for Master/Chief Officer/Second Officer/Third Officer there
+  are TWO separate tags each — a DP-capable variant and a plain variant. Only use the DP
+  variant if the text explicitly mentions DP, DPO, SDPO, JDPO, or "dynamic positioning" for
+  that specific rank; otherwise use the plain variant (the vessel may not be a DP vessel):
+    "Master", "Captain", "Skipper" WITH DP/SDPO mentioned -> MasterSDPO
+    "Master", "Captain", "Skipper" with no DP mention -> Master
+    "C/O", "Chief Officer", "Chief Mate", "First Mate", "1/O" WITH DP/SDPO mentioned,
+    or a bare "DPO" with no rank number -> ChiefOfficerSDPO
+    "C/O", "Chief Officer", "Chief Mate", "First Mate", "1/O" with no DP mention -> ChiefOfficer
+    "2/O", "2nd Officer", "Second Officer", "Second Mate" WITH "DPO" (not JDPO) mentioned
+    -> SecondOfficerDPO
+    "2/O", "2nd Officer", "Second Officer", "Second Mate" WITH "JDPO" mentioned
+    -> SecondOfficerJDPO
+    "2/O", "2nd Officer", "Second Officer", "Second Mate" with no DP mention -> SecondOfficer
+    "3/O", "3rd Officer", "Third Officer", "Third Mate" WITH "JDPO" mentioned -> ThirdOfficerJDPO
+    "3/O", "3rd Officer", "Third Officer", "Third Mate" with no DP mention -> ThirdOfficer
     "Safety Officer" -> SafetyOfficer
     "HLO", "Helicopter Landing Officer" -> HLO
     "Deck Cadet", "Deck Trainee", "Navigation Cadet" -> DeckCadet
@@ -480,11 +515,13 @@ For each vacancy, extract:
     "4/E", "Fourth Engineer", "Junior Engineer" -> JuniorEngineer
     "Deck Engineer", "Deck Mechanic" -> ThirdEngineer (junior-sounding phrasing, explicit
     "junior"/"trainee" wording -> JuniorEngineer instead)
-    "Junior ETO", "Electro-Technical Officer", "Electrical Officer", "Ship's Electrician"
-    (as a job title, not a requirement) -> ETO
+    "ETO", "Junior ETO", "Electro-Technical Officer", "Electrical Officer" -> ETO
+    "Ship's Electrician", "Electrician" (as a job title, senior/qualified) -> Electrician
+    "Electrician Assistant", "Assistant Electrician", "Trainee Electrician" -> ElectricianAssistant
     "Boatswain", "Bosun's Mate" -> Bosun
-    "AB", "Able Seaman", "Able Bodied Seaman", "Deck Hand", "Deckhand", "OS",
-    "Ordinary Seaman", "Roustabout" -> AB
+    "AB", "Able Seaman", "Able Bodied Seaman", "Deck Hand", "Deckhand" -> AB
+    "OS", "Ordinary Seaman" -> OS
+    "Roustabout" -> Roustabout
     "Crane Operator" -> CraneOperator
     "Gangway Operator" -> GangwayOperator
     "Rigger" -> Rigger
@@ -493,13 +530,14 @@ For each vacancy, extract:
     "Oiler" -> Oiler
     "Wiper" -> Wiper
     "Engine Cadet", "Engine Trainee", "Motor Cadet" -> EngineCadet
-    "Cook", "Ship's Cook", "Chief Cook", "Galley Cook", "Night Cook" -> Cook
+    "Cook", "Ship's Cook", "Chief Cook", "Galley Cook" -> Cook
+    "Night Cook" -> NightCook
     "Steward", "Stewardess" -> Steward
     "Messman", "Mess Man" -> Messman
     "Baker" -> Baker
     "Camp Boss", "Campboss", "Catering Manager" -> CampBoss
     "Chief Steward", "Chief Steward/ess" -> ChiefSteward
-    "ROV", "ROV Pilot", "ROV Technician" -> ROV
+    "ROV", "ROV Pilot", "ROV Technician" (job title, a person) -> ROV
     "Client Rep", "Client Representative" -> ClientRep
     "Online Survey", "Survey" (remote/online) -> OnlineSurvey
     "Survey Engineer" -> SurveyEngineer
@@ -515,27 +553,61 @@ For each vacancy, extract:
 - vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list:
   {vessel_tags}
   Use this guide (not exhaustive — apply the same logic to anything similar that isn't
-  listed here):
+  listed here; abbreviated or fully spelled out, both map to the same tag):
     "Offshore Support Vessel", "Supply Vessel" (generic, no more specific type given) -> OSV
-    "Platform Supply Vessel" -> PSV
+    "Platform Supply Vessel", "PSV" -> PSV
     "Anchor Handling Tug Supply", "AHTS vessel" -> AHTS
-    "Anchor Handling Tug" WITHOUT "Supply" (pure towing, no cargo deck) -> Tug
-    "Tug", "Tugboat", "Towing vessel", "Harbour Tug" -> Tug
-    "Diving Support Vessel" -> DSV
-    "Construction Support Vessel" -> CSV
-    "Multi-Purpose Support Vessel" -> MPSV
-    "Multi-Purpose Vessel" (not offshore-support-specific) -> MPV
-    "Service Operation Vessel" (wind farm crew transfer/service) -> SOV
+    "Anchor Handling Tug" WITHOUT "Supply" (pure towing, no cargo deck), "AHT" -> AHT
+    "Tug", "Tugboat", "Towing vessel", "Harbour Tug", "ASD Tug", "Azimuth Stern Drive Tug" -> Tug
+    "Diving Support Vessel", "DSV" -> DSV
+    "Construction Support Vessel", "CSV" -> CSV
+    "Multi-Purpose Support Vessel", "MPSV" -> MPSV
+    "Multi-Purpose Vessel" (not offshore-support-specific), "MPV" -> MPV
+    "Service Operation Vessel", "SOV" (wind farm crew transfer/service) -> SOV
+    "Commissioning Service Operation Vessel", "CSOV" -> CSOV
     "Dredger", "Dredging vessel", "Hopper Dredger", "Cutter Suction Dredger",
     "Trailing Suction Hopper Dredger", "TSHD" -> Dredger
     "Pipelay vessel", "Pipe-laying vessel", "Pipelayer", "S-lay vessel", "J-lay vessel" -> Pipelay
-    "Cable Layer", "Cable-laying vessel", "Cable Ship" -> CableLayer
+    "Pipelay Support Vessel", "PLSV" -> PLSV
+    "Cable Layer", "Cable-laying vessel", "Cable Ship", "Cable Lay Vessel", "CLV" -> CLV
+    "Cable Repair Vessel", "CRV" -> CRV
+    "Utility Vessel" -> UtilityVessel
+    "Crew Boat" -> CrewBoat
+    "Workboat", "Work Boat" -> Workboat
+    "Multicat" -> Multicat
+    "ROV Support Vessel", "ROV Vessel" (the SHIP, not the job title) -> ROVVessel
+    "Survey Vessel" (the ship) -> SurveyVessel
+    "Offshore Construction Vessel", "OCV" -> OCV
+    "Construction Vessel", "Construction" (as vessel type) -> ConstructionVessel
+    "Emergency Response & Rescue Vessel", "ERRV" -> ERRV
+    "Geophysical Vessel", "Geophysical Survey Vessel" -> GeophysicalVessel
+    "Seismic Vessel", "Seismic Survey Vessel" -> SeismicVessel
+    "Wind Turbine Installation Vessel", "WTIV" -> WTIV
+    "Wind Farm Service Vessel", "WFSV" -> WFSV
+    "Rock Dumping Vessel" -> RockDumpingVessel
+    "Semi-Submersible Crane Vessel", "SSCV" -> SSCV
+    "Drilling Vessel", "Drillship" -> DrillingVessel
+    "Fallpipe Vessel", "FPV" -> FPV
+    "Trenching Vessel" -> TrenchingVessel
+    "Heavy Lift Vessel", "HLV" -> HLV
+    "Crane Vessel" (not semi-sub) -> CraneVessel
+    "Accommodation Vessel", "Flotel", "Floating Hotel" -> AccommodationVessel
+    "Standby Vessel" -> StandbyVessel
+    "Oil Spill Response Vessel", "OSRV" -> OSRV
+    "Fire Fighting Vessel", "FFV" -> FFV
+    "Well Stimulation Vessel", "WSV" -> WSV
+    "Well Intervention Vessel", "WIV" -> WIV
+    "Well Testing Vessel" -> WellTestingVessel
+    "Floating Production Storage and Offloading", "FPSO" -> FPSO
+    "Floating Storage and Offloading", "FSO" -> FSO
+    "Floating Production Unit", "FPU" -> FPU
+    "Floating Liquefied Natural Gas", "FLNG" -> FLNG
+    "Floating Storage and Regasification Unit", "FSRU" -> FSRU
+    "Jack-up rig", "Jack-up platform", "Jack Up" -> JackUp
     "Product Tanker", "Crude Tanker", "Oil Tanker" -> Tanker
     "Container ship", "Containership" -> Container
     "Bulk Carrier", "Bulker" -> Bulk
     "Ro-Ro", "Roll-on/Roll-off" -> RoRo
-    "Floating Production Storage and Offloading" -> FPSO
-    "Jack-up rig", "Jack-up platform" -> JackUp
     If the text just says "offshore vessel"/"offshore project" with no more specific type,
     use "Offshore".
   If vessel type isn't stated or nothing fits, use "Other".
@@ -650,7 +722,10 @@ def ai_parse_batch(raw: str) -> list[dict]:
             vessel_tag = FALLBACK_TAG
         item["position_tag"] = position_tag
         item["vessel_tag"] = vessel_tag
-        item["hashtags"] = f"#{position_tag} #{vessel_tag}"
+        tags_line = f"#{position_tag} #{vessel_tag}"
+        if vessel_tag in OFFSHORE_VESSEL_TAGS:
+            tags_line += " #OffshoreFleet"
+        item["hashtags"] = tags_line
     return data
 
 
