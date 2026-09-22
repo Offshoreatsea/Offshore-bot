@@ -174,6 +174,7 @@ OFFSHORE_VESSEL_TAGS = [
     "DrillingVessel", "FPV", "TrenchingVessel", "PLSV", "HLV", "CraneVessel",
     "AccommodationVessel", "StandbyVessel", "OSRV", "FFV", "WSV", "WIV",
     "WellTestingVessel", "FSO", "FPU", "FLNG", "FSRU",
+    "DP1", "DP2", "DP3",
 ]
 
 VESSEL_TAGS = MERCHANT_VESSEL_TAGS + OFFSHORE_VESSEL_TAGS
@@ -604,6 +605,10 @@ For each vacancy, extract:
     "Floating Liquefied Natural Gas", "FLNG" -> FLNG
     "Floating Storage and Regasification Unit", "FSRU" -> FSRU
     "Jack-up rig", "Jack-up platform", "Jack Up" -> JackUp
+    If the text only gives a DP class ("DP1 vessel", "DP2", "DP3") with no more specific
+    vessel type named anywhere else in the text, use DP1/DP2/DP3 accordingly. If a more
+    specific vessel type IS also mentioned (e.g. "DP2 PSV"), use that specific type instead
+    (PSV here) — the DP class alone is a weaker signal than a named vessel type.
     "Product Tanker", "Crude Tanker", "Oil Tanker" -> Tanker
     "Container ship", "Containership" -> Container
     "Bulk Carrier", "Bulker" -> Bulk
