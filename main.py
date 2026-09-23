@@ -1011,6 +1011,7 @@ async def cmd_start(message: Message, command: CommandObject):
             "/unlockpositions [@ник или id] — разблокировать должности без продления подписки\n"
             "/lockpositions [@ник или id] — принудительно зафиксировать выбранные должности\n"
             "/unlockall — разблокировать должности СРАЗУ ВСЕМ подписчикам\n"
+            "/revokeallpositions — снять должности у ВСЕХ (нужно подтверждение: /revokeallpositions confirm)\n"
             "/revoke [@ник или id] — отписать вручную, доступ прекращается немедленно\n"
             "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
             "/revenue [дней] — доход в Stars за период (по умолчанию 7 дней)\n"
@@ -1993,6 +1994,33 @@ async def cmd_unlock_all(message: Message):
         await asyncio.sleep(0.05)  # не спамим Telegram API пачкой без пауз
 
     await message.answer(f"✅ Готово. Разблокировано: {len(ids)}. Уведомлено: {sent}, не доставлено: {failed}.")
+
+
+@router.message(Command("revokeallpositions"))
+async def cmd_revoke_all_positions(message: Message, command: CommandObject):
+    if not admin_only(message.from_user.id):
+        return
+    arg = (command.args or "").strip().lower()
+    count = db.count_subscribers_with_positions()
+
+    if arg != "confirm":
+        if count == 0:
+            await message.answer("Ни у кого сейчас нет выбранных должностей — сбрасывать нечего.")
+            return
+        await message.answer(
+            f"⚠️ Это снимет должности у {count} подписчиков (у всех, без исключений) "
+            f"и разблокирует выбор — каждому придётся выбирать заново.\n\n"
+            f"Действие необратимо. Чтобы подтвердить, напиши:\n"
+            f"/revokeallpositions confirm"
+        )
+        return
+
+    if count == 0:
+        await message.answer("Ни у кого сейчас нет выбранных должностей — сбрасывать нечего.")
+        return
+
+    affected = db.revoke_all_positions()
+    await message.answer(f"✅ Должности сброшены у {affected} подписчиков. Выбор разблокирован у всех.")
 
 
 @router.message(Command("addad"))

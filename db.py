@@ -506,6 +506,29 @@ def get_all_locked_subscriber_ids():
     return [r["tg_id"] for r in rows]
 
 
+def count_subscribers_with_positions() -> int:
+    """Сколько разных людей вообще имеют хоть одну выбранную должность —
+    для предупреждения перед /revokeallpositions."""
+    conn = get_conn()
+    row = conn.execute("SELECT COUNT(DISTINCT tg_id) c FROM subscriptions").fetchone()
+    conn.close()
+    return row["c"]
+
+
+def revoke_all_positions() -> int:
+    """Снимает ВСЕ выбранные должности у ВСЕХ подписчиков и разблокирует
+    выбор, чтобы каждый мог выбрать заново. Возвращает число затронутых
+    людей. Необратимо — вызывающий код обязан подтвердить действие сам,
+    эта функция ничего не спрашивает."""
+    conn = get_conn()
+    affected = conn.execute("SELECT COUNT(DISTINCT tg_id) c FROM subscriptions").fetchone()["c"]
+    conn.execute("DELETE FROM subscriptions")
+    conn.execute("UPDATE subscribers SET positions_locked = 0")
+    conn.commit()
+    conn.close()
+    return affected
+
+
 def revoke_subscription(tg_id: int):
     """Ручной отзыв доступа (команда /revoke) — ставим дату истечения в
     прошлое, а не NULL: так человек не получит повторный бесплатный триал,
