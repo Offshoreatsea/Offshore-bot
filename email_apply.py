@@ -32,7 +32,8 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardButton,
+                           InlineKeyboardMarkup, Message)
 from cryptography.fernet import Fernet, InvalidToken
 
 import db
@@ -41,6 +42,7 @@ router = Router()
 
 MAIL_DAILY_LIMIT = int(os.getenv("MAIL_DAILY_LIMIT", "100"))          # писем в день с одного клиента
 MAIL_PER_EMPLOYER_DAY = int(os.getenv("MAIL_PER_EMPLOYER_DAY", "4"))  # писем в день одному работодателю от клиента
+MAIL_BACKFILL_DAYS = int(os.getenv("MAIL_BACKFILL_DAYS", "4"))        # за сколько дней откликаться при заведении клиента
 COVER_MODEL = os.getenv("COVER_MODEL", "claude-haiku-4-5-20251001")
 
 # заполняется из main.py через setup(), чтобы не было циклического импорта
@@ -82,6 +84,30 @@ def setup(admin_ids, claude, valid_tags, tag_labels):
 
 def is_admin(user_id: int) -> bool:
     return user_id in _admin_ids
+
+
+ADMIN_MAIL_COMMANDS = [
+    ("mailhelp", "📧 Отклики по email — все команды"),
+    ("clients", "📧 Клиенты для откликов"),
+    ("addclient", "📧 Добавить клиента"),
+    ("mailsent", "📧 Последние отправки"),
+]
+
+
+@router.startup()
+async def _install_admin_commands(bot: Bot):
+    # команды откликов видны в меню только админам; обычное меню для остальных не меняется
+    try:
+        base = await bot.get_my_commands()
+    except Exception:
+        base = []
+    names = {c.command for c in base}
+    cmds = list(base) + [BotCommand(command=c, description=d) for c, d in ADMIN_MAIL_COMMANDS if c not in names]
+    for admin_id in _admin_ids:
+        try:
+            await bot.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as e:
+            print(f"[email_apply] не удалось поставить меню команд админу {admin_id}: {e}")
 
 
 # ---------------------------------------------------------------- шифрование
@@ -570,6 +596,37 @@ async def send_app(bot: Bot, app_id: int) -> tuple[bool, str]:
     return True, ""
 
 
+async def backfill_client(bot: Bot, client_id: int, days: int = MAIL_BACKFILL_DAYS):
+    """Откликается от клиента на опубликованные за последние `days` дней вакансии по его должностям."""
+    client = get_client(client_id)
+    if not client or not client["active"]:
+        return
+    tags = [t for t in (client["positions"] or "").split(",") if t]
+    if not tags:
+        return
+    since = (datetime.now() - timedelta(days=days)).isoformat()
+    marks = ",".join("?" * len(tags))
+    rows = _q(f"""SELECT id FROM vacancies WHERE status = 'published' AND created_at > ?
+                  AND position_tag IN ({marks}) ORDER BY id""", (since, *tags))
+    before_sent = sent_today(client_id)
+    total = 0
+    for r in rows:
+        try:
+            total += await propose_for_vacancy(bot, r["id"], only_client_id=client_id)
+        except Exception as e:
+            print(f"[email_apply] backfill вакансия {r['id']}: {e}")
+        await asyncio.sleep(1.5)  # не частим — и Gmail, и Telegram не любят пачки подряд
+    sent = sent_today(client_id) - before_sent
+    mode = "отправлено" if client["auto_send"] else "черновиков создано"
+    await _notify_admins(bot, f"📬 {html.escape(client['full_name'])}: вакансий за {days} дн. по его должностям — "
+                              f"{len(rows)}, новых откликов: {total} ({mode}: "
+                              f"{sent if client['auto_send'] else total}).")
+
+
+def start_backfill(bot: Bot, client_id: int, days: int = MAIL_BACKFILL_DAYS):
+    asyncio.create_task(backfill_client(bot, client_id, days))
+
+
 @router.callback_query(F.data.startswith("ea_send:"))
 async def cb_send(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -663,6 +720,10 @@ class AddClient(StatesGroup):
     cv = State()
 
 
+class ClientPosEdit(StatesGroup):
+    pick = State()
+
+
 class ClientSetup(StatesGroup):
     subject = State()
     letter = State()
@@ -681,15 +742,85 @@ class ClientPass(StatesGroup):
     password = State()
 
 
+def _norm_tag(raw: str) -> str:
+    raw = raw.strip().lstrip("#").lower().replace(".", "").replace("/", "").replace(" ", "")
+    return raw.replace("2nd", "second").replace("3rd", "third")
+
+
 def _parse_positions(text: str) -> tuple[list[str], list[str]]:
     lookup = {t.lower(): t for t in _valid_tags}
     ok, bad = [], []
-    for raw in re.split(r"[,\s]+", text.strip()):
-        raw = raw.strip().lstrip("#")
-        if not raw:
+    for raw in re.split(r"[,;\n]+", text.strip()):
+        if not raw.strip():
             continue
-        (ok if raw.lower() in lookup else bad).append(lookup.get(raw.lower(), raw))
+        key = _norm_tag(raw)
+        (ok if key in lookup else bad).append(lookup.get(key, raw.strip()))
     return list(dict.fromkeys(ok)), bad
+
+
+# порядок и группы кнопок — как задал владелец; один тег может стоять в двух группах
+# (HLO, Fitter/Welder) — отметка ставится/снимается сразу в обеих
+POSITION_GROUPS = [
+    ("Bridge Officers", [
+        ("MasterSDPO", "Master / SDPO"), ("Master", "Master"),
+        ("ChiefOfficerSDPO", "Chief Officer / SDPO"), ("ChiefOfficer", "Chief Officer"),
+        ("SecondOfficerDPO", "2nd Officer / DPO"), ("SecondOfficerJDPO", "2nd Officer / JDPO"),
+        ("SecondOfficer", "2nd Officer"), ("ThirdOfficerJDPO", "3rd Officer / JDPO"),
+        ("ThirdOfficer", "3rd Officer"), ("SafetyOfficer", "Safety Officer"), ("HLO", "HLO"),
+    ]),
+    ("Engine Officers", [
+        ("ChiefEngineer", "Chief Engineer"), ("SecondEngineer", "2nd Engineer"),
+        ("ThirdEngineer", "3rd Engineer"), ("JuniorEngineer", "Junior Engineer"),
+        ("ETO", "ETO"), ("Electrician", "Electrician"), ("ElectricianAssistant", "Electrician Assistant"),
+    ]),
+    ("Deck Ratings", [
+        ("AB", "AB"), ("OS", "OS"), ("Bosun", "Bosun"), ("Roustabout", "Roustabout"),
+        ("CraneOperator", "Crane Operator"), ("GangwayOperator", "Gangway Operator"), ("HLO", "HLO"),
+        ("Rigger", "Rigger"), ("FitterWelder", "Fitter / Welder"), ("DeckCadet", "Deck Cadet"),
+    ]),
+    ("Engine Ratings", [
+        ("Motorman", "Motorman"), ("Oiler", "Oiler"), ("Wiper", "Wiper"),
+        ("FitterWelder", "Fitter / Welder"), ("EngineCadet", "Engine Cadet"),
+    ]),
+    ("Catering", [
+        ("Cook", "Cook"), ("NightCook", "Night Cook"), ("CampBoss", "Camp Boss"),
+        ("Steward", "Steward"), ("ChiefSteward", "Chief Steward"), ("Messman", "Messman"),
+    ]),
+]
+
+
+def _position_groups() -> list[tuple[str, list[tuple[str, str]]]]:
+    valid = set(_valid_tags)
+    groups = [(name, [(t, l) for t, l in items if t in valid]) for name, items in POSITION_GROUPS]
+    listed = {t for _, items in groups for t, _ in items}
+    rest = [(t, _tag_labels.get(t, t)) for t in _valid_tags if t not in listed]
+    if rest:  # теги, которые есть в канале, но не вошли в группы (Diver, ROV, …)
+        groups.append(("Other", rest))
+    return [(n, items) for n, items in groups if items]
+
+
+def positions_keyboard(selected: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for name, items in _position_groups():
+        rows.append([InlineKeyboardButton(text=f"— {name} —", callback_data="eahdr")])
+        buttons = [
+            InlineKeyboardButton(text=("✅ " if tag in selected else "") + label, callback_data=f"eapos:{tag}")
+            for tag, label in items
+        ]
+        rows += [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton(text=f"Готово ✔️ ({len(selected)})", callback_data="eapos_done")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _pos_label(tag: str) -> str:
+    for _, items in POSITION_GROUPS:
+        for t, l in items:
+            if t == tag:
+                return l
+    return _tag_labels.get(tag, tag)
+
+
+POSITIONS_PROMPT = "Выберите должности кнопками (можно несколько), затем нажмите «Готово»:"
 
 
 def _tags_hint() -> str:
@@ -758,7 +889,7 @@ async def ac_password(message: Message, state: FSMContext):
     await state.update_data(password=password)
     await state.set_state(AddClient.positions)
     await status.edit_text(
-        "✅ Вход в почту работает.\n\n4/9. Должности через запятую (теги как в канале):\n" + _tags_hint()
+        "✅ Вход в почту работает.\n\n4/9. " + POSITIONS_PROMPT, reply_markup=positions_keyboard([])
     )
 
 
@@ -771,6 +902,48 @@ async def ac_positions(message: Message, state: FSMContext):
     await state.update_data(positions=ok)
     await state.set_state(AddClient.phone)
     await message.answer("5/9. Телефон/WhatsApp для подписи письма (или «-», если не нужен):")
+
+
+@router.callback_query(StateFilter(AddClient.positions, ClientPosEdit.pick), F.data.startswith("eapos:"))
+async def cb_pos_toggle(callback: CallbackQuery, state: FSMContext):
+    tag = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    sel = list(data.get("sel") or [])
+    sel.remove(tag) if tag in sel else sel.append(tag)
+    await state.update_data(sel=sel)
+    await callback.message.edit_reply_markup(reply_markup=positions_keyboard(sel))
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(AddClient.positions, ClientPosEdit.pick), F.data == "eapos_done")
+async def cb_pos_done(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    sel = [t for t in _valid_tags if t in (data.get("sel") or [])]
+    if not sel:
+        return await callback.answer("Выберите хотя бы одну должность", show_alert=True)
+    labels = ", ".join(_pos_label(t) for t in sel)
+    await callback.message.edit_text(f"Должности: {html.escape(labels)}")
+    await callback.answer()
+    if await state.get_state() == ClientPosEdit.pick.state:
+        update_client(data["client_id"], positions=",".join(sel))
+        await state.clear()
+        await callback.message.answer(f"✅ #{data['client_id']}: должности сохранены. Проверяю вакансии "
+                                      f"за {MAIL_BACKFILL_DAYS} дн. по новым должностям…")
+        start_backfill(callback.bot, data["client_id"])
+        return
+    await state.update_data(positions=sel)
+    await state.set_state(AddClient.phone)
+    await callback.message.answer("5/9. Телефон/WhatsApp для подписи письма (или «-», если не нужен):")
+
+
+@router.callback_query(F.data == "eahdr")
+async def cb_pos_header(callback: CallbackQuery):
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("eapos"))
+async def cb_pos_stale(callback: CallbackQuery):
+    await callback.answer("Этот выбор уже закрыт. Для смены должностей: /clientpos ID", show_alert=True)
 
 
 @router.message(StateFilter(AddClient.phone), F.text & ~F.text.startswith("/"))
@@ -832,26 +1005,52 @@ async def cs_letter(message: Message, state: FSMContext):
     text = message.text.strip()
     update_client(data["client_id"], letter_tpl=None if text == "-" else text)
     await state.set_state(ClientSetup.auto)
-    await message.answer(
-        "9/9. <b>Отправлять автоматически?</b>\n"
-        "«да» — письмо уходит само, как только выходит подходящая вакансия с email, "
-        "а вам приходит уведомление, что отправлено.\n"
-        "«нет» — сначала черновик с кнопкой ✅ Send."
-    )
+    await message.answer(AUTO_PROMPT_TEXT.replace("{n}", "9/9. "), reply_markup=auto_keyboard(data["client_id"]))
+
+
+AUTO_PROMPT_TEXT = (
+    "{n}<b>Как подавать отклики?</b>\n\n"
+    "🤖 <b>Автоматически</b> — письмо уходит само, как только выходит подходящая вакансия с email; "
+    "вам приходит уведомление, что отправлено.\n"
+    "✋ <b>Через кнопку</b> — сначала приходит черновик, письмо уходит после ✅ Send."
+)
+
+
+def auto_keyboard(client_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🤖 Автоматически", callback_data=f"eaauto:{client_id}:1"),
+        InlineKeyboardButton(text="✋ Через кнопку", callback_data=f"eaauto:{client_id}:0"),
+    ]])
+
+
+@router.callback_query(F.data.startswith("eaauto:"))
+async def cb_auto(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    _, cid, flag = callback.data.split(":")
+    cid, auto = int(cid), flag == "1"
+    if not get_client(cid):
+        return await callback.answer("Клиент не найден", show_alert=True)
+    update_client(cid, auto_send=1 if auto else 0)
+    in_setup = await state.get_state() == ClientSetup.auto.state
+    mode = "автоматически 🤖" if auto else "через кнопку ✋"
+    await callback.message.edit_text(f"Клиент #{cid}: подача {mode}.")
+    await callback.answer()
+    if in_setup:
+        await state.clear()
+        await callback.message.answer(
+            f"✅ Клиент #{cid} готов.\n"
+            f"Сейчас откликнусь на подходящие вакансии за последние {MAIL_BACKFILL_DAYS} дн. — "
+            f"итог пришлю отдельным сообщением.\n\n"
+            f"Настройки: <code>/clientshow {cid}</code> · тест: <code>/testmail {cid}</code>"
+        )
+        start_backfill(callback.bot, cid)
 
 
 @router.message(StateFilter(ClientSetup.auto), F.text & ~F.text.startswith("/"))
-async def cs_auto(message: Message, state: FSMContext):
+async def cs_auto_text(message: Message, state: FSMContext):
     data = await state.get_data()
-    await state.clear()
-    auto = message.text.strip().lower() in ("да", "yes", "y", "д", "+", "on")
-    update_client(data["client_id"], auto_send=1 if auto else 0)
-    cid = data["client_id"]
-    await message.answer(
-        f"✅ Готово. Клиент #{cid}: {'автоотправка 🤖' if auto else 'через подтверждение ✋'}.\n\n"
-        f"Посмотреть настройки: <code>/clientshow {cid}</code>\n"
-        f"Проверить отправку: <code>/testmail {cid}</code>"
-    )
+    await message.answer("Выберите кнопкой 👇", reply_markup=auto_keyboard(data["client_id"]))
 
 
 @router.message(StateFilter(AddClient.cv, ClientCV.cv), ~F.document)
@@ -895,8 +1094,9 @@ async def cmd_mail_help(message: Message):
         "/clientshow ID — посмотреть тему, письмо и режим\n"
         "/clientsubject ID текст — тема письма (шаблон)\n"
         "/clientletter ID — cover letter (шаблон, потом прислать текст)\n"
-        "/clientauto ID on|off — автоотправка вкл/выкл\n"
-        "/clientpos ID теги — сменить должности\n"
+        "/clientauto ID — подача автоматически или через кнопку\n"
+        f"/backfill ID [дней] — откликнуться на вакансии за последние дни (по умолчанию {MAIL_BACKFILL_DAYS})\n"
+        "/clientpos ID — сменить должности (кнопками)\n"
         "/clientabout ID текст — выжимка для cover letter\n"
         "/clientphone ID телефон\n"
         "/clientcv ID — заменить CV (потом прислать файл)\n"
@@ -905,7 +1105,8 @@ async def cmd_mail_help(message: Message):
         "/clientoff ID · /clienton ID — пауза/включить\n"
         "/delclient ID — удалить\n"
         "/testmail ID — тестовое письмо клиенту на его же почту\n"
-        "/applyto VACANCY_ID [CLIENT_ID] — сделать черновик для уже опубликованной вакансии\n"
+        "/applyto VACANCY_ID [CLIENT_ID] — отклик на уже опубликованную вакансию\n"
+        "/applyto last [CLIENT_ID] — на последнюю опубликованную\n"
         "/mailsent — последние отправки\n\n"
         f"Лимиты: {MAIL_DAILY_LIMIT} писем в день на клиента, одному работодателю до {MAIL_PER_EMPLOYER_DAY} в день, "
         "на одну вакансию — одно письмо."
@@ -976,19 +1177,30 @@ async def cmd_client_auto(message: Message, command: CommandObject):
         return
     client, rest = _client_arg(command)
     mode = rest.strip().lower()
-    if not client or mode not in ("on", "off"):
-        return await message.answer("Формат: /clientauto ID on — автоотправка, /clientauto ID off — через подтверждение")
+    if not client:
+        return await message.answer("Формат: /clientauto ID")
+    if mode not in ("on", "off"):
+        now = "автоматически 🤖" if client["auto_send"] else "через кнопку ✋"
+        return await message.answer(AUTO_PROMPT_TEXT.replace("{n}", f"#{client['id']} {html.escape(client['full_name'])} "
+                                                                    f"(сейчас: {now}).\n"),
+                                     reply_markup=auto_keyboard(client["id"]))
     update_client(client["id"], auto_send=1 if mode == "on" else 0)
     await message.answer(f"#{client['id']}: {'автоотправка 🤖' if mode == 'on' else 'через подтверждение ✋'}")
 
 
 @router.message(Command("clientpos"))
-async def cmd_client_pos(message: Message, command: CommandObject):
+async def cmd_client_pos(message: Message, command: CommandObject, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     client, rest = _client_arg(command)
     if not client:
-        return await message.answer("Формат: /clientpos ID ChiefOfficer, 2ndOfficer")
+        return await message.answer("Формат: /clientpos ID")
+    if not rest.strip():
+        current = [t for t in (client["positions"] or "").split(",") if t]
+        await state.set_state(ClientPosEdit.pick)
+        await state.update_data(client_id=client["id"], sel=current)
+        return await message.answer(f"#{client['id']} {html.escape(client['full_name'])}. " + POSITIONS_PROMPT,
+                                    reply_markup=positions_keyboard(current))
     ok, bad = _parse_positions(rest)
     if bad or not ok:
         return await message.answer(f"Не узнал: {html.escape(', '.join(bad) or '—')}. Доступные:\n" + _tags_hint())
@@ -1127,14 +1339,35 @@ async def cmd_test_mail(message: Message, command: CommandObject):
     await status.edit_text(f"✅ Тестовое письмо ушло на {html.escape(client['email'])} — проверьте ящик клиента.")
 
 
+@router.message(Command("backfill"))
+async def cmd_backfill(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (command.args or "").split()
+    if not parts or not parts[0].isdigit() or not get_client(int(parts[0])):
+        return await message.answer(f"Формат: /backfill ID [дней] (по умолчанию {MAIL_BACKFILL_DAYS})")
+    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else MAIL_BACKFILL_DAYS
+    await message.answer(f"Проверяю вакансии за {days} дн.…")
+    start_backfill(message.bot, int(parts[0]), days)
+
+
 @router.message(Command("applyto"))
 async def cmd_apply_to(message: Message, command: CommandObject):
     if not is_admin(message.from_user.id):
         return
     parts = (command.args or "").split()
+    if parts and parts[0].lower() == "last":
+        row = _q("SELECT id FROM vacancies WHERE status = 'published' ORDER BY id DESC LIMIT 1", one=True)
+        if not row:
+            return await message.answer("Опубликованных вакансий нет.")
+        parts[0] = str(row["id"])
     if not parts or not parts[0].isdigit():
-        return await message.answer("Формат: /applyto VACANCY_ID [CLIENT_ID]")
+        return await message.answer("Формат: /applyto VACANCY_ID [CLIENT_ID] или /applyto last [CLIENT_ID]")
     vacancy_id = int(parts[0])
+    vac = db.get_vacancy(vacancy_id)
+    if vac:
+        await message.answer(f"Вакансия #{vacancy_id}: тег {html.escape(vac['position_tag'] or '—')}, "
+                             f"контакт {html.escape((vac['contact'] or '—')[:80])}")
     only = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
     n = await propose_for_vacancy(message.bot, vacancy_id, only_client_id=only)
     if not n:
