@@ -30,6 +30,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 import db
+import email_apply
 import webapp
 
 load_dotenv()
@@ -944,6 +945,12 @@ async def do_publish(bot: Bot, vacancy_id: int):
     except Exception as e:
         print(f"[do_publish] Рассылка подписчикам не удалась (публикация в канал прошла успешно): {e}")
 
+    # черновики откликов по email с почты клиентов — тоже изолированно
+    try:
+        await email_apply.propose_for_vacancy(bot, vacancy_id)
+    except Exception as e:
+        print(f"[do_publish] Черновики email-откликов не созданы: {e}")
+
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
@@ -1240,7 +1247,6 @@ async def cb_my_subscription(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.message(Command("getemails"))
 def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=t(lang, "digest_count_button"), callback_data="digest_count")],
@@ -1294,6 +1300,7 @@ async def cb_digest_demo(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.message(Command("getemails"))
 async def cmd_get_emails(message: Message):
     # доступно всем, не только тебе — это платный продукт для кандидатов/
     # других крюингов, отдельный от основной подписки на вакансии
@@ -2591,8 +2598,11 @@ async def scheduled_ads_worker(bot: Bot):
 
 async def main():
     db.init_db()
+    email_apply.init_tables()
+    email_apply.setup(ADMIN_IDS, claude, RANK_TAGS, TAG_LABELS)
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(email_apply.router)  # раньше основного: его пошаговые диалоги должны ловить текст первыми
     dp.include_router(router)
     asyncio.create_task(digest_worker(bot))
     asyncio.create_task(subscription_reminder_worker(bot))
