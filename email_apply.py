@@ -70,6 +70,10 @@ SMTP_PRESETS = {
     "ukr.net": ("smtp.ukr.net", 465),
     "icloud.com": ("smtp.mail.me.com", 587),
     "me.com": ("smtp.mail.me.com", 587),
+    "yahoo.com": ("smtp.mail.yahoo.com", 465),
+    "ymail.com": ("smtp.mail.yahoo.com", 465),
+    "rocketmail.com": ("smtp.mail.yahoo.com", 465),
+    "aol.com": ("smtp.aol.com", 465),
     "outlook.com": ("smtp-mail.outlook.com", 587),
     "hotmail.com": ("smtp-mail.outlook.com", 587),
     "live.com": ("smtp-mail.outlook.com", 587),
@@ -287,6 +291,8 @@ def insert_app(client_id, vacancy_id, to_email, subject, body) -> int:
 
 def smtp_for(email: str) -> tuple[str, int]:
     domain = email.split("@")[-1].lower()
+    if domain.startswith("yahoo."):  # yahoo.co.uk, yahoo.fr, yahoo.com.ph и т.д.
+        return ("smtp.mail.yahoo.com", 465)
     return SMTP_PRESETS.get(domain, DEFAULT_SMTP)
 
 
@@ -999,6 +1005,7 @@ async def ac_email(message: Message, state: FSMContext):
         f"3/9. Пароль приложения для этой почты (сервер {host}).\n\n"
         "Gmail: myaccount.google.com → Безопасность → Двухэтапная проверка (включить) → "
         "Пароли приложений → создать → 16 символов.\n"
+        "Yahoo: login.yahoo.com/account/security → «Создать пароль приложения» (Generate app password).\n"
         "Сообщение с паролем я сразу удалю из чата, в базе он хранится зашифрованным."
     )
 
