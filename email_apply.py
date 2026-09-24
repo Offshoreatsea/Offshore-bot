@@ -10,14 +10,15 @@
   3. Админ жмёт ✅ Send — письмо уходит с почты самого клиента (SMTP).
      Ответ работодателя придёт прямо клиенту в его ящик.
 
-Защита: одно письмо на клиента на вакансию, одному работодателю не чаще
-раза в MAIL_DEDUP_DAYS дней, не больше MAIL_DAILY_LIMIT писем в день на клиента.
+Защита: одно письмо на клиента на вакансию, одному работодателю не больше
+MAIL_PER_EMPLOYER_DAY (4) писем в день, не больше MAIL_DAILY_LIMIT (100) писем в день на клиента.
 """
 import asyncio
 import base64
 import hashlib
 import html
 import io
+import mimetypes
 import os
 import re
 import smtplib
@@ -38,8 +39,8 @@ import db
 
 router = Router()
 
-MAIL_DAILY_LIMIT = int(os.getenv("MAIL_DAILY_LIMIT", "15"))
-MAIL_DEDUP_DAYS = int(os.getenv("MAIL_DEDUP_DAYS", "14"))
+MAIL_DAILY_LIMIT = int(os.getenv("MAIL_DAILY_LIMIT", "100"))          # писем в день с одного клиента
+MAIL_PER_EMPLOYER_DAY = int(os.getenv("MAIL_PER_EMPLOYER_DAY", "4"))  # писем в день одному работодателю от клиента
 COVER_MODEL = os.getenv("COVER_MODEL", "claude-haiku-4-5-20251001")
 
 # заполняется из main.py через setup(), чтобы не было циклического импорта
@@ -140,6 +141,10 @@ def init_tables():
             UNIQUE(client_id, vacancy_id)
         )
     """)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(mail_clients)")}
+    for col, ddl in (("subject_tpl", "TEXT"), ("letter_tpl", "TEXT"), ("auto_send", "INTEGER DEFAULT 0")):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE mail_clients ADD COLUMN {col} {ddl}")
     conn.commit()
     conn.close()
 
@@ -205,11 +210,12 @@ def app_exists(client_id: int, vacancy_id: int) -> bool:
                    (client_id, vacancy_id), one=True))
 
 
-def recently_sent_to(client_id: int, to_email: str) -> bool:
-    since = (datetime.now() - timedelta(days=MAIL_DEDUP_DAYS)).isoformat()
-    return bool(_q(
-        """SELECT 1 FROM mail_applications WHERE client_id = ? AND lower(to_email) = lower(?)
-           AND status = 'sent' AND sent_at > ?""", (client_id, to_email, since), one=True))
+def employer_limit_reached(client_id: int, to_email: str) -> bool:
+    today = datetime.now().strftime("%Y-%m-%d")
+    row = _q("""SELECT COUNT(*) AS n FROM mail_applications WHERE client_id = ?
+                AND lower(to_email) = lower(?) AND status = 'sent' AND sent_at LIKE ?""",
+             (client_id, to_email, today + "%"), one=True)
+    return row["n"] >= MAIL_PER_EMPLOYER_DAY
 
 
 def sent_today(client_id: int) -> int:
@@ -314,8 +320,8 @@ async def build_message(bot: Bot, client, to_email: str, subject: str, body: str
         buf = io.BytesIO()
         await bot.download(client["cv_file_id"], destination=buf)
         filename = client["cv_filename"] or "CV.pdf"
-        maintype, subtype = ("application", "pdf") if filename.lower().endswith(".pdf") \
-            else ("application", "octet-stream")
+        mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        maintype, subtype = mime.split("/", 1)
         msg.add_attachment(buf.getvalue(), maintype=maintype, subtype=subtype, filename=filename)
     return msg
 
@@ -392,9 +398,46 @@ CANDIDATE SUMMARY:
         return _fallback_letter(fields, client)
 
 
+PLACEHOLDERS_HELP = ("Можно вставлять метки, бот подставит их из вакансии: "
+                     "<code>{position}</code> — должность, <code>{vessel}</code> — судно, "
+                     "<code>{region}</code> — регион, <code>{name}</code> — имя клиента.")
+
+
+def fill_tpl(text: str, fields: dict, client) -> str:
+    position = re.sub(r"\s+", " ", (fields.get("position") or "")).strip() \
+        or _tag_labels.get(fields.get("position_tag"), "the advertised position")
+    values = {
+        "{position}": position[:70],
+        "{vessel}": (fields.get("vessel") or "").strip(),
+        "{region}": (fields.get("region") or "").strip(),
+        "{name}": client["full_name"],
+    }
+    for k, v in values.items():
+        text = text.replace(k, v)
+    if "\n" not in text:
+        # тема: если метка пустая, убираем лишний разделитель " –  – "
+        text = " – ".join(p.strip() for p in re.split(r"\s[–-](?=\s|$)", text) if p.strip())
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
+def with_signature(body: str, client) -> str:
+    if client["full_name"].lower() in body.lower():
+        return body
+    has_closing = re.search(r"(regards|sincerely|faithfully|respectfully|thank you)[\s,.!]*$", body, re.I)
+    sig = signature(client)
+    if has_closing:
+        sig = sig.split("\n", 1)[1]  # без "Kind regards," — прощание уже есть в тексте
+        return body.rstrip() + ",\n" + sig if not body.rstrip().endswith(",") else body.rstrip() + "\n" + sig
+    return body + "\n\n" + sig
+
+
 async def compose(fields: dict, client) -> tuple[str, str]:
+    subject = fill_tpl(client["subject_tpl"], fields, client) if client["subject_tpl"] \
+        else make_subject(fields, client)
+    if client["letter_tpl"]:
+        return subject, with_signature(fill_tpl(client["letter_tpl"], fields, client), client)
     letter = await asyncio.to_thread(_compose_letter_sync, fields, client)
-    return make_subject(fields, client), letter + "\n\n" + signature(client)
+    return subject, letter + "\n\n" + signature(client)
 
 
 def _summarize_cv_sync(pdf_bytes: bytes) -> str | None:
@@ -479,7 +522,9 @@ async def propose_for_vacancy(bot: Bot, vacancy_id: int, only_client_id: int | N
     for client in candidates:
         if app_exists(client["id"], vacancy_id):
             continue
-        if recently_sent_to(client["id"], to_email):
+        if employer_limit_reached(client["id"], to_email):
+            await _notify_admins(bot, f"⚠️ {html.escape(client['full_name'])}: на {html.escape(to_email)} уже "
+                                      f"{MAIL_PER_EMPLOYER_DAY} письма сегодня, вакансия #{vacancy_id} пропущена.")
             continue
         if sent_today(client["id"]) >= MAIL_DAILY_LIMIT:
             await _notify_admins(bot, f"⚠️ {html.escape(client['full_name'])}: дневной лимит "
@@ -487,9 +532,42 @@ async def propose_for_vacancy(bot: Bot, vacancy_id: int, only_client_id: int | N
             continue
         subject, body = await compose(fields, client)
         app_id = insert_app(client["id"], vacancy_id, to_email, subject, body)
-        await _notify_admins(bot, draft_text(get_app(app_id), client), draft_keyboard(app_id))
+        if client["auto_send"]:
+            ok, err = await send_app(bot, app_id)
+            if ok:
+                await _notify_admins(bot, draft_text(get_app(app_id), client)
+                                     + "\n\n✅ <b>Отправлено автоматически</b>")
+            else:
+                await _notify_admins(bot, draft_text(get_app(app_id), client)
+                                     + f"\n\n❌ Автоотправка не удалась: {html.escape(err)}",
+                                     draft_keyboard(app_id))
+        else:
+            await _notify_admins(bot, draft_text(get_app(app_id), client), draft_keyboard(app_id))
         created += 1
     return created
+
+
+async def send_app(bot: Bot, app_id: int) -> tuple[bool, str]:
+    app = get_app(app_id)
+    client = get_client(app["client_id"]) if app else None
+    if not client:
+        return False, "клиент удалён"
+    if sent_today(client["id"]) >= MAIL_DAILY_LIMIT:
+        set_app(app_id, status="failed", error="дневной лимит")
+        return False, f"дневной лимит {MAIL_DAILY_LIMIT} писем исчерпан"
+    if employer_limit_reached(client["id"], app["to_email"]):
+        set_app(app_id, status="failed", error="лимит на работодателя")
+        return False, f"на {app['to_email']} уже {MAIL_PER_EMPLOYER_DAY} письма сегодня"
+    set_app(app_id, status="sending")
+    try:
+        msg = await build_message(bot, client, app["to_email"], app["subject"], app["body"])
+        await asyncio.to_thread(_smtp_send, client, msg)
+    except Exception as e:
+        err = _friendly_smtp_error(e)
+        set_app(app_id, status="failed", error=err)
+        return False, err
+    set_app(app_id, status="sent", sent_at=datetime.now().isoformat(), error=None)
+    return True, ""
 
 
 @router.callback_query(F.data.startswith("ea_send:"))
@@ -503,20 +581,12 @@ async def cb_send(callback: CallbackQuery):
     client = get_client(app["client_id"])
     if not client:
         return await callback.answer("Клиент удалён", show_alert=True)
-    if sent_today(client["id"]) >= MAIL_DAILY_LIMIT:
-        return await callback.answer(f"Дневной лимит {MAIL_DAILY_LIMIT} писем исчерпан", show_alert=True)
-    set_app(app_id, status="sending")
     await callback.answer("Отправляю…")
-    try:
-        msg = await build_message(callback.bot, client, app["to_email"], app["subject"], app["body"])
-        await asyncio.to_thread(_smtp_send, client, msg)
-    except Exception as e:
-        err = _friendly_smtp_error(e)
-        set_app(app_id, status="failed", error=err)
+    ok, err = await send_app(callback.bot, app_id)
+    if not ok:
         await callback.message.answer(f"❌ Не отправлено ({html.escape(client['full_name'])}): {html.escape(err)}\n"
                                       f"Можно нажать ✅ Send ещё раз после исправления.")
         return
-    set_app(app_id, status="sent", sent_at=datetime.now().isoformat(), error=None)
     try:
         await callback.message.edit_text(draft_text(get_app(app_id), client) + "\n\n✅ <b>Отправлено</b>")
     except Exception:
@@ -593,6 +663,16 @@ class AddClient(StatesGroup):
     cv = State()
 
 
+class ClientSetup(StatesGroup):
+    subject = State()
+    letter = State()
+    auto = State()
+
+
+class ClientLetter(StatesGroup):
+    letter = State()
+
+
 class ClientCV(StatesGroup):
     cv = State()
 
@@ -633,7 +713,7 @@ async def cmd_add_client(message: Message, state: FSMContext):
     await message.answer(
         "Новый клиент для отклика по email.\n"
         "⚠️ Заводите только тех моряков, кто сам дал доступ к почте и согласен на отклики от своего имени.\n\n"
-        "1/6. Имя и фамилия (латиницей, как в CV):\n/cancel — отмена"
+        "1/9. Имя и фамилия (латиницей, как в CV):\n/cancel — отмена"
     )
 
 
@@ -641,7 +721,7 @@ async def cmd_add_client(message: Message, state: FSMContext):
 async def ac_name(message: Message, state: FSMContext):
     await state.update_data(full_name=message.text.strip())
     await state.set_state(AddClient.email)
-    await message.answer("2/6. Email клиента (с него будут уходить письма):")
+    await message.answer("2/9. Email клиента (с него будут уходить письма):")
 
 
 @router.message(StateFilter(AddClient.email), F.text & ~F.text.startswith("/"))
@@ -653,7 +733,7 @@ async def ac_email(message: Message, state: FSMContext):
     await state.update_data(email=email)
     await state.set_state(AddClient.password)
     await message.answer(
-        f"3/6. Пароль приложения для этой почты (сервер {host}).\n\n"
+        f"3/9. Пароль приложения для этой почты (сервер {host}).\n\n"
         "Gmail: myaccount.google.com → Безопасность → Двухэтапная проверка (включить) → "
         "Пароли приложений → создать → 16 символов.\n"
         "Сообщение с паролем я сразу удалю из чата, в базе он хранится зашифрованным."
@@ -678,7 +758,7 @@ async def ac_password(message: Message, state: FSMContext):
     await state.update_data(password=password)
     await state.set_state(AddClient.positions)
     await status.edit_text(
-        "✅ Вход в почту работает.\n\n4/6. Должности через запятую (теги как в канале):\n" + _tags_hint()
+        "✅ Вход в почту работает.\n\n4/9. Должности через запятую (теги как в канале):\n" + _tags_hint()
     )
 
 
@@ -690,7 +770,7 @@ async def ac_positions(message: Message, state: FSMContext):
             f"Не узнал: {html.escape(', '.join(bad) or '—')}. Пришлите ещё раз. Доступные:\n" + _tags_hint())
     await state.update_data(positions=ok)
     await state.set_state(AddClient.phone)
-    await message.answer("5/6. Телефон/WhatsApp для подписи письма (или «-», если не нужен):")
+    await message.answer("5/9. Телефон/WhatsApp для подписи письма (или «-», если не нужен):")
 
 
 @router.message(StateFilter(AddClient.phone), F.text & ~F.text.startswith("/"))
@@ -698,7 +778,7 @@ async def ac_phone(message: Message, state: FSMContext):
     phone = message.text.strip()
     await state.update_data(phone="" if phone == "-" else phone)
     await state.set_state(AddClient.cv)
-    await message.answer("6/6. Пришлите CV файлом (лучше PDF):")
+    await message.answer("6/9. Пришлите CV файлом (лучше PDF):")
 
 
 @router.message(StateFilter(AddClient.cv), F.document)
@@ -719,9 +799,58 @@ async def ac_cv(message: Message, state: FSMContext):
         tail = (f"CV прочитать не удалось — напишите пару строк о клиенте: "
                 f"<code>/clientabout {client_id} Chief Officer, 8 years DP2 PSV, DPO unlimited, BOSIET…</code>")
     await status.edit_text(
-        f"✅ Клиент #{client_id} {html.escape(data['full_name'])} добавлен.\n"
-        f"Должности: {', '.join(data['positions'])}\n\n{tail}\n\n"
-        f"Проверить отправку: <code>/testmail {client_id}</code>"
+        f"✅ Клиент #{client_id} {html.escape(data['full_name'])} сохранён.\n"
+        f"Должности: {', '.join(data['positions'])}\n\n{tail}"
+    )
+    await state.set_state(ClientSetup.subject)
+    await state.update_data(client_id=client_id)
+    await message.answer(
+        "7/9. <b>Тема письма</b> — один раз, дальше бот берёт её для каждой вакансии.\n"
+        + PLACEHOLDERS_HELP +
+        "\n\nПример: <code>Application for {position} – {name}</code>\n"
+        "Отправьте «-», чтобы бот составлял тему сам."
+    )
+
+
+@router.message(StateFilter(ClientSetup.subject), F.text & ~F.text.startswith("/"))
+async def cs_subject(message: Message, state: FSMContext):
+    data = await state.get_data()
+    text = message.text.strip()
+    update_client(data["client_id"], subject_tpl=None if text == "-" else text)
+    await state.set_state(ClientSetup.letter)
+    await message.answer(
+        "8/9. <b>Cover letter</b> — пришлите текст письма целиком одним сообщением.\n"
+        + PLACEHOLDERS_HELP +
+        "\nЕсли в тексте нет имени клиента, бот сам добавит подпись (имя, телефон, email).\n\n"
+        "Отправьте «-», чтобы Claude писал письмо под каждую вакансию сам."
+    )
+
+
+@router.message(StateFilter(ClientSetup.letter), F.text & ~F.text.startswith("/"))
+async def cs_letter(message: Message, state: FSMContext):
+    data = await state.get_data()
+    text = message.text.strip()
+    update_client(data["client_id"], letter_tpl=None if text == "-" else text)
+    await state.set_state(ClientSetup.auto)
+    await message.answer(
+        "9/9. <b>Отправлять автоматически?</b>\n"
+        "«да» — письмо уходит само, как только выходит подходящая вакансия с email, "
+        "а вам приходит уведомление, что отправлено.\n"
+        "«нет» — сначала черновик с кнопкой ✅ Send."
+    )
+
+
+@router.message(StateFilter(ClientSetup.auto), F.text & ~F.text.startswith("/"))
+async def cs_auto(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    auto = message.text.strip().lower() in ("да", "yes", "y", "д", "+", "on")
+    update_client(data["client_id"], auto_send=1 if auto else 0)
+    cid = data["client_id"]
+    await message.answer(
+        f"✅ Готово. Клиент #{cid}: {'автоотправка 🤖' if auto else 'через подтверждение ✋'}.\n\n"
+        f"Посмотреть настройки: <code>/clientshow {cid}</code>\n"
+        f"Проверить отправку: <code>/testmail {cid}</code>"
     )
 
 
@@ -748,7 +877,7 @@ async def cmd_clients(message: Message):
         return await message.answer("Клиентов пока нет. /addclient — добавить.")
     lines = ["<b>Клиенты (отклик по email):</b>"]
     for c in rows:
-        flag = "🟢" if c["active"] else "⏸"
+        flag = ("🟢" if c["active"] else "⏸") + ("🤖" if c["auto_send"] else "✋")
         lines.append(f"{flag} #{c['id']} {html.escape(c['full_name'])} — {html.escape(c['email'])}\n"
                      f"    {c['positions']} · сегодня {sent_today(c['id'])}/{MAIL_DAILY_LIMIT}")
     lines.append("\n/mailhelp — все команды")
@@ -763,6 +892,10 @@ async def cmd_mail_help(message: Message):
         "<b>Отклик по email с почты клиента</b>\n\n"
         "/addclient — добавить клиента\n"
         "/clients — список\n"
+        "/clientshow ID — посмотреть тему, письмо и режим\n"
+        "/clientsubject ID текст — тема письма (шаблон)\n"
+        "/clientletter ID — cover letter (шаблон, потом прислать текст)\n"
+        "/clientauto ID on|off — автоотправка вкл/выкл\n"
         "/clientpos ID теги — сменить должности\n"
         "/clientabout ID текст — выжимка для cover letter\n"
         "/clientphone ID телефон\n"
@@ -774,8 +907,79 @@ async def cmd_mail_help(message: Message):
         "/testmail ID — тестовое письмо клиенту на его же почту\n"
         "/applyto VACANCY_ID [CLIENT_ID] — сделать черновик для уже опубликованной вакансии\n"
         "/mailsent — последние отправки\n\n"
-        f"Лимиты: {MAIL_DAILY_LIMIT} писем в день на клиента, одному адресу не чаще раза в {MAIL_DEDUP_DAYS} дн."
+        f"Лимиты: {MAIL_DAILY_LIMIT} писем в день на клиента, одному работодателю до {MAIL_PER_EMPLOYER_DAY} в день, "
+        "на одну вакансию — одно письмо."
     )
+
+
+@router.message(Command("clientshow"))
+async def cmd_client_show(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    client, _ = _client_arg(command)
+    if not client:
+        return await message.answer("Формат: /clientshow ID")
+    e = html.escape
+    demo = {"position": "Chief Officer", "vessel": "DP2 PSV", "region": "North Sea", "position_tag": ""}
+    subject, body = (fill_tpl(client["subject_tpl"], demo, client) if client["subject_tpl"]
+                     else "(бот составляет сам)"), None
+    if client["letter_tpl"]:
+        body = with_signature(fill_tpl(client["letter_tpl"], demo, client), client)
+    await message.answer(
+        f"<b>#{client['id']} {e(client['full_name'])}</b> — {e(client['email'])}\n"
+        f"Должности: {e(client['positions'] or '')}\n"
+        f"Режим: {'автоотправка 🤖' if client['auto_send'] else 'через подтверждение ✋'} · "
+        f"{'включён 🟢' if client['active'] else 'на паузе ⏸'}\n"
+        f"CV: {e(client['cv_filename'] or '—')}\n\n"
+        f"<b>Тема</b> (пример для Chief Officer, DP2 PSV):\n{e(subject)}\n\n"
+        f"<b>Письмо:</b>\n" + (f"<pre>{e(body[:3000])}</pre>" if body else "(Claude пишет под каждую вакансию)")
+    )
+
+
+@router.message(Command("clientsubject"))
+async def cmd_client_subject(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    client, rest = _client_arg(command)
+    if not client or not rest.strip():
+        return await message.answer("Формат: /clientsubject ID Application for {position} – {name}\n"
+                                    "«-» вместо текста — бот составляет тему сам.\n" + PLACEHOLDERS_HELP)
+    update_client(client["id"], subject_tpl=None if rest.strip() == "-" else rest.strip())
+    await message.answer("✅ Тема сохранена. Проверить: /clientshow " + str(client["id"]))
+
+
+@router.message(Command("clientletter"))
+async def cmd_client_letter(message: Message, command: CommandObject, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    client, _ = _client_arg(command)
+    if not client:
+        return await message.answer("Формат: /clientletter ID — потом пришлите текст письма")
+    await state.set_state(ClientLetter.letter)
+    await state.update_data(client_id=client["id"])
+    await message.answer("Пришлите текст cover letter одним сообщением. «-» — пусть пишет Claude.\n"
+                         + PLACEHOLDERS_HELP + "\n/cancel — отмена")
+
+
+@router.message(StateFilter(ClientLetter.letter), F.text & ~F.text.startswith("/"))
+async def on_client_letter(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    text = message.text.strip()
+    update_client(data["client_id"], letter_tpl=None if text == "-" else text)
+    await message.answer("✅ Письмо сохранено. Проверить: /clientshow " + str(data["client_id"]))
+
+
+@router.message(Command("clientauto"))
+async def cmd_client_auto(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    client, rest = _client_arg(command)
+    mode = rest.strip().lower()
+    if not client or mode not in ("on", "off"):
+        return await message.answer("Формат: /clientauto ID on — автоотправка, /clientauto ID off — через подтверждение")
+    update_client(client["id"], auto_send=1 if mode == "on" else 0)
+    await message.answer(f"#{client['id']}: {'автоотправка 🤖' if mode == 'on' else 'через подтверждение ✋'}")
 
 
 @router.message(Command("clientpos"))
@@ -935,7 +1139,7 @@ async def cmd_apply_to(message: Message, command: CommandObject):
     n = await propose_for_vacancy(message.bot, vacancy_id, only_client_id=only)
     if not n:
         await message.answer("Черновиков нет: в вакансии нет email, нет подходящих клиентов, "
-                             "либо этому адресу уже писали / лимит исчерпан.")
+                             "либо лимит на сегодня исчерпан.")
 
 
 @router.message(Command("mailsent"))
