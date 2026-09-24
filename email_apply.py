@@ -21,6 +21,7 @@ import io
 import os
 import re
 import smtplib
+import socket
 import ssl
 from datetime import datetime, timedelta
 from email.message import EmailMessage
@@ -235,12 +236,35 @@ def smtp_for(email: str) -> tuple[str, int]:
     return SMTP_PRESETS.get(domain, DEFAULT_SMTP)
 
 
+def _ipv4_socket(host: str, port: int, timeout, source_address=None):
+    # Railway по умолчанию не выпускает IPv6 наружу, а smtp.gmail.com отдаёт
+    # IPv6-адрес первым -> "Network is unreachable". Подключаемся строго по IPv4.
+    last_err = None
+    for *_, sockaddr in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+        try:
+            return socket.create_connection(sockaddr[:2], timeout, source_address)
+        except OSError as e:
+            last_err = e
+    raise last_err or OSError(f"нет IPv4-адреса для {host}")
+
+
+class _SMTP4(smtplib.SMTP):
+    def _get_socket(self, host, port, timeout):
+        return _ipv4_socket(host, port, timeout, self.source_address)
+
+
+class _SMTP4_SSL(smtplib.SMTP_SSL):
+    def _get_socket(self, host, port, timeout):
+        sock = _ipv4_socket(host, port, timeout, self.source_address)
+        return self.context.wrap_socket(sock, server_hostname=self._host)
+
+
 def _smtp_connect(host: str, port: int, user: str, password: str):
     ctx = ssl.create_default_context()
     if port == 465:
-        s = smtplib.SMTP_SSL(host, port, context=ctx, timeout=30)
+        s = _SMTP4_SSL(host, port, context=ctx, timeout=30)
     else:
-        s = smtplib.SMTP(host, port, timeout=30)
+        s = _SMTP4(host, port, timeout=30)
         s.starttls(context=ctx)
     s.login(user, password)
     return s
@@ -267,6 +291,10 @@ def _smtp_check(host, port, user, password):
 
 def _friendly_smtp_error(e: Exception) -> str:
     text = str(e)
+    if isinstance(e, OSError) and not isinstance(e, smtplib.SMTPException):
+        return ("нет соединения с почтовым сервером — похоже, Railway всё ещё закрывает "
+                "почтовые порты (после перехода на Pro нужен Redeploy). "
+                f"Техническая ошибка: {type(e).__name__}: {text[:150]}")
     if isinstance(e, smtplib.SMTPAuthenticationError):
         return ("почта не приняла логин/пароль. Для Gmail нужен именно пароль приложения "
                 "(16 символов), а у аккаунта должна быть включена двухэтапная проверка. "
