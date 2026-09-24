@@ -10,14 +10,16 @@
   3. Админ жмёт ✅ Send — письмо уходит с почты самого клиента (SMTP).
      Ответ работодателя придёт прямо клиенту в его ящик.
 
-Защита: одно письмо на клиента на вакансию, одному работодателю не больше
-MAIL_PER_EMPLOYER_DAY (4) писем в день, не больше MAIL_DAILY_LIMIT (100) писем в день на клиента.
+Защита: одному HR — одно CV от клиента за всё время, не больше MAIL_DAILY_LIMIT (100)
+писем в день на клиента, между письмами с одного ящика пауза ~MAIL_SEND_INTERVAL сек.
 """
 import asyncio
 import base64
 import hashlib
 import html
 import io
+import random
+import time
 import mimetypes
 import os
 import re
@@ -37,11 +39,14 @@ from aiogram.types import (BotCommand, BotCommandScopeChat, CallbackQuery, Inlin
 from cryptography.fernet import Fernet, InvalidToken
 
 import db
+import ranks
 
 router = Router()
 
 MAIL_DAILY_LIMIT = int(os.getenv("MAIL_DAILY_LIMIT", "100"))          # писем в день с одного клиента
-MAIL_PER_EMPLOYER_DAY = int(os.getenv("MAIL_PER_EMPLOYER_DAY", "4"))  # писем в день одному работодателю от клиента
+MAIL_SEND_INTERVAL = int(os.getenv("MAIL_SEND_INTERVAL", "120"))     # сек. между письмами по умолчанию; у клиента можно 1-4 мин
+SEND_INTERVAL_CHOICES = [1, 2, 3, 4]                                 # минуты — кнопки в карточке клиента
+MAIL_VARY_LETTER = os.getenv("MAIL_VARY_LETTER", "on") == "on"       # слегка перефразировать cover letter каждый раз
 MAIL_BACKFILL_DAYS = int(os.getenv("MAIL_BACKFILL_DAYS", "4"))        # за сколько дней откликаться при заведении клиента
 COVER_MODEL = os.getenv("COVER_MODEL", "claude-haiku-4-5-20251001")
 
@@ -87,10 +92,7 @@ def is_admin(user_id: int) -> bool:
 
 
 ADMIN_MAIL_COMMANDS = [
-    ("mailhelp", "📧 Отклики по email — все команды"),
-    ("clients", "📧 Клиенты для откликов"),
-    ("addclient", "📧 Добавить клиента"),
-    ("mailsent", "📧 Последние отправки"),
+    ("mail", "📧 Рассылка резюме — меню"),
 ]
 
 
@@ -168,7 +170,8 @@ def init_tables():
         )
     """)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(mail_clients)")}
-    for col, ddl in (("subject_tpl", "TEXT"), ("letter_tpl", "TEXT"), ("auto_send", "INTEGER DEFAULT 0")):
+    for col, ddl in (("subject_tpl", "TEXT"), ("letter_tpl", "TEXT"), ("auto_send", "INTEGER DEFAULT 0"),
+                      ("send_interval", "INTEGER")):
         if col not in cols:
             conn.execute(f"ALTER TABLE mail_clients ADD COLUMN {col} {ddl}")
     conn.commit()
@@ -217,9 +220,26 @@ def delete_client(client_id: int):
     _q("DELETE FROM mail_clients WHERE id = ?", (client_id,), commit=True)
 
 
-def clients_for_tag(tag: str):
+# ---------------------------------------------------------------- подбор вакансий
+# Правила общие с основным ботом — см. ranks.py
+
+def client_match_tags(client) -> set[str]:
+    return ranks.expand((client["positions"] or "").split(","))
+
+
+def client_matches(client, fields: dict) -> bool:
+    return ranks.matches((client["positions"] or "").split(","), fields)
+
+
+def clients_for_vacancy(fields: dict):
     rows = _q("SELECT * FROM mail_clients WHERE active = 1")
-    return [r for r in rows if tag in (r["positions"] or "").split(",")]
+    return [r for r in rows if client_matches(r, fields)]
+
+
+def matched_labels(client) -> str:
+    order = [t for _, items in POSITION_GROUPS for t, _ in items]
+    tags = sorted(client_match_tags(client), key=lambda t: order.index(t) if t in order else 999)
+    return ", ".join(dict.fromkeys(ranks.EXTRA_LABELS.get(t) or _pos_label(t) for t in tags))
 
 
 def get_app(app_id: int):
@@ -236,12 +256,14 @@ def app_exists(client_id: int, vacancy_id: int) -> bool:
                    (client_id, vacancy_id), one=True))
 
 
-def employer_limit_reached(client_id: int, to_email: str) -> bool:
-    today = datetime.now().strftime("%Y-%m-%d")
-    row = _q("""SELECT COUNT(*) AS n FROM mail_applications WHERE client_id = ?
-                AND lower(to_email) = lower(?) AND status = 'sent' AND sent_at LIKE ?""",
-             (client_id, to_email, today + "%"), one=True)
-    return row["n"] >= MAIL_PER_EMPLOYER_DAY
+def already_applied_to(client_id: int, to_email: str, exclude_app_id: int | None = None,
+                       statuses=("draft", "sending", "sent")) -> bool:
+    """Одному HR — одно CV от клиента за всё время (плюс не плодим черновики на тот же адрес)."""
+    marks = ",".join("?" * len(statuses))
+    return bool(_q(
+        f"""SELECT 1 FROM mail_applications WHERE client_id = ? AND lower(to_email) = lower(?)
+            AND status IN ({marks}) AND id != ?""",
+        (client_id, to_email, *statuses, exclude_app_id or -1), one=True))
 
 
 def sent_today(client_id: int) -> int:
@@ -457,11 +479,32 @@ def with_signature(body: str, client) -> str:
     return body + "\n\n" + sig
 
 
+def _vary_letter_sync(text: str) -> str:
+    if not (_claude and MAIL_VARY_LETTER):
+        return text
+    prompt = ("Lightly rephrase this job-application cover letter so it is not word-for-word identical "
+              "to previous copies. Change some wording and sentence order only. Keep EVERY fact, rank, "
+              "certificate, visa, vessel type, name and the meaning exactly; do not add anything new; keep the "
+              "same greeting, sign-off and roughly the same length. Plain text. Output only the letter.\n\n"
+              + text)
+    try:
+        resp = _claude.messages.create(model=COVER_MODEL, max_tokens=1200, temperature=0.9,
+                                       messages=[{"role": "user", "content": prompt}])
+        out = resp.content[0].text.strip()
+        if 0.7 * len(text) <= len(out) <= 1.4 * len(text):
+            return out
+    except Exception as e:
+        print(f"[email_apply] перефразирование не удалось: {e}")
+    return text
+
+
 async def compose(fields: dict, client) -> tuple[str, str]:
     subject = fill_tpl(client["subject_tpl"], fields, client) if client["subject_tpl"] \
         else make_subject(fields, client)
     if client["letter_tpl"]:
-        return subject, with_signature(fill_tpl(client["letter_tpl"], fields, client), client)
+        letter = fill_tpl(client["letter_tpl"], fields, client)
+        letter = await asyncio.to_thread(_vary_letter_sync, letter)
+        return subject, with_signature(letter, client)
     letter = await asyncio.to_thread(_compose_letter_sync, fields, client)
     return subject, letter + "\n\n" + signature(client)
 
@@ -527,7 +570,8 @@ async def _notify_admins(bot: Bot, text: str, markup=None):
             print(f"[email_apply] не удалось написать админу {admin_id}: {e}")
 
 
-async def propose_for_vacancy(bot: Bot, vacancy_id: int, only_client_id: int | None = None) -> int:
+async def propose_for_vacancy(bot: Bot, vacancy_id: int, only_client_id: int | None = None,
+                              quiet: bool = False, fields_override: dict | None = None) -> list[int]:
     """Создаёт черновики писем для всех подходящих клиентов. Возвращает их число."""
     row = db.get_vacancy(vacancy_id)
     if not row:
@@ -535,42 +579,47 @@ async def propose_for_vacancy(bot: Bot, vacancy_id: int, only_client_id: int | N
     fields = dict(row)
     m = EMAIL_RE.search(fields.get("contact") or "")
     if not m:
-        return 0
+        return []
     to_email = m.group(0).rstrip(".")
     tag = fields.get("position_tag")
     if only_client_id:
         c = get_client(only_client_id)
         candidates = [c] if c else []
     else:
-        candidates = clients_for_tag(tag) if tag else []
+        candidates = clients_for_vacancy(fields)
 
-    created = 0
+    if fields_override:
+        fields.update(fields_override)
+    created: list[int] = []
     for client in candidates:
-        if app_exists(client["id"], vacancy_id):
-            continue
-        if employer_limit_reached(client["id"], to_email):
-            await _notify_admins(bot, f"⚠️ {html.escape(client['full_name'])}: на {html.escape(to_email)} уже "
-                                      f"{MAIL_PER_EMPLOYER_DAY} письма сегодня, вакансия #{vacancy_id} пропущена.")
-            continue
-        if sent_today(client["id"]) >= MAIL_DAILY_LIMIT:
-            await _notify_admins(bot, f"⚠️ {html.escape(client['full_name'])}: дневной лимит "
-                                      f"{MAIL_DAILY_LIMIT} писем исчерпан, вакансия #{vacancy_id} пропущена.")
-            continue
+        if app_exists(client["id"], vacancy_id) or already_applied_to(client["id"], to_email):
+            continue  # этому HR этот клиент уже писал (или черновик уже ждёт)
         subject, body = await compose(fields, client)
         app_id = insert_app(client["id"], vacancy_id, to_email, subject, body)
+        created.append(app_id)
         if client["auto_send"]:
-            ok, err = await send_app(bot, app_id)
-            if ok:
-                await _notify_admins(bot, draft_text(get_app(app_id), client)
-                                     + "\n\n✅ <b>Отправлено автоматически</b>")
-            else:
-                await _notify_admins(bot, draft_text(get_app(app_id), client)
-                                     + f"\n\n❌ Автоотправка не удалась: {html.escape(err)}",
-                                     draft_keyboard(app_id))
-        else:
+            asyncio.create_task(_auto_send_and_notify(bot, app_id, quiet))
+        elif not quiet:
             await _notify_admins(bot, draft_text(get_app(app_id), client), draft_keyboard(app_id))
-        created += 1
     return created
+
+
+async def _auto_send_and_notify(bot: Bot, app_id: int, quiet: bool = False):
+    ok, err = await send_app(bot, app_id)
+    app = get_app(app_id)
+    client = get_client(app["client_id"]) if app else None
+    if not client:
+        return
+    if ok and not quiet:
+        await _notify_admins(bot, draft_text(app, client) + "\n\n✅ <b>Отправлено автоматически</b>")
+    elif not ok and app["status"] != "skipped":
+        await _notify_admins(bot, draft_text(app, client)
+                             + f"\n\n❌ Автоотправка не удалась: {html.escape(err)}", draft_keyboard(app_id))
+
+
+# один ящик — одно письмо за раз, с паузой между письмами, чтобы Gmail не счёл это рассылкой
+_client_locks: dict[int, asyncio.Lock] = {}
+_client_last_send: dict[int, float] = {}
 
 
 async def send_app(bot: Bot, app_id: int) -> tuple[bool, str]:
@@ -581,19 +630,75 @@ async def send_app(bot: Bot, app_id: int) -> tuple[bool, str]:
     if sent_today(client["id"]) >= MAIL_DAILY_LIMIT:
         set_app(app_id, status="failed", error="дневной лимит")
         return False, f"дневной лимит {MAIL_DAILY_LIMIT} писем исчерпан"
-    if employer_limit_reached(client["id"], app["to_email"]):
-        set_app(app_id, status="failed", error="лимит на работодателя")
-        return False, f"на {app['to_email']} уже {MAIL_PER_EMPLOYER_DAY} письма сегодня"
-    set_app(app_id, status="sending")
+    lock = _client_locks.setdefault(client["id"], asyncio.Lock())
+    async with lock:
+        app = get_app(app_id)
+        if app["status"] == "sent":
+            return True, ""
+        if already_applied_to(client["id"], app["to_email"], exclude_app_id=app_id, statuses=("sent",)):
+            set_app(app_id, status="skipped", error="этому HR уже отправляли")
+            return False, f"на {app['to_email']} CV уже отправлялось"
+        if sent_today(client["id"]) >= MAIL_DAILY_LIMIT:
+            set_app(app_id, status="failed", error="дневной лимит")
+            return False, f"дневной лимит {MAIL_DAILY_LIMIT} писем исчерпан"
+        # пауза клиента ±15%, чтобы письма не уходили как по часам
+        wait = _client_last_send.get(client["id"], 0) + client_interval(client) * random.uniform(0.85, 1.15) \
+            - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        set_app(app_id, status="sending")
+        try:
+            msg = await build_message(bot, client, app["to_email"], app["subject"], app["body"])
+            await asyncio.to_thread(_smtp_send, client, msg)
+        except Exception as e:
+            err = _friendly_smtp_error(e)
+            set_app(app_id, status="failed", error=err)
+            return False, err
+        finally:
+            _client_last_send[client["id"]] = time.monotonic()
+        set_app(app_id, status="sent", sent_at=datetime.now().isoformat(), error=None)
+        return True, ""
+
+
+def client_interval(client) -> int:
+    """Пауза между письмами клиента в секундах."""
     try:
-        msg = await build_message(bot, client, app["to_email"], app["subject"], app["body"])
-        await asyncio.to_thread(_smtp_send, client, msg)
-    except Exception as e:
-        err = _friendly_smtp_error(e)
-        set_app(app_id, status="failed", error=err)
-        return False, err
-    set_app(app_id, status="sent", sent_at=datetime.now().isoformat(), error=None)
-    return True, ""
+        v = client["send_interval"]
+    except (IndexError, KeyError):
+        v = None
+    return int(v) if v else MAIL_SEND_INTERVAL
+
+
+def _eta_min(client, n: int) -> int:
+    return max(1, round(n * client_interval(client) / 60))
+
+
+def pending_drafts(client_id: int):
+    return _q("SELECT id FROM mail_applications WHERE client_id = ? AND status IN ('draft', 'failed') "
+              "AND (error IS NULL OR error NOT LIKE 'этому HR%') ORDER BY id", (client_id,))
+
+
+def summary_keyboard(client_id: int, n: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Отправить все ({n})", callback_data=f"ea_sendall:{client_id}")],
+        [InlineKeyboardButton(text="📋 Показать по одному", callback_data=f"ea_list:{client_id}"),
+         InlineKeyboardButton(text="🗑 Отменить все", callback_data=f"ea_skipall:{client_id}")],
+    ])
+
+
+async def _report_batch(bot: Bot, client, title: str, app_ids: list[int]):
+    if not app_ids:
+        return await _notify_admins(bot, f"📬 {html.escape(client['full_name'])}: {title} — новых адресов нет "
+                                         f"(этим HR уже писали или в вакансиях нет email).")
+    if client["auto_send"]:
+        mins = _eta_min(client, len(app_ids))
+        await _notify_admins(bot, f"📬 {html.escape(client['full_name'])}: {title} — {len(app_ids)} писем "
+                                  f"поставлено в очередь 🤖. Уходят по одному раз в ~{max(1, client_interval(client) // 60)} мин., "
+                                  f"займёт ~{mins} мин. "
+                                  f"Итог: /mailsent")
+    else:
+        await _notify_admins(bot, f"📬 {html.escape(client['full_name'])}: {title} — готово {len(app_ids)} писем, "
+                                  f"ждут подтверждения ✋.", summary_keyboard(client["id"], len(app_ids)))
 
 
 async def backfill_client(bot: Bot, client_id: int, days: int = MAIL_BACKFILL_DAYS):
@@ -601,26 +706,53 @@ async def backfill_client(bot: Bot, client_id: int, days: int = MAIL_BACKFILL_DA
     client = get_client(client_id)
     if not client or not client["active"]:
         return
-    tags = [t for t in (client["positions"] or "").split(",") if t]
-    if not tags:
+    if not client["positions"]:
         return
     since = (datetime.now() - timedelta(days=days)).isoformat()
-    marks = ",".join("?" * len(tags))
-    rows = _q(f"""SELECT id FROM vacancies WHERE status = 'published' AND created_at > ?
-                  AND position_tag IN ({marks}) ORDER BY id""", (since, *tags))
-    before_sent = sent_today(client_id)
-    total = 0
+    rows = [r for r in _q("""SELECT * FROM vacancies WHERE status = 'published' AND created_at > ?
+                             AND contact LIKE '%@%' ORDER BY id""", (since,))
+            if client_matches(client, dict(r))]
+    app_ids: list[int] = []
     for r in rows:
         try:
-            total += await propose_for_vacancy(bot, r["id"], only_client_id=client_id)
+            app_ids += await propose_for_vacancy(bot, r["id"], only_client_id=client_id, quiet=True)
         except Exception as e:
             print(f"[email_apply] backfill вакансия {r['id']}: {e}")
-        await asyncio.sleep(1.5)  # не частим — и Gmail, и Telegram не любят пачки подряд
-    sent = sent_today(client_id) - before_sent
-    mode = "отправлено" if client["auto_send"] else "черновиков создано"
-    await _notify_admins(bot, f"📬 {html.escape(client['full_name'])}: вакансий за {days} дн. по его должностям — "
-                              f"{len(rows)}, новых откликов: {total} ({mode}: "
-                              f"{sent if client['auto_send'] else total}).")
+    await _report_batch(bot, client, f"вакансии за {days} дн. по его должностям ({len(rows)} шт.)", app_ids)
+
+
+async def blast_client(bot: Bot, client_id: int, days: int = 7):
+    """Рассылка CV клиента по всем HR-адресам из вакансий за `days` дней, независимо от должности."""
+    client = get_client(client_id)
+    if not client:
+        return
+    labels = [_pos_label(t) for t in (client["positions"] or "").split(",") if t]
+    general = {"position": " / ".join(labels) or "any suitable position", "vessel": "", "region": ""}
+    app_ids: list[int] = []
+    for vid, _email in blast_targets(client_id, days):
+        try:
+            app_ids += await propose_for_vacancy(bot, vid, only_client_id=client_id, quiet=True,
+                                                 fields_override=general)
+        except Exception as e:
+            print(f"[email_apply] blast вакансия {vid}: {e}")
+    await _report_batch(bot, client, f"рассылка по базе HR за {days} дн.", app_ids)
+
+
+def blast_targets(client_id: int, days: int) -> list[tuple[int, str]]:
+    since = (datetime.now() - timedelta(days=days)).isoformat()
+    rows = _q("SELECT id, contact FROM vacancies WHERE status = 'published' AND created_at > ? ORDER BY id DESC",
+              (since,))
+    seen, out = set(), []
+    for r in rows:
+        m = EMAIL_RE.search(r["contact"] or "")
+        if not m:
+            continue
+        email = m.group(0).rstrip(".").lower()
+        if email in seen or already_applied_to(client_id, email):
+            continue
+        seen.add(email)
+        out.append((r["id"], email))
+    return out
 
 
 def start_backfill(bot: Bot, client_id: int, days: int = MAIL_BACKFILL_DAYS):
@@ -927,8 +1059,9 @@ async def cb_pos_done(callback: CallbackQuery, state: FSMContext):
     if await state.get_state() == ClientPosEdit.pick.state:
         update_client(data["client_id"], positions=",".join(sel))
         await state.clear()
-        await callback.message.answer(f"✅ #{data['client_id']}: должности сохранены. Проверяю вакансии "
-                                      f"за {MAIL_BACKFILL_DAYS} дн. по новым должностям…")
+        await callback.message.answer(f"✅ Должности сохранены. Проверяю вакансии "
+                                      f"за {MAIL_BACKFILL_DAYS} дн. по новым должностям…",
+                                      reply_markup=back_kb(data["client_id"]))
         start_backfill(callback.bot, data["client_id"])
         return
     await state.update_data(positions=sel)
@@ -1034,7 +1167,9 @@ async def cb_auto(callback: CallbackQuery, state: FSMContext):
     update_client(cid, auto_send=1 if auto else 0)
     in_setup = await state.get_state() == ClientSetup.auto.state
     mode = "автоматически 🤖" if auto else "через кнопку ✋"
-    await callback.message.edit_text(f"Клиент #{cid}: подача {mode}.")
+    await callback.message.edit_text(f"Клиент #{cid}: подача {mode}.",
+                                     reply_markup=None if await state.get_state() == ClientSetup.auto.state
+                                     else back_kb(cid))
     await callback.answer()
     if in_setup:
         await state.clear()
@@ -1105,11 +1240,14 @@ async def cmd_mail_help(message: Message):
         "/clientoff ID · /clienton ID — пауза/включить\n"
         "/delclient ID — удалить\n"
         "/testmail ID — тестовое письмо клиенту на его же почту\n"
+        "/blast ID [дней] — разослать CV клиента по всем HR из вакансий за неделю (любые должности)\n"
+        "/drafts ID — черновики клиента, ждущие отправки\n"
+        "/sendall ID — отправить все черновики клиента\n"
         "/applyto VACANCY_ID [CLIENT_ID] — отклик на уже опубликованную вакансию\n"
         "/applyto last [CLIENT_ID] — на последнюю опубликованную\n"
         "/mailsent — последние отправки\n\n"
-        f"Лимиты: {MAIL_DAILY_LIMIT} писем в день на клиента, одному работодателю до {MAIL_PER_EMPLOYER_DAY} в день, "
-        "на одну вакансию — одно письмо."
+        f"Правила: одному HR — одно CV от клиента за всё время; до {MAIL_DAILY_LIMIT} писем в день; "
+        "пауза между письмами 1–4 мин. (настраивается в /mail → клиент → ⏱); cover letter каждый раз слегка перефразируется."
     )
 
 
@@ -1168,7 +1306,7 @@ async def on_client_letter(message: Message, state: FSMContext):
     await state.clear()
     text = message.text.strip()
     update_client(data["client_id"], letter_tpl=None if text == "-" else text)
-    await message.answer("✅ Письмо сохранено. Проверить: /clientshow " + str(data["client_id"]))
+    await message.answer("✅ Письмо сохранено.", reply_markup=back_kb(data["client_id"]))
 
 
 @router.message(Command("clientauto"))
@@ -1287,7 +1425,8 @@ async def on_client_cv(message: Message, state: FSMContext):
     about = await summarize_cv(message.bot, doc.file_id, filename)
     if about:
         update_client(data["client_id"], about=about)
-    await message.answer("✅ CV обновлён" + (f"\n<pre>{html.escape(about)}</pre>" if about else ""))
+    await message.answer("✅ CV обновлён" + (f"\n<pre>{html.escape(about)}</pre>" if about else ""),
+                         reply_markup=back_kb(data["client_id"]))
 
 
 @router.message(Command("clientpass"))
@@ -1317,7 +1456,7 @@ async def on_client_pass(message: Message, state: FSMContext):
         return await message.answer(f"❌ {html.escape(_friendly_smtp_error(e))}\nПришлите ещё раз или /cancel.")
     await state.clear()
     update_client(client["id"], enc_password=encrypt(password))
-    await message.answer("✅ Пароль обновлён, вход в почту работает.")
+    await message.answer("✅ Пароль обновлён, вход в почту работает.", reply_markup=back_kb(client["id"]))
 
 
 @router.message(Command("testmail"))
@@ -1328,15 +1467,145 @@ async def cmd_test_mail(message: Message, command: CommandObject):
     if not client:
         return await message.answer("Формат: /testmail ID")
     status = await message.answer("Отправляю тест…")
+    await status.edit_text(await run_test_mail(message.bot, client), reply_markup=back_kb(client["id"]))
+
+
+async def run_test_mail(bot: Bot, client) -> str:
     try:
         msg = await build_message(
-            message.bot, client, client["email"], "Test – OffshoreAtSea job applications",
+            bot, client, client["email"], "Test – OffshoreAtSea job applications",
             "This is a test message. If you see it with the CV attached, sending works.\n\n" + signature(client),
         )
         await asyncio.to_thread(_smtp_send, client, msg)
     except Exception as e:
-        return await status.edit_text(f"❌ {html.escape(_friendly_smtp_error(e))}")
-    await status.edit_text(f"✅ Тестовое письмо ушло на {html.escape(client['email'])} — проверьте ящик клиента.")
+        return f"❌ {html.escape(_friendly_smtp_error(e))}"
+    return f"✅ Тестовое письмо ушло на {html.escape(client['email'])} — проверьте ящик клиента."
+
+
+@router.callback_query(F.data.startswith("ea_sendall:"))
+async def cb_send_all(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    cid = int(callback.data.split(":")[1])
+    ids = [r["id"] for r in pending_drafts(cid)]
+    if not ids:
+        return await callback.answer("Черновиков нет", show_alert=True)
+    for aid in ids:
+        set_app(aid, status="draft", error=None)
+        asyncio.create_task(_auto_send_and_notify(callback.bot, aid, quiet=True))
+    client = get_client(cid)
+    mins = _eta_min(client, len(ids))
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(f"🚀 {len(ids)} писем поставлено в очередь, уходят по одному раз в "
+                                  f"~{client_interval(client) // 60} мин. (всего ~{mins} мин.). "
+                                  f"Итог: /mailsent")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ea_skipall:"))
+async def cb_skip_all(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    cid = int(callback.data.split(":")[1])
+    ids = [r["id"] for r in pending_drafts(cid)]
+    for aid in ids:
+        set_app(aid, status="skipped")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(f"🗑 Отменено черновиков: {len(ids)}")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ea_list:"))
+async def cb_list_drafts(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    await callback.answer()
+    await _show_drafts(callback.bot, callback.from_user.id, int(callback.data.split(":")[1]))
+
+
+async def _show_drafts(bot: Bot, chat_id: int, cid: int, limit: int = 15):
+    client = get_client(cid)
+    ids = [r["id"] for r in pending_drafts(cid)]
+    if not client or not ids:
+        return await bot.send_message(chat_id, "Черновиков нет.")
+    for aid in ids[:limit]:
+        await bot.send_message(chat_id, draft_text(get_app(aid), client), reply_markup=draft_keyboard(aid))
+        await asyncio.sleep(0.3)
+    if len(ids) > limit:
+        await bot.send_message(chat_id, f"…и ещё {len(ids) - limit}.", reply_markup=summary_keyboard(cid, len(ids)))
+
+
+@router.message(Command("drafts"))
+async def cmd_drafts(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    client, _ = _client_arg(command)
+    if not client:
+        return await message.answer("Формат: /drafts ID")
+    n = len(pending_drafts(client["id"]))
+    if not n:
+        return await message.answer("Черновиков нет.")
+    await message.answer(f"{html.escape(client['full_name'])}: черновиков {n}.", reply_markup=summary_keyboard(client["id"], n))
+
+
+@router.message(Command("sendall"))
+async def cmd_send_all(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    client, _ = _client_arg(command)
+    if not client:
+        return await message.answer("Формат: /sendall ID")
+    n = len(pending_drafts(client["id"]))
+    await message.answer(f"Отправить {n} черновиков?", reply_markup=summary_keyboard(client["id"], n))
+
+
+@router.message(Command("blast"))
+async def cmd_blast(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (command.args or "").split()
+    client = get_client(int(parts[0])) if parts and parts[0].isdigit() else None
+    if not client:
+        return await message.answer("Формат: /blast ID [дней] — по умолчанию 7")
+    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 7
+    text, kb = blast_prompt(client, days)
+    await message.answer(text, reply_markup=kb)
+
+
+def blast_prompt(client, days: int):
+    n = len(blast_targets(client["id"], days))
+    if not n:
+        return "Новых HR-адресов за этот период нет — всем уже отправляли.", back_kb(client["id"])
+    mode = "уйдут автоматически по одному 🤖" if client["auto_send"] else "придут на подтверждение ✋"
+    text = (f"🚀 <b>Рассылка по базе</b> — {html.escape(client['full_name'])}\n\n"
+            f"Найдено <b>{n}</b> HR-адресов из вакансий за {days} дн., которым его CV ещё не отправлялось "
+            f"(любые должности). Письма {mode}.\n"
+            f"Тема и письмо — по его шаблону, вместо {{position}} подставятся его должности.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🚀 Разослать ({n})", callback_data=f"ea_blast:{client['id']}:{days}")],
+        [InlineKeyboardButton(text="7 дней", callback_data=f"m:blast:{client['id']}:7"),
+         InlineKeyboardButton(text="14 дней", callback_data=f"m:blast:{client['id']}:14"),
+         InlineKeyboardButton(text="30 дней", callback_data=f"m:blast:{client['id']}:30")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"m:c:{client['id']}")],
+    ])
+    return text, kb
+
+
+@router.callback_query(F.data.startswith("ea_blast:"))
+async def cb_blast(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    _, cid, days = callback.data.split(":")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Готовлю письма…")
+    await callback.message.answer("Готовлю письма, итог пришлю отдельным сообщением…")
+    asyncio.create_task(blast_client(callback.bot, int(cid), int(days)))
+
+
+@router.callback_query(F.data == "ea_blastno")
+async def cb_blast_no(callback: CallbackQuery):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Отменено")
 
 
 @router.message(Command("backfill"))
@@ -1389,3 +1658,300 @@ async def cmd_mail_sent(message: Message):
              f"{html.escape(r['full_name'] or '?')} → {html.escape(r['to_email'])} (вак. #{r['vacancy_id']})"
              for r in rows]
     await message.answer("\n".join(lines))
+
+
+# ================================================================ МЕНЮ (кнопки)
+#
+# /mail → главное меню → клиент → карточка клиента со всеми действиями.
+# Все старые команды продолжают работать, меню — просто удобная обёртка над ними.
+
+def back_kb(client_id: int | None = None) -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton(text="🏠 Меню", callback_data="m:home")]
+    if client_id:
+        row.insert(0, InlineKeyboardButton(text="⬅️ К клиенту", callback_data=f"m:c:{client_id}"))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
+def _counts(client_id: int | None = None) -> dict:
+    where, params = ("WHERE client_id = ?", (client_id,)) if client_id else ("", ())
+    today = datetime.now().strftime("%Y-%m-%d")
+    rows = _q(f"SELECT status, sent_at FROM mail_applications {where}", params)
+    c = {"sent": 0, "today": 0, "draft": 0, "failed": 0}
+    for r in rows:
+        if r["status"] == "sent":
+            c["sent"] += 1
+            if (r["sent_at"] or "").startswith(today):
+                c["today"] += 1
+        elif r["status"] == "draft":
+            c["draft"] += 1
+        elif r["status"] == "failed":
+            c["failed"] += 1
+    return c
+
+
+def home_view():
+    clients = list_clients()
+    c = _counts()
+    text = (
+        "📧 <b>Рассылка резюме</b>\n\n"
+        f"👥 Клиентов: <b>{len(clients)}</b> · активных: {sum(1 for x in clients if x['active'])}\n"
+        f"📤 Отправлено сегодня: <b>{c['today']}</b> · всего: {c['sent']}\n"
+        f"📝 Ждут подтверждения: <b>{c['draft']}</b>"
+        + (f" · ❌ ошибок: {c['failed']}" if c["failed"] else "")
+        + "\n\nВыберите клиента или действие:"
+    )
+    rows = []
+    for x in clients:
+        cc = _counts(x["id"])
+        icon = ("🟢" if x["active"] else "⏸") + ("🤖" if x["auto_send"] else "✋")
+        extra = f" · 📝{cc['draft']}" if cc["draft"] else ""
+        rows.append([InlineKeyboardButton(text=f"{icon} {x['full_name']}{extra}", callback_data=f"m:c:{x['id']}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить клиента", callback_data="m:add")])
+    rows.append([InlineKeyboardButton(text="📜 Последние отправки", callback_data="m:hist:0"),
+                 InlineKeyboardButton(text="❓ Как это работает", callback_data="m:help")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def client_view(client):
+    e = html.escape
+    cc = _counts(client["id"])
+    pos = ", ".join(_pos_label(t) for t in (client["positions"] or "").split(",") if t) or "—"
+    subj = client["subject_tpl"] or "составляет бот"
+    letter = "свой шаблон ✅" if client["letter_tpl"] else "пишет Claude"
+    cv = client["cv_filename"] or "— нет —"
+    cv_warn = "" if cv.lower().endswith(".pdf") else "  ⚠️ лучше PDF"
+    text = (
+        f"👤 <b>{e(client['full_name'])}</b>\n"
+        f"✉️ {e(client['email'])}" + (f" · 📞 {e(client['phone'])}" if client["phone"] else "") + "\n\n"
+        f"👔 Должности: {e(pos)}\n"
+        f"🎯 Подбираются вакансии: {e(matched_labels(client))}\n"
+        f"⚙️ Подача: {'🤖 автоматически' if client['auto_send'] else '✋ через кнопку'}"
+        f" · {'🟢 включён' if client['active'] else '⏸ на паузе'}\n"
+        f"⏱ Между письмами: {max(1, client_interval(client) // 60)} мин.\n"
+        f"📌 Тема: {e(subj)}\n"
+        f"📄 Письмо: {letter}\n"
+        f"📎 CV: {e(cv)}{cv_warn}\n\n"
+        f"📤 Сегодня: <b>{cc['today']}</b>/{MAIL_DAILY_LIMIT} · всего: {cc['sent']}"
+        + (f" · 📝 ждут: <b>{cc['draft']}</b>" if cc["draft"] else "")
+        + (f" · ❌ {cc['failed']}" if cc["failed"] else "")
+    )
+    cid = client["id"]
+    b = lambda t, d: InlineKeyboardButton(text=t, callback_data=d)
+    rows = [
+        [b("🚀 Разослать по базе (7 дн.)", f"m:blast:{cid}:7")],
+        [b(f"🔁 Отклик за {MAIL_BACKFILL_DAYS} дн. по должностям", f"m:bf:{cid}")],
+    ]
+    if cc["draft"]:
+        rows.append([b(f"📝 Черновики ({cc['draft']})", f"m:dr:{cid}")])
+    rows += [
+        [b("🤖 / ✋ Режим подачи", f"m:auto:{cid}"),
+         b("▶️ Включить" if not client["active"] else "⏸ Пауза", f"m:act:{cid}")],
+        [b(f"⏱ Интервал: {max(1, client_interval(client) // 60)} мин.", f"m:int:{cid}")],
+        [b("👔 Должности", f"m:pos:{cid}"), b("👁 Как выглядит письмо", f"m:show:{cid}")],
+        [b("📌 Тема", f"m:set:subject:{cid}"), b("📄 Письмо", f"m:set:letter:{cid}")],
+        [b("📎 CV", f"m:set:cv:{cid}"), b("📞 Телефон", f"m:set:phone:{cid}")],
+        [b("🧾 Выжимка из CV", f"m:set:about:{cid}"), b("🔑 Пароль почты", f"m:set:pass:{cid}")],
+        [b("🧪 Тестовое письмо", f"m:test:{cid}"), b("📜 История", f"m:hist:{cid}")],
+        [b("🗑 Удалить", f"m:del:{cid}"), b("🏠 Меню", "m:home")],
+    ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+HELP_TEXT = (
+    "❓ <b>Как это работает</b>\n\n"
+    "<b>1. Добавить клиента</b> — ➕ в меню: имя → почта → пароль приложения Gmail → должности → "
+    "телефон → CV → тема → письмо → режим. Сразу после этого бот откликается на подходящие вакансии "
+    f"за {MAIL_BACKFILL_DAYS} дн.\n\n"
+    "<b>2. Дальше само</b> — каждая новая вакансия в канале с email по должности клиента:\n"
+    "🤖 режим «автоматически» — письмо уходит само, вам приходит уведомление;\n"
+    "✋ режим «через кнопку» — приходит черновик с кнопкой ✅ Send.\n\n"
+    "<b>Подбор вакансий:</b>\n"
+    "• Master = Master / DPO / SDPO (и наоборот)\n"
+    "• Chief Officer = Chief Officer / DPO / SDPO\n"
+    "• 2nd Officer = 2nd Officer / DPO / JDPO / SDPO, а также «Mate», «2nd Mate», «OOW»\n"
+    "• 3rd Officer = 3rd Officer / DPO / JDPO, «3rd Mate»\n"
+    "• «Engineer», «EOOW» без уточнения = 3rd Engineer и 2nd Engineer\n"
+    "• «Captain», «Skipper» = Master · «Chief Mate» = Chief Officer\n"
+    "• остальные должности — точное совпадение\n\n"
+    "<b>3. Разослать по базе</b> — 🚀 в карточке клиента: CV уходит всем HR из вакансий за 7/14/30 дн. "
+    "(любые должности), кому ещё не отправляли.\n\n"
+    "<b>Правила:</b> одному HR — одно CV от клиента навсегда · до "
+    f"{MAIL_DAILY_LIMIT} писем в день · пауза между письмами 1–4 мин. (⏱ в карточке клиента) · "
+    "cover letter каждый раз слегка перефразируется.\n\n"
+    "Ответы работодателей приходят клиенту на его почту."
+)
+
+
+async def _edit(callback: CallbackQuery, text: str, kb):
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+
+
+@router.message(Command("mail"))
+async def cmd_mail_menu(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    text, kb = home_view()
+    await message.answer(text, reply_markup=kb)
+
+
+class ClientField(StatesGroup):
+    value = State()
+
+
+FIELD_PROMPTS = {
+    "subject": ("📌 Пришлите <b>тему письма</b> одной строкой.\n" + PLACEHOLDERS_HELP +
+                "\nПример: <code>Application for {position} – {name}</code>\n«-» — бот составляет тему сам."),
+    "phone": "📞 Пришлите телефон/WhatsApp для подписи (или «-», чтобы убрать).",
+    "about": "🧾 Пришлите пару строк о клиенте — по ним Claude пишет письма, если нет своего шаблона.",
+}
+
+
+@router.callback_query(F.data.startswith("m:"))
+async def cb_menu(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    parts = callback.data.split(":")
+    action = parts[1]
+    client = None
+    if action not in ("home", "add", "help") and not (action == "hist" and parts[2] == "0"):
+        cid = int(parts[2] if action in ("blast", "intset") else parts[-1])
+        client = get_client(cid)
+        if not client:
+            await callback.answer("Клиент не найден", show_alert=True)
+            return await _edit(callback, *home_view())
+
+    if action == "home":
+        await state.clear()
+        await _edit(callback, *home_view())
+    elif action == "help":
+        await _edit(callback, HELP_TEXT, back_kb())
+    elif action == "add":
+        await callback.answer()
+        await state.clear()
+        await state.set_state(AddClient.name)
+        return await callback.message.answer(
+            "➕ <b>Новый клиент</b>\n"
+            "⚠️ Только моряки, которые сами дали доступ к почте и согласны на отклики от своего имени.\n\n"
+            "1/9. Имя и фамилия (латиницей, как в CV):\n/cancel — отмена")
+    elif action == "c":
+        await state.clear()
+        await _edit(callback, *client_view(client))
+    elif action == "blast":
+        await _edit(callback, *blast_prompt(client, int(parts[3])))
+    elif action == "bf":
+        start_backfill(callback.bot, client["id"])
+        await callback.answer(f"Проверяю вакансии за {MAIL_BACKFILL_DAYS} дн. — итог пришлю", show_alert=True)
+        return
+    elif action == "dr":
+        n = len(pending_drafts(client["id"]))
+        await _edit(callback, f"📝 <b>Черновики</b> — {html.escape(client['full_name'])}: {n} писем ждут подтверждения.",
+                    summary_keyboard(client["id"], n) if n else back_kb(client["id"]))
+    elif action == "auto":
+        now = "автоматически 🤖" if client["auto_send"] else "через кнопку ✋"
+        kb = auto_keyboard(client["id"])
+        kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"m:c:{client['id']}")])
+        await _edit(callback, AUTO_PROMPT_TEXT.replace("{n}", f"Сейчас: {now}.\n\n"), kb)
+    elif action == "int":
+        cur = max(1, client_interval(client) // 60)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=("✅ " if m == cur else "") + f"{m} мин", callback_data=f"m:intset:{client['id']}:{m}")
+             for m in SEND_INTERVAL_CHOICES],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"m:c:{client['id']}")],
+        ])
+        await _edit(callback, f"⏱ <b>Пауза между письмами</b> — {html.escape(client['full_name'])}\n\n"
+                              "Когда писем много (рассылка по базе, отклик за прошлые дни, «Отправить все»), "
+                              "они уходят по одному с этой паузой. Чем больше пауза, тем спокойнее к ящику "
+                              "относится Gmail.\n\n"
+                              "Для примера: 40 писем при 1 мин. уйдут за ~40 мин, при 4 мин. за ~2 ч 40 мин.", kb)
+    elif action == "intset":
+        m = int(parts[3])
+        if m not in SEND_INTERVAL_CHOICES:
+            return await callback.answer()
+        update_client(client["id"], send_interval=m * 60)
+        await callback.answer(f"Интервал: {m} мин.")
+        return await _edit(callback, *client_view(get_client(client["id"])))
+    elif action == "act":
+        update_client(client["id"], active=0 if client["active"] else 1)
+        await callback.answer("На паузе ⏸" if client["active"] else "Включён 🟢")
+        return await _edit(callback, *client_view(get_client(client["id"])))
+    elif action == "pos":
+        current = [t for t in (client["positions"] or "").split(",") if t]
+        await state.set_state(ClientPosEdit.pick)
+        await state.update_data(client_id=client["id"], sel=current)
+        await _edit(callback, f"👔 {html.escape(client['full_name'])}. " + POSITIONS_PROMPT, positions_keyboard(current))
+    elif action == "show":
+        demo = {"position": "Chief Officer", "vessel": "DP2 PSV", "region": "North Sea", "position_tag": ""}
+        subject = fill_tpl(client["subject_tpl"], demo, client) if client["subject_tpl"] else make_subject(demo, client)
+        body = with_signature(fill_tpl(client["letter_tpl"], demo, client), client) if client["letter_tpl"] \
+            else "(Claude пишет письмо под каждую вакансию)"
+        await _edit(callback, f"👁 <b>Пример письма</b> (вакансия Chief Officer, DP2 PSV)\n\n"
+                              f"<b>Тема:</b> {html.escape(subject)}\n\n<pre>{html.escape(body[:3000])}</pre>\n"
+                              f"При отправке текст каждый раз слегка перефразируется.", back_kb(client["id"]))
+    elif action == "set":
+        field = parts[2]
+        await callback.answer()
+        if field == "letter":
+            await state.set_state(ClientLetter.letter)
+            await state.update_data(client_id=client["id"])
+            return await callback.message.answer("📄 Пришлите текст <b>cover letter</b> одним сообщением. "
+                                                 "«-» — пусть пишет Claude.\n" + PLACEHOLDERS_HELP +
+                                                 "\n/cancel — отмена")
+        if field == "cv":
+            await state.set_state(ClientCV.cv)
+            await state.update_data(client_id=client["id"])
+            return await callback.message.answer("📎 Пришлите новый CV файлом (лучше PDF). /cancel — отмена")
+        if field == "pass":
+            await state.set_state(ClientPass.password)
+            await state.update_data(client_id=client["id"])
+            return await callback.message.answer("🔑 Пришлите новый пароль приложения Gmail (16 символов). "
+                                                 "Сообщение удалю сразу. /cancel — отмена")
+        await state.set_state(ClientField.value)
+        await state.update_data(client_id=client["id"], field=field)
+        return await callback.message.answer(FIELD_PROMPTS[field] + "\n/cancel — отмена")
+    elif action == "test":
+        await callback.answer("Отправляю тест…")
+        return await callback.message.answer(await run_test_mail(callback.bot, client), reply_markup=back_kb(client["id"]))
+    elif action == "hist":
+        await _edit(callback, history_text(client["id"] if client else None),
+                    back_kb(client["id"] if client else None))
+    elif action == "del":
+        await _edit(callback, f"🗑 Удалить клиента <b>{html.escape(client['full_name'])}</b> вместе с паролем почты?",
+                    InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="Да, удалить", callback_data=f"m:delyes:{client['id']}"),
+                        InlineKeyboardButton(text="Нет", callback_data=f"m:c:{client['id']}")]]))
+    elif action == "delyes":
+        delete_client(client["id"])
+        await callback.answer("Удалён")
+        return await _edit(callback, *home_view())
+    await callback.answer()
+
+
+@router.message(StateFilter(ClientField.value), F.text & ~F.text.startswith("/"))
+async def on_client_field(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    text = message.text.strip()
+    col = {"subject": "subject_tpl", "phone": "phone", "about": "about"}[data["field"]]
+    value = ("" if col == "phone" else None) if text == "-" else text
+    update_client(data["client_id"], **{col: value})
+    await message.answer("✅ Сохранено.", reply_markup=back_kb(data["client_id"]))
+
+
+def history_text(client_id: int | None = None) -> str:
+    where, params = ("WHERE a.client_id = ?", (client_id,)) if client_id else ("", ())
+    rows = _q(f"""SELECT a.*, c.full_name FROM mail_applications a
+                  LEFT JOIN mail_clients c ON c.id = a.client_id {where}
+                  ORDER BY a.id DESC LIMIT 25""", params)
+    if not rows:
+        return "📜 Писем пока не было."
+    icons = {"sent": "✅", "failed": "❌", "skipped": "⏭", "draft": "📝", "sending": "⏳"}
+    lines = ["📜 <b>Последние письма</b>\n✅ ушло · 📝 ждёт · ⏭ пропущено · ❌ ошибка\n"]
+    for r in rows:
+        who = "" if client_id else f"{html.escape(r['full_name'] or '?')} → "
+        lines.append(f"{icons.get(r['status'], '•')} {(r['sent_at'] or r['created_at'])[5:16].replace('T', ' ')} "
+                     f"{who}{html.escape(r['to_email'])}")
+    return "\n".join(lines)

@@ -917,6 +917,20 @@ def get_recent_published_by_tag(position_tag: str, days: int = 7):
     return rows
 
 
+def get_recent_published(days: int = 7):
+    """Все опубликованные вакансии за `days` суток, от старых к новым — фильтр по должности
+    делается в коде по правилам ranks.py (семьи должностей и синонимы)."""
+    conn = get_conn()
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    rows = conn.execute(
+        """SELECT * FROM vacancies WHERE status = 'published' AND created_at > ?
+           ORDER BY created_at ASC""",
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 def insert_correction(original_text: str, corrected_fields_json: str):
     conn = get_conn()
     conn.execute(

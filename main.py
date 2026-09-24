@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 
 import db
 import email_apply
+import ranks
 import webapp
 
 load_dotenv()
@@ -514,6 +515,7 @@ For each vacancy, extract:
     "C/E", "Chief Engineer" -> ChiefEngineer
     "2/E", "Second Engineer", "First Assistant Engineer" -> SecondEngineer
     "3/E", "Third Engineer", "EOOW" -> ThirdEngineer
+    a bare "Engineer", "Marine Engineer", "Engineer Officer" with no rank number -> ThirdEngineer
     "4/E", "Fourth Engineer", "Junior Engineer" -> JuniorEngineer
     "Deck Engineer", "Deck Mechanic" -> ThirdEngineer (junior-sounding phrasing, explicit
     "junior"/"trainee" wording -> JuniorEngineer instead)
@@ -546,10 +548,8 @@ For each vacancy, extract:
     "Diver", "Saturation Diver" -> Diver
     "Scaffolder" -> Scaffolder
     "Winch Operator" -> WinchOperator
-    "OOW" (Officer of the Watch) or a bare "Mate" with no rank number given is ambiguous
-    between SecondOfficer and ThirdOfficer — infer from context (years of experience
-    required, COC class, whether it's described as senior/junior watch); if there is truly
-    no way to tell, default to SecondOfficer rather than Other.
+    "OOW" (Officer of the Watch), "Mate" or "2nd Mate" with no other rank number -> SecondOfficer
+    (the channel owner's rule: Mate / OOW = 2nd Officer); "3rd Mate" -> ThirdOfficer.
   If truly nothing in the list or the guidance above fits, use "Other".
 - vessel: vessel/rig type or name, as written/implied in the source, or null
 - vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list:
@@ -1891,6 +1891,9 @@ async def cmd_test_match(message: Message, command: CommandObject):
     with_contact = db.get_subscribers_for_tag(tag)
     lines.append(f"\nПолучат вакансию (все, включая с скрытым контактом): {all_matched}")
     lines.append(f"Из них увидят контакт (активна подписка): {with_contact}")
+    family = sorted(ranks.expand([tag]))
+    fam_matched = sorted({t for ft in family for t in db.get_all_subscribers_for_tag_any_status(ft)})
+    lines.append(f"\nС учётом семьи должностей {family}: получат {fam_matched}")
 
     await message.answer("\n".join(lines))
 
@@ -2352,7 +2355,9 @@ async def cb_subscribe_position(callback: CallbackQuery):
         return
 
     await callback.answer(t(lang, "subscribed", tag=position_tag))
-    backfill = db.get_recent_published_by_tag(position_tag, days=TRIAL_BACKFILL_DAYS)
+    # та же логика подбора, что и для новых вакансий (ranks.py)
+    backfill = [row for row in db.get_recent_published(days=TRIAL_BACKFILL_DAYS)
+                if ranks.matches([position_tag], dict(row))]
     # не дублируем то, что этому человеку уже когда-то уходило — актуально
     # при повторной подписке/оплате после отписки, когда он заново проходит
     # тот же выбор должности
@@ -2401,10 +2406,19 @@ async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
     Вызывается ПОСЛЕ успешной публикации в канал и полностью изолирована
     try/except-ом на уровне вызова — сбой рассылки никак не должен влиять
     на основную публикацию, которая на этот момент уже прошла."""
-    position_tag = fields.get("position_tag")
-    if not position_tag or position_tag == FALLBACK_TAG:
+    # подбор по общим правилам ranks.py: семьи должностей (Master = Master/DPO/SDPO и т.п.)
+    # + синонимы в названии (Mate/OOW = 2nd Officer, Engineer/EOOW = 3rd и 2nd Engineer)
+    tags = ranks.vacancy_tags(fields)
+    if not tags:
         return
-    for tg_id in db.get_all_subscribers_for_tag_any_status(position_tag):
+    recipients: list[int] = []
+    for tag in sorted(tags):
+        for tg_id in db.get_all_subscribers_for_tag_any_status(tag):
+            if tg_id not in recipients:
+                recipients.append(tg_id)
+    for tg_id in recipients:
+        if db.was_notification_sent(tg_id, vacancy_id):
+            continue
         try:
             lang = db.get_subscriber_language(tg_id)
             hide_contact = not db.is_subscription_active(tg_id)
