@@ -2621,7 +2621,7 @@ async def main():
     asyncio.create_task(digest_worker(bot))
     asyncio.create_task(subscription_reminder_worker(bot))
     asyncio.create_task(scheduled_ads_worker(bot))
-
+    asyncio.create_task(email_apply.mail_base_worker(bot))
     # текст, видимый в ПУСТОМ чате до первого нажатия Start — ставится через
     # Bot API, не хранится нигде в БД, просто применяется заново при каждом
     # старте, чтобы не зависеть от ручной настройки через BotFather
