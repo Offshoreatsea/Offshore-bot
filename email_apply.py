@@ -10,7 +10,8 @@
   3. Админ жмёт ✅ Send — письмо уходит с почты самого клиента (SMTP).
      Ответ работодателя придёт прямо клиенту в его ящик.
 
-Защита: одному HR — одно CV от клиента в день, не больше MAIL_DAILY_LIMIT (100)
+Защита: одному HR — одно CV от клиента не чаще MAIL_HR_COOLDOWN_HOURS (по умолчанию раз в
+сутки), не больше MAIL_DAILY_LIMIT (100)
 писем в день на клиента, между письмами с одного ящика пауза ~MAIL_SEND_INTERVAL сек.
 """
 import asyncio
@@ -43,7 +44,7 @@ import ranks
 
 router = Router()
 
-MAIL_DAILY_LIMIT = int(os.getenv("MAIL_DAILY_LIMIT", "100"))          # писем в день с одного клиента
+MAIL_DAILY_LIMIT = int(os.getenv("MAIL_DAILY_LIMIT", "500"))          # писем в день с одного клиента
 MAIL_SEND_INTERVAL = int(os.getenv("MAIL_SEND_INTERVAL", "120"))     # сек. между письмами по умолчанию; у клиента можно 1-4 мин
 SEND_INTERVAL_CHOICES = [1, 2, 3, 4]                                 # минуты — кнопки в карточке клиента
 MAIL_VARY_LETTER = os.getenv("MAIL_VARY_LETTER", "on") == "on"       # слегка перефразировать cover letter каждый раз
@@ -267,14 +268,14 @@ def _mailbase_now():
 
 def _q(sql, params=(), one=False, commit=False):
     conn = db.get_conn()
-    cur = conn.execute(sql, params)
-    if commit:
-        conn.commit()
-        res = cur.lastrowid
-    else:
-        res = cur.fetchone() if one else cur.fetchall()
-    conn.close()
-    return res
+    try:
+        cur = conn.execute(sql, params)
+        if commit:
+            conn.commit()
+            return cur.lastrowid
+        return cur.fetchone() if one else cur.fetchall()
+    finally:
+        conn.close()  # и при ошибке — иначе висящая транзакция держит блокировку записи
 
 
 def add_client(d: dict) -> int:
@@ -343,23 +344,34 @@ def app_exists(client_id: int, vacancy_id: int) -> bool:
                    (client_id, vacancy_id), one=True))
 
 
+MAIL_HR_COOLDOWN_HOURS = int(os.getenv("MAIL_HR_COOLDOWN_HOURS", "24"))  # одному HR — одно CV не чаще, чем раз в столько часов
+
+
 def already_applied_to(client_id: int, to_email: str, exclude_app_id: int | None = None,
                        statuses=("draft", "sending", "sent")) -> bool:
-    """Одному HR — одно CV от клиента в день. Отправленное считается только за сегодня;
-    черновик или письмо в очереди на тот же адрес блокирует всегда (чтобы не плодить дубли)."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    pending = [st for st in statuses if st != "sent"]
-    conds, params = [], []
-    if pending:
-        conds.append(f"status IN ({','.join('?' * len(pending))})")
-        params += pending
+    """Одному HR — одно CV от клиента не чаще MAIL_HR_COOLDOWN_HOURS (по умолчанию раз в
+    сутки). Черновик/отправку в процессе (draft/sending) не дублируем НЕЗАВИСИМО от времени —
+    это просто защита от двух параллельных писем на один и тот же адрес одновременно."""
+    marks = ",".join("?" * len(statuses))
     if "sent" in statuses:
-        conds.append("(status = 'sent' AND sent_at LIKE ?)")
-        params.append(today + "%")
+        # для "sent" — только за последние MAIL_HR_COOLDOWN_HOURS часов; для
+        # draft/sending время не ограничиваем (см. докстринг)
+        cutoff = (datetime.now() - timedelta(hours=MAIL_HR_COOLDOWN_HOURS)).isoformat()
+        other = [s for s in statuses if s != "sent"]
+        other_marks = ",".join("?" * len(other)) if other else None
+        clause = f"(status = 'sent' AND sent_at > ?)"
+        params = [client_id, to_email, cutoff]
+        if other:
+            clause += f" OR status IN ({other_marks})"
+            params += list(other)
+        return bool(_q(
+            f"""SELECT 1 FROM mail_applications WHERE client_id = ? AND lower(to_email) = lower(?)
+                AND ({clause}) AND id != ?""",
+            (*params, exclude_app_id or -1), one=True))
     return bool(_q(
         f"""SELECT 1 FROM mail_applications WHERE client_id = ? AND lower(to_email) = lower(?)
-            AND id != ? AND ({' OR '.join(conds)})""",
-        (client_id, to_email, exclude_app_id or -1, *params), one=True))
+            AND status IN ({marks}) AND id != ?""",
+        (client_id, to_email, *statuses, exclude_app_id or -1), one=True))
 
 
 def sent_today(client_id: int) -> int:
@@ -1355,7 +1367,7 @@ async def cmd_mail_help(message: Message):
         "/applyto VACANCY_ID [CLIENT_ID] — отклик на уже опубликованную вакансию\n"
         "/applyto last [CLIENT_ID] — на последнюю опубликованную\n"
         "/mailsent — последние отправки\n\n"
-        f"Правила: одному HR — одно CV от клиента в день; до {MAIL_DAILY_LIMIT} писем в день; "
+        f"Правила: одному HR — одно CV от клиента раз в {MAIL_HR_COOLDOWN_HOURS} ч.; до {MAIL_DAILY_LIMIT} писем в день; "
         "пауза между письмами 1–4 мин. (настраивается в /mail → клиент → ⏱); cover letter каждый раз слегка перефразируется."
     )
 
@@ -1690,12 +1702,12 @@ def blast_prompt(client, days: int):
     back = [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"m:c:{cid}")]
     head = f"🚀 <b>Рассылка по базе</b> — {html.escape(client['full_name'])}\nПериод: вакансии за <b>{days} дн.</b>\n\n"
     if not n:
-        return (head + "Новых HR-адресов нет — всем из этого периода сегодня уже отправляли. "
-                       "Выберите другой период или попробуйте завтра."), \
+        return (head + "Новых HR-адресов нет — всем из этого периода уже отправляли "
+                       f"(за последние {MAIL_HR_COOLDOWN_HOURS} ч.). Выберите другой период или попробуйте позже."), \
             InlineKeyboardMarkup(inline_keyboard=[periods, back])
     mode = "уйдут автоматически по одному 🤖" if client["auto_send"] else "придут на подтверждение ✋"
-    text = head + (f"Найдено <b>{n}</b> HR-адресов (любые должности), которым сегодня его CV ещё не "
-                   f"отправлялось. Письма {mode}.\n"
+    text = head + (f"Найдено <b>{n}</b> HR-адресов (любые должности), которым его CV ещё не "
+                   f"отправлялось за последние {MAIL_HR_COOLDOWN_HOURS} ч. Письма {mode}.\n"
                    f"Тема и письмо — по его шаблону, вместо {{position}} подставятся его должности.")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🚀 Разослать ({n})", callback_data=f"ea_blast:{cid}:{days}")],
@@ -1894,8 +1906,8 @@ HELP_TEXT = (
     "• «Captain», «Skipper» = Master · «Chief Mate» = Chief Officer\n"
     "• остальные должности — точное совпадение\n\n"
     "<b>3. Разослать по базе</b> — 🚀 в карточке клиента: CV уходит всем HR из вакансий за 1–5 дн. "
-    "(любые должности), кому сегодня ещё не отправляли.\n\n"
-    "<b>Правила:</b> одному HR — одно CV от клиента в день · до "
+    "(любые должности), кому ещё не отправляли.\n\n"
+    f"<b>Правила:</b> одному HR — одно CV от клиента раз в {MAIL_HR_COOLDOWN_HOURS} ч. · до "
     f"{MAIL_DAILY_LIMIT} писем в день · пауза между письмами 1–4 мин. (⏱ в карточке клиента) · "
     "cover letter каждый раз слегка перефразируется.\n\n"
     "Ответы работодателей приходят клиенту на его почту."
@@ -2180,7 +2192,7 @@ async def mb_date(callback: CallbackQuery, state: FSMContext):
         for s, e in TIME_WINDOW_PRESETS
     ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"m:c:{client_id}")]])
     await callback.message.edit_text(
-        f"📅 Старт: {date_str}\n\n⏰ Окно рассылки (24-часовой формат, по будням).\n"
+        f"📅 Старт: {date_str}\n\n⏰ Окно рассылки (24-часовой формат, по будням {MAIL_BASE_WORKDAYS} дн. подряд).\n"
         "Выберите готовый вариант или пришлите своё время текстом, например <code>09:30-17:30</code>.",
         reply_markup=kb,
     )
@@ -2331,7 +2343,7 @@ async def _mailbase_send(bot: Bot, client, to_email: str) -> tuple[bool, str]:
     lock = _client_locks.setdefault(client["id"], asyncio.Lock())
     async with lock:
         if already_applied_to(client["id"], to_email, statuses=("sent",)):
-            return False, "этому адресу уже отправляли"
+            return False, "этому адресу уже отправляли (за последние сутки)"
         subject, body = await compose({}, client)
         app_id = insert_app(client["id"], None, to_email, subject, body)
         set_app(app_id, status="sending")
@@ -2377,7 +2389,7 @@ async def _mail_base_tick(bot: Bot):
         if time.monotonic() - last < interval * random.uniform(0.85, 1.15):
             continue
         target = _q("SELECT * FROM mail_base_targets WHERE client_id = ? AND status = 'pending' "
-                    "ORDER BY id LIMIT 1", (client_id,), one=True)
+                    "ORDER BY RANDOM() LIMIT 1", (client_id,), one=True)
         if not target:
             continue
         _mailbase_last_tick[client_id] = time.monotonic()
@@ -2395,7 +2407,7 @@ async def _mail_base_tick(bot: Bot):
 
 async def mail_base_worker(bot: Bot):
     """Фоновый воркер точечной рассылки — проверяет активные кампании раз в минуту
-    и шлёт письма по расписанию (будни, окно времени, интервал)."""
+    и шлёт письма по расписанию (будни, окно времени, дневная квота)."""
     await asyncio.sleep(45)
     while True:
         try:
