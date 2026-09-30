@@ -48,6 +48,8 @@ MAIL_SEND_INTERVAL = int(os.getenv("MAIL_SEND_INTERVAL", "120"))     # сек. �
 SEND_INTERVAL_CHOICES = [1, 2, 3, 4]                                 # минуты — кнопки в карточке клиента
 MAIL_VARY_LETTER = os.getenv("MAIL_VARY_LETTER", "on") == "on"       # слегка перефразировать cover letter каждый раз
 MAIL_BACKFILL_DAYS = int(os.getenv("MAIL_BACKFILL_DAYS", "4"))        # за сколько дней откликаться при заведении клиента
+MAIL_BASE_TZ_OFFSET = int(os.getenv("MAIL_BASE_TZ_OFFSET", "2"))     # часов от UTC — под окно точечной рассылки
+MAIL_BASE_WORKDAYS = int(os.getenv("MAIL_BASE_WORKDAYS", "5"))        # рабочих дней-ориентир на всю базу (только Пн-Пт)
 COVER_MODEL = os.getenv("COVER_MODEL", "claude-haiku-4-5-20251001")
 
 # заполняется из main.py через setup(), чтобы не было циклического импорта
@@ -83,6 +85,57 @@ DEFAULT_SMTP = ("smtp.gmail.com", 465)  # свой домен на Google Worksp
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 
+def parse_email_file(data: bytes, filename: str) -> list[str]:
+    """csv/xlsx с email-адресами — любая раскладка по столбцам, берём всё, что
+    похоже на email, и дедуплицируем (без учёта регистра)."""
+    name = (filename or "").lower()
+    text_chunks: list[str] = []
+    if name.endswith(".xlsx"):
+        import openpyxl  # тяжёлая библиотека — импортируем только когда реально нужна
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                for cell in row:
+                    if cell:
+                        text_chunks.append(str(cell))
+    else:
+        try:
+            text_chunks.append(data.decode("utf-8"))
+        except UnicodeDecodeError:
+            text_chunks.append(data.decode("cp1251", errors="ignore"))
+    found = EMAIL_RE.findall(" ".join(text_chunks))
+    seen, out = set(), []
+    for email in found:
+        key = email.strip().rstrip(".").lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(email.strip().rstrip("."))
+    return out
+
+
+def add_mail_base_targets(client_id: int, emails: list[str]) -> tuple[int, int]:
+    """Возвращает (добавлено, дублей — уже были в базе этого клиента)."""
+    existing = {r["email"].lower() for r in _q(
+        "SELECT email FROM mail_base_targets WHERE client_id = ?", (client_id,))}
+    added = 0
+    now = datetime.now().isoformat()
+    for email in emails:
+        if email.lower() in existing:
+            continue
+        _q("INSERT INTO mail_base_targets (client_id, email, status, added_at) VALUES (?, ?, 'pending', ?)",
+           (client_id, email, now), commit=True)
+        existing.add(email.lower())
+        added += 1
+    return added, len(emails) - added
+
+
+def mailbase_counts(client_id: int) -> dict:
+    rows = _q("SELECT status, COUNT(*) c FROM mail_base_targets WHERE client_id = ? GROUP BY status",
+              (client_id,))
+    d = {r["status"]: r["c"] for r in rows}
+    return {"pending": d.get("pending", 0), "sent": d.get("sent", 0), "total": sum(d.values())}
+
+
 def setup(admin_ids, claude, valid_tags, tag_labels):
     global _admin_ids, _claude, _valid_tags, _tag_labels
     _admin_ids = list(admin_ids)
@@ -97,6 +150,8 @@ def is_admin(user_id: int) -> bool:
 
 ADMIN_MAIL_COMMANDS = [
     ("mail", "📧 Рассылка резюме — меню"),
+    ("mbcheck", "📋 Проверить базу точечной рассылки по id клиента"),
+    ("mbstop", "⏸ Остановить точечную рассылку по id клиента"),
 ]
 
 
@@ -173,13 +228,41 @@ def init_tables():
             UNIQUE(client_id, vacancy_id)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mail_base_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id INTEGER,
+            email TEXT,
+            status TEXT DEFAULT 'pending',
+            added_at TEXT,
+            sent_at TEXT
+        )
+    """)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(mail_clients)")}
-    for col, ddl in (("subject_tpl", "TEXT"), ("letter_tpl", "TEXT"), ("auto_send", "INTEGER DEFAULT 0"),
-                      ("send_interval", "INTEGER")):
+    for col, ddl in (
+        ("subject_tpl", "TEXT"), ("letter_tpl", "TEXT"), ("auto_send", "INTEGER DEFAULT 0"),
+        ("send_interval", "INTEGER"),
+        # точечная рассылка по загруженной базе — расписание кампании
+        ("mailbase_active", "INTEGER DEFAULT 0"),
+        ("mailbase_start_date", "TEXT"),
+        ("mailbase_window_start", "TEXT"),
+        ("mailbase_window_end", "TEXT"),
+        ("mailbase_days_left", "INTEGER"),
+        ("mailbase_day_quota", "INTEGER"),
+        ("mailbase_sent_today", "INTEGER DEFAULT 0"),
+        ("mailbase_last_active_date", "TEXT"),
+        ("mailbase_interval_sec", "INTEGER"),
+    ):
         if col not in cols:
             conn.execute(f"ALTER TABLE mail_clients ADD COLUMN {col} {ddl}")
     conn.commit()
     conn.close()
+
+
+def _mailbase_now():
+    """Локальное время кампании — сервер обычно в UTC, MAIL_BASE_TZ_OFFSET сдвигает
+    на нужный часовой пояс, чтобы выбранное окно времени было настоящим утром/вечером."""
+    return datetime.utcnow() + timedelta(hours=MAIL_BASE_TZ_OFFSET)
 
 
 def _q(sql, params=(), one=False, commit=False):
@@ -869,6 +952,12 @@ class AddClient(StatesGroup):
     positions = State()
     phone = State()
     cv = State()
+
+
+class MailBaseCampaign(StatesGroup):
+    file = State()
+    time = State()      # дата уже выбрана к этому моменту (инлайн-календарь без FSM-состояния)
+    interval = State()  # окно времени уже выбрано, ждём интервал между письмами
 
 
 class ClientPosEdit(StatesGroup):
@@ -1761,8 +1850,15 @@ def client_view(client):
     )
     cid = client["id"]
     b = lambda t, d: InlineKeyboardButton(text=t, callback_data=d)
+    mb = mailbase_counts(cid)
+    mb_label = "🎯 Разослать точечно"
+    if client["mailbase_active"]:
+        mb_label += f" (идёт: {mb['sent']}/{mb['total']})"
+    elif mb["total"]:
+        mb_label += f" (база: {mb['total']})"
     rows = [
         [b("🚀 Разослать по базе (1–5 дн.)", f"m:blast:{cid}:{BLAST_DEFAULT_DAYS}")],
+        [b(mb_label, f"m:mb:{cid}")],
         [b(f"🔁 Отклик за {MAIL_BACKFILL_DAYS} дн. по должностям", f"m:bf:{cid}")],
     ]
     if cc["draft"]:
@@ -1870,6 +1966,27 @@ async def cb_menu(callback: CallbackQuery, state: FSMContext):
         start_backfill(callback.bot, client["id"])
         await callback.answer(f"Проверяю вакансии за {MAIL_BACKFILL_DAYS} дн. — итог пришлю", show_alert=True)
         return
+    elif action == "mb":
+        if client["mailbase_active"]:
+            mb = mailbase_counts(client["id"])
+            await _edit(
+                callback,
+                f"🎯 <b>Точечная рассылка уже идёт</b> — {html.escape(client['full_name'])}\n\n"
+                f"Отправлено {mb['sent']} из {mb['total']}, осталось {mb['pending']}.\n"
+                f"Окно: {client['mailbase_window_start']}–{client['mailbase_window_end']}, будни.\n\n"
+                "Остановить — только через /mbstop " + str(client["id"]),
+                back_kb(client["id"]),
+            )
+            return await callback.answer()
+        await callback.answer()
+        await state.clear()
+        await state.set_state(MailBaseCampaign.file)
+        await state.update_data(client_id=client["id"])
+        return await callback.message.answer(
+            f"🎯 <b>Точечная рассылка</b> — {html.escape(client['full_name'])}\n\n"
+            "Пришлите файлом список адресов: .csv или .xlsx, email в любом столбце "
+            "(бот сам найдёт всё похожее на email).\n/cancel — отмена"
+        )
     elif action == "dr":
         n = len(pending_drafts(client["id"]))
         await _edit(callback, f"📝 <b>Черновики</b> — {html.escape(client['full_name'])}: {n} писем ждут подтверждения.",
@@ -1963,6 +2080,329 @@ async def on_client_field(message: Message, state: FSMContext):
     value = ("" if col == "phone" else None) if text == "-" else text
     update_client(data["client_id"], **{col: value})
     await message.answer("✅ Сохранено.", reply_markup=back_kb(data["client_id"]))
+
+
+# ---------------------------------------------------------------- точечная рассылка по базе
+
+@router.message(StateFilter(MailBaseCampaign.file), F.document)
+async def mb_file(message: Message, state: FSMContext):
+    data = await state.get_data()
+    client_id = data["client_id"]
+    doc = message.document
+    status = await message.answer("Читаю файл…")
+    buf = io.BytesIO()
+    await message.bot.download(doc.file_id, destination=buf)
+    try:
+        emails = parse_email_file(buf.getvalue(), doc.file_name or "")
+    except Exception as e:
+        return await status.edit_text(f"❌ Не смог прочитать файл: {e}\nПришлите .csv или .xlsx ещё раз, или /cancel.")
+    if not emails:
+        return await status.edit_text("❌ Не нашёл ни одного email в файле. Пришлите другой файл, или /cancel.")
+    added, dup = add_mail_base_targets(client_id, emails)
+    now = _mailbase_now()
+    preview_n = min(5, len(emails))
+    preview = "\n".join(f"• {html.escape(e)}" for e in emails[:preview_n])
+    more = f"\n…и ещё {len(emails) - preview_n}" if len(emails) > preview_n else ""
+    await status.edit_text(
+        f"✅ Нашёл {len(emails)} адресов, добавил {added} новых"
+        + (f" ({dup} уже были в базе клиента)" if dup else "") + ".\n\n"
+        f"<b>Проверьте, что распозналось верно:</b>\n{preview}{more}\n\n"
+        "📅 Когда начать рассылку?",
+        reply_markup=_calendar_kb(client_id, now.year, now.month),
+    )
+
+
+def _calendar_kb(client_id: int, year: int, month: int) -> InlineKeyboardMarkup:
+    import calendar as _cal
+    today = _mailbase_now().date()
+    cal = _cal.Calendar(firstweekday=0)
+    rows = [[
+        InlineKeyboardButton(text="‹", callback_data=f"mbnav:{client_id}:{year}:{month - 1}"),
+        InlineKeyboardButton(text=f"{_cal.month_name[month]} {year}", callback_data="mbnoop"),
+        InlineKeyboardButton(text="›", callback_data=f"mbnav:{client_id}:{year}:{month + 1}"),
+    ]]
+    rows.append([InlineKeyboardButton(text=d, callback_data="mbnoop") for d in ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")])
+    for week in cal.monthdatescalendar(year, month):
+        row = []
+        for day in week:
+            if day.month != month or day < today:
+                row.append(InlineKeyboardButton(text=" ", callback_data="mbnoop"))
+            else:
+                label = f"[{day.day}]" if day == today else str(day.day)
+                row.append(InlineKeyboardButton(text=label, callback_data=f"mbdate:{client_id}:{day.isoformat()}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"m:c:{client_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "mbnoop")
+async def mb_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mbnav:"))
+async def mb_nav(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    _, cid, year, month = callback.data.split(":")
+    year, month = int(year), int(month)
+    if month == 0:
+        year, month = year - 1, 12
+    elif month == 13:
+        year, month = year + 1, 1
+    await callback.message.edit_reply_markup(reply_markup=_calendar_kb(int(cid), year, month))
+    await callback.answer()
+
+
+TIME_WINDOW_PRESETS = [("09:00", "18:00"), ("08:00", "17:00"), ("10:00", "19:00")]
+MAILBASE_INTERVAL_CHOICES = [60, 70, 80, 90, 100, 110, 120, 150, 180]
+
+
+def _fmt_interval(sec: int) -> str:
+    m, s = divmod(sec, 60)
+    if m and s:
+        return f"{m} мин {s} сек"
+    if m:
+        return f"{m} мин"
+    return f"{s} сек"
+
+
+@router.callback_query(F.data.startswith("mbdate:"))
+async def mb_date(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    _, cid, date_str = callback.data.split(":")
+    client_id = int(cid)
+    await state.set_state(MailBaseCampaign.time)
+    await state.update_data(client_id=client_id, start_date=date_str)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{s}–{e}", callback_data=f"mbtime:{client_id}:{s}-{e}")]
+        for s, e in TIME_WINDOW_PRESETS
+    ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"m:c:{client_id}")]])
+    await callback.message.edit_text(
+        f"📅 Старт: {date_str}\n\n⏰ Окно рассылки (24-часовой формат, по будням).\n"
+        "Выберите готовый вариант или пришлите своё время текстом, например <code>09:30-17:30</code>.",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mbtime:"))
+async def mb_time_preset(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    _, cid, window = callback.data.split(":", 2)  # окно вида "09:00-18:00" само содержит ":", разбиваем только первые два
+    start, end = window.split("-")
+    await _ask_interval(callback.message, int(cid), start, end, state, edit=True)
+    await callback.answer()
+
+
+@router.message(StateFilter(MailBaseCampaign.time), F.text & ~F.text.startswith("/"))
+async def mb_time_custom(message: Message, state: FSMContext):
+    m = re.fullmatch(r"(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})", message.text.strip())
+    if not m:
+        return await message.answer("Формат: <code>09:00-18:00</code> (24-часовой). Пришлите ещё раз, или /cancel.")
+    start, end = m.group(1), m.group(2)
+    if start >= end:
+        return await message.answer("Начало должно быть раньше конца. Пришлите ещё раз, или /cancel.")
+    data = await state.get_data()
+    await _ask_interval(message, data["client_id"], start, end, state, edit=False)
+
+
+async def _ask_interval(msg: Message, client_id: int, start: str, end: str, state: FSMContext, edit: bool):
+    await state.set_state(MailBaseCampaign.interval)
+    await state.update_data(client_id=client_id, window_start=start, window_end=end)
+    pending = mailbase_counts(client_id)["pending"] or 1
+    wstart_dt = datetime.strptime(start, "%H:%M")
+    wend_dt = datetime.strptime(end, "%H:%M")
+    window_seconds = max(60, (wend_dt - wstart_dt).total_seconds())
+    rows = []
+    for sec in MAILBASE_INTERVAL_CHOICES:
+        per_day = max(1, int(window_seconds // sec))
+        days = -(-pending // per_day)
+        rows.append([InlineKeyboardButton(
+            text=f"{_fmt_interval(sec)} (~{days} дн.)", callback_data=f"mbint:{client_id}:{sec}"
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"m:c:{client_id}")])
+    text = (f"⏰ Окно: {start}–{end}\n\n⏱ <b>Интервал между письмами</b> — базовое значение, "
+            f"реальная отправка каждый раз чуть вразброс (±15%), чтобы не было по часам.\n"
+            f"Дни в скобках — оценка на {pending} адресов при таком темпе.")
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    if edit:
+        await msg.edit_text(text, reply_markup=kb)
+    else:
+        await msg.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("mbint:"))
+async def mb_interval_pick(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    _, cid, sec = callback.data.split(":")
+    await _start_mailbase(callback.bot, int(cid), int(sec), state)
+    await callback.answer()
+
+
+async def _start_mailbase(bot: Bot, client_id: int, interval_sec: int, state: FSMContext, message: Message | None = None):
+    data = await state.get_data()
+    start_date = data.get("start_date")
+    start, end = data.get("window_start"), data.get("window_end")
+    await state.clear()
+    update_client(
+        client_id, mailbase_active=1, mailbase_start_date=start_date,
+        mailbase_window_start=start, mailbase_window_end=end, mailbase_interval_sec=interval_sec,
+        mailbase_days_left=MAIL_BASE_WORKDAYS, mailbase_day_quota=None,
+        mailbase_sent_today=0, mailbase_last_active_date=None,
+    )
+    client = get_client(client_id)
+    pending = mailbase_counts(client_id)["pending"]
+    wstart_dt = datetime.strptime(start, "%H:%M")
+    wend_dt = datetime.strptime(end, "%H:%M")
+    window_seconds = max(60, (wend_dt - wstart_dt).total_seconds())
+    per_day = max(1, int(window_seconds // interval_sec))
+    days = -(-pending // per_day)
+    text = (
+        f"✅ <b>Точечная рассылка запланирована</b> — {html.escape(client['full_name'])}\n\n"
+        f"📅 Старт: {start_date}, только будни (Пн-Пт)\n"
+        f"⏰ Окно: {start}–{end} (часовой пояс сервера {'+' if MAIL_BASE_TZ_OFFSET >= 0 else ''}{MAIL_BASE_TZ_OFFSET})\n"
+        f"⏱ Интервал: {_fmt_interval(interval_sec)} ± 15% случайно\n"
+        f"📬 Адресов: {pending}, ~{per_day}/день → ориентировочно {days} рабочих дн.\n"
+        f"✏️ Текст каждого письма слегка перефразируется Claude\n\n"
+        f"Не считается в обычный дневной лимит {MAIL_DAILY_LIMIT} писем — у кампании своя квота.\n"
+        f"Остановить: /mbstop {client_id}"
+    )
+    if message:
+        await message.answer(text)
+    else:
+        await _notify_admins(bot, text)
+
+
+@router.message(Command("mbcheck"))
+async def cmd_mbcheck(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    if not (command.args or "").strip().isdigit():
+        return await message.answer("Формат: /mbcheck [id клиента]")
+    client_id = int(command.args.strip())
+    client = get_client(client_id)
+    if not client:
+        return await message.answer("Клиент не найден.")
+    mb = mailbase_counts(client_id)
+    if not mb["total"]:
+        return await message.answer("У этого клиента пока нет загруженной базы.")
+    pending_sample = _q("SELECT email FROM mail_base_targets WHERE client_id = ? AND status = 'pending' "
+                        "ORDER BY id LIMIT 10", (client_id,))
+    sent_sample = _q("SELECT email, sent_at FROM mail_base_targets WHERE client_id = ? AND status = 'sent' "
+                     "ORDER BY sent_at DESC LIMIT 5", (client_id,))
+    lines = [f"📋 <b>База</b> — {html.escape(client['full_name'])}: всего {mb['total']}, "
+             f"отправлено {mb['sent']}, осталось {mb['pending']}\n"]
+    if pending_sample:
+        lines.append("<b>Ждут отправки (первые 10):</b>")
+        lines += [f"• {html.escape(r['email'])}" for r in pending_sample]
+    if sent_sample:
+        lines.append("\n<b>Последние отправленные:</b>")
+        lines += [f"• {html.escape(r['email'])} — {(r['sent_at'] or '')[:16].replace('T',' ')}" for r in sent_sample]
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("mbstop"))
+async def cmd_mbstop(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    if not (command.args or "").strip().isdigit():
+        return await message.answer("Формат: /mbstop [id клиента]")
+    client_id = int(command.args.strip())
+    client = get_client(client_id)
+    if not client:
+        return await message.answer("Клиент не найден.")
+    update_client(client_id, mailbase_active=0)
+    mb = mailbase_counts(client_id)
+    await message.answer(f"⏸ Точечная рассылка остановлена — {html.escape(client['full_name'])}. "
+                         f"Отправлено {mb['sent']} из {mb['total']}, оставшиеся адреса сохранены "
+                         f"(можно запустить заново через 🎯 в карточке клиента).")
+
+
+_mailbase_last_tick: dict[int, float] = {}
+
+
+async def _mailbase_send(bot: Bot, client, to_email: str) -> tuple[bool, str]:
+    """Как send_app, но без общего дневного лимита MAIL_DAILY_LIMIT — у точечной
+    рассылки своя, отдельно посчитанная дневная квота (см. _mail_base_tick)."""
+    lock = _client_locks.setdefault(client["id"], asyncio.Lock())
+    async with lock:
+        if already_applied_to(client["id"], to_email, statuses=("sent",)):
+            return False, "этому адресу уже отправляли"
+        subject, body = await compose({}, client)
+        app_id = insert_app(client["id"], None, to_email, subject, body)
+        set_app(app_id, status="sending")
+        try:
+            msg = await build_message(bot, client, to_email, subject, body)
+            await asyncio.to_thread(_smtp_send, client, msg)
+        except Exception as e:
+            err = _friendly_smtp_error(e)
+            set_app(app_id, status="failed", error=err)
+            return False, err
+        finally:
+            _client_last_send[client["id"]] = time.monotonic()
+        set_app(app_id, status="sent", sent_at=datetime.now().isoformat(), error=None)
+        return True, ""
+
+
+async def _mail_base_tick(bot: Bot):
+    clients = _q("SELECT * FROM mail_clients WHERE mailbase_active = 1")
+    now = _mailbase_now()
+    today_str = now.strftime("%Y-%m-%d")
+    now_hm = now.strftime("%H:%M")
+    for client in clients:
+        client_id = client["id"]
+        if today_str < (client["mailbase_start_date"] or today_str):
+            continue
+        if now.weekday() >= 5:
+            continue
+        pending = mailbase_counts(client_id)["pending"]
+        if pending == 0:
+            update_client(client_id, mailbase_active=0)
+            await _notify_admins(bot, f"🎯 Точечная рассылка для {html.escape(client['full_name'])} "
+                                      f"завершена — все адреса отправлены.")
+            continue
+        if client["mailbase_last_active_date"] != today_str:
+            update_client(client_id, mailbase_sent_today=0, mailbase_last_active_date=today_str)
+            client = get_client(client_id)
+        win_start = client["mailbase_window_start"] or "09:00"
+        win_end = client["mailbase_window_end"] or "18:00"
+        if not (win_start <= now_hm <= win_end):
+            continue
+        interval = client["mailbase_interval_sec"] or MAIL_SEND_INTERVAL
+        last = _mailbase_last_tick.get(client_id, 0)
+        if time.monotonic() - last < interval * random.uniform(0.85, 1.15):
+            continue
+        target = _q("SELECT * FROM mail_base_targets WHERE client_id = ? AND status = 'pending' "
+                    "ORDER BY id LIMIT 1", (client_id,), one=True)
+        if not target:
+            continue
+        _mailbase_last_tick[client_id] = time.monotonic()
+        if already_applied_to(client_id, target["email"], statuses=("sent",)):
+            _q("UPDATE mail_base_targets SET status = 'skipped' WHERE id = ?", (target["id"],), commit=True)
+            continue
+        ok, err = await _mailbase_send(bot, client, target["email"])
+        if ok:
+            _q("UPDATE mail_base_targets SET status = 'sent', sent_at = ? WHERE id = ?",
+               (datetime.now().isoformat(), target["id"]), commit=True)
+            update_client(client_id, mailbase_sent_today=(client["mailbase_sent_today"] or 0) + 1)
+        else:
+            print(f"[mail_base_worker] не отправилось {target['email']} (клиент {client_id}): {err}")
+
+
+async def mail_base_worker(bot: Bot):
+    """Фоновый воркер точечной рассылки — проверяет активные кампании раз в минуту
+    и шлёт письма по расписанию (будни, окно времени, интервал)."""
+    await asyncio.sleep(45)
+    while True:
+        try:
+            await _mail_base_tick(bot)
+        except Exception as e:
+            print(f"[mail_base_worker] ошибка: {e}")
+        await asyncio.sleep(60)
 
 
 def history_text(client_id: int | None = None) -> str:
