@@ -1,4 +1,5 @@
 import asyncio
+import html
 import io
 import random
 import json
@@ -736,16 +737,19 @@ def ai_parse_batch(raw: str) -> list[dict]:
 
 
 def render_template(fields: dict, hide_contact: bool = False, lang: str | None = None) -> str:
+    # все значения экранируем: бот шлёт сообщения в режиме HTML, и любой «<»
+    # или «&» из текста вакансии («<hr@x.com>», «Salary <$500») раньше ломал
+    # публикацию целиком ошибкой Telegram «can't parse entities»
     def val(key):
         v = fields.get(key)
-        return v if v else None
+        return html.escape(str(v), quote=False) if v else None
 
     def as_list(key):
         v = fields.get(key)
         if isinstance(v, list):
-            return v
+            return [html.escape(str(x), quote=False) for x in v if x]
         if isinstance(v, str) and v.strip():
-            return [l for l in v.split("\n") if l.strip()]
+            return [html.escape(l, quote=False) for l in v.split("\n") if l.strip()]
         return []
 
     date_val = val("date") or val("dates")
@@ -779,7 +783,7 @@ def render_template(fields: dict, hide_contact: bool = False, lang: str | None =
 
     if fields.get("notes"):
         parts.append("")
-        parts.append(f"ℹ️ {fields['notes']}")
+        parts.append(f"ℹ️ {val('notes')}")
 
     if val("contact"):
         parts.append("")
@@ -790,7 +794,7 @@ def render_template(fields: dict, hide_contact: bool = False, lang: str | None =
 
     if fields.get("hashtags"):
         parts.append("")
-        parts.append(fields["hashtags"])
+        parts.append(val("hashtags"))
 
     parts.append("")
     parts.append(f"🔗 {CHANNEL_LINK}")
@@ -874,6 +878,25 @@ def duplicate_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+async def send_long(bot: Bot, chat_id: int, header: str, lines: list[str], filename: str = "list.txt"):
+    """Длинный список (email-дайджест и т.п.): если влезает в одно сообщение —
+    текстом, иначе — текстом первые строки + полный список файлом. Раньше при
+    >4096 символов Telegram отклонял сообщение, и купивший дайджест не получал ничего."""
+    text = header + "\n\n" + "\n".join(lines)
+    if len(text) <= 3900:
+        await bot.send_message(chat_id, text, parse_mode=None)
+        return
+    await bot.send_message(chat_id, header + "\n\n📎 Full list in the file below.", parse_mode=None)
+    await bot.send_document(chat_id, BufferedInputFile("\n".join(lines).encode("utf-8"), filename=filename))
+
+
+def weekly_emails() -> list[str]:
+    """Уникальные email из вакансий за 7 дней — одна функция и для счётчика,
+    и для демо, и для платной выдачи (раньше счётчик считал «контакты», а не
+    email, и цифра не совпадала с тем, что человек получал)."""
+    return sorted({e.lower() for e in (extract_email(c) for c in db.list_contacts_since(7)) if e})
+
+
 def admin_only(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -909,43 +932,73 @@ def next_digest_slot() -> datetime:
     return (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
 
 
-async def do_publish(bot: Bot, vacancy_id: int):
-    global _banner_file_id
-    row = db.get_vacancy(vacancy_id)
-    fields = dict(row)
-    text = render_template(fields)
+def _caption_from(text: str, limit: int = 1000) -> str:
+    """Подпись к фото ≤1024 символов, обрезанная ПО ЦЕЛЫМ СТРОКАМ — раньше
+    резали посередине, могли разрезать HTML-тег <b>…</b> или &amp;, и Telegram
+    отказывался публиковать длинную вакансию вообще."""
+    out, size = [], 0
+    for line in text.split("\n"):
+        if size + len(line) + 1 > limit:
+            break
+        out.append(line)
+        size += len(line) + 1
+    return "\n".join(out).rstrip() + "\n…\n\n👇 Full details below"
 
-    photo = _banner_file_id or FSInputFile(BANNER_PATH)
-    CAPTION_LIMIT = 1024
-    if len(text) <= CAPTION_LIMIT:
-        sent = await bot.send_photo(
-            chat_id=CHANNEL_ID, photo=photo, caption=text,
-            reply_markup=channel_keyboard(vacancy_id),
-        )
+
+async def do_publish(bot: Bot, vacancy_id: int) -> bool:
+    """Публикует вакансию в канал. Возвращает False, если она уже опубликована
+    (или публикуется прямо сейчас) — двойной тап по кнопке или кнопка из старого
+    сообщения больше не дают дубль поста в канале."""
+    global _banner_file_id
+    prev_status = db.claim_for_publish(vacancy_id)
+    if prev_status is None:
+        return False
+    try:
+        row = db.get_vacancy(vacancy_id)
+        fields = dict(row)
+        text = render_template(fields)
+        CAPTION_LIMIT = 1024
+        sent = None
+        try:
+            photo = _banner_file_id or FSInputFile(BANNER_PATH)
+            if len(text) <= CAPTION_LIMIT:
+                sent = await bot.send_photo(
+                    chat_id=CHANNEL_ID, photo=photo, caption=text,
+                    reply_markup=channel_keyboard(vacancy_id),
+                )
+            else:
+                # подпись к фото ограничена 1024 символами — короткая версия на
+                # баннере, полный текст с кнопками вторым сообщением следом
+                sent = await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=_caption_from(text))
+                await bot.send_message(
+                    chat_id=CHANNEL_ID, text=text,
+                    reply_markup=channel_keyboard(vacancy_id),
+                )
+        except Exception as e:
+            if sent is not None:
+                raise  # фото уже ушло — не дублируем пост текстом
+            # баннер не отправился (нет файла, сбой загрузки) — публикуем без картинки,
+            # чтобы вакансия всё равно вышла
+            print(f"[do_publish] баннер не отправился, публикую текстом: {type(e).__name__}: {e}")
+            sent = await bot.send_message(chat_id=CHANNEL_ID, text=text,
+                                          reply_markup=channel_keyboard(vacancy_id))
         db.set_status(vacancy_id, "published", sent.message_id)
-    else:
-        # подпись к фото у Telegram ограничена 1024 символами — обрезаем её
-        # с пометкой, а полный текст со всеми деталями шлём вторым обычным
-        # сообщением сразу следом, туда же переносим кнопки
-        caption = text[:1000].rstrip() + "…\n\n👇 Full details below"
-        sent = await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=caption)
-        await bot.send_message(
-            chat_id=CHANNEL_ID, text=text,
-            reply_markup=channel_keyboard(vacancy_id),
-        )
-        db.set_status(vacancy_id, "published", sent.message_id)
-    if not _banner_file_id and sent.photo:
+    except Exception:
+        db.set_status(vacancy_id, prev_status)  # вернуть как было — можно нажать ещё раз
+        raise
+    if not _banner_file_id and getattr(sent, "photo", None):
         _banner_file_id = sent.photo[-1].file_id  # кэшируем на все следующие публикации в этом процессе
 
-    # публикация в канал уже состоялась и подтверждена выше — рассылка
-    # подписчикам оборачивается отдельно, чтобы её сбой ни в коем случае
-    # не выглядел как ошибка самой публикации
+    # пост в канале уже вышел — рассылка подписчикам и email-отклики идут в фоне
+    asyncio.create_task(_after_publish(bot, vacancy_id, fields))
+    return True
+
+
+async def _after_publish(bot: Bot, vacancy_id: int, fields: dict):
     try:
         await notify_subscribers(bot, vacancy_id, fields)
     except Exception as e:
         print(f"[do_publish] Рассылка подписчикам не удалась (публикация в канал прошла успешно): {e}")
-
-    # черновики откликов по email с почты клиентов — тоже изолированно
     try:
         await email_apply.propose_for_vacancy(bot, vacancy_id)
     except Exception as e:
@@ -1024,18 +1077,18 @@ async def cmd_start(message: Message, command: CommandObject):
             "/revenue [дней] — доход в Stars за период (по умолчанию 7 дней)\n"
             "/blockuser [@ник или id] — заблокировать (бот перестанет отвечать)\n"
             "/unblockuser [@ник или id] — снять блокировку\n"
+            "/health — состояние бота: очередь, рассылки, ящики на паузе, возвраты\n"
+            "/backup — прислать копию базы данных файлом (автоматически — каждую ночь)\n"
             f"/autopublish on|off — автопубликация без подтверждения (сейчас {mode})"
         )
         # email-дайджест за неделю — только тебе, никто другой это не увидит.
         # Обёрнуто в try/except: если тут что-то сломается, это не должно
         # выглядеть как "бот вообще не ответил" — основной текст выше уже ушёл
         try:
-            contacts = db.list_contacts_since(7)
-            emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
+            emails = weekly_emails()
             if emails:
-                await message.answer(
-                    f"📧 Email за последние 7 дней ({len(emails)}):\n\n" + "\n".join(emails)
-                )
+                await send_long(message.bot, message.chat.id, f"📧 Email за последние 7 дней ({len(emails)}):",
+                                emails, filename="emails_7_days.txt")
         except Exception as e:
             await message.answer(f"⚠️ Не удалось собрать email-дайджест: {e}")
         return
@@ -1129,8 +1182,9 @@ async def cb_pay_subscription(callback: CallbackQuery):
     if db.is_blocked(tg_id):
         await callback.answer()
         return
-    _, days_str, price_str = callback.data.split(":")
-    days, price = int(days_str), int(price_str)
+    # дни и цену НЕ берём из callback_data: модифицированный клиент Telegram
+    # может прислать любые данные кнопки (например «365 дней за 1 звезду»)
+    days, price = SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS
     await callback.bot.send_invoice(
         chat_id=tg_id,
         title=f"OffshoreAtSea — Job Alerts ({days} days)",
@@ -1267,7 +1321,7 @@ def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> Inline
 async def cb_digest_count(callback: CallbackQuery):
     tg_id = callback.from_user.id
     lang = db.get_subscriber_language(tg_id)
-    count = len(db.list_contacts_since(7))
+    count = len(weekly_emails())
     await callback.answer(t(lang, "digest_count_text", count=count), show_alert=True)
 
 
@@ -1285,8 +1339,7 @@ async def cb_digest_demo(callback: CallbackQuery):
     if used >= DIGEST_DEMO_FREE_USES:
         await callback.answer(t(lang, "digest_demo_exhausted"), show_alert=True)
         return
-    contacts = db.list_contacts_since(7)
-    emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
+    emails = weekly_emails()
     if not emails:
         await callback.answer(t(lang, "digest_empty"), show_alert=True)
         return
@@ -1357,16 +1410,25 @@ async def deliver_email_digest(bot: Bot, tg_id: int, charge_id: str,
     """Общая точка доставки купленного дайджеста — используется и для оплаты
     звёздами, и для Stripe."""
     amount = amount if amount is not None else EMAIL_DIGEST_PRICE_STARS
+    if charge_id and db.payment_exists(charge_id):
+        print(f"[deliver_email_digest] платёж {charge_id} уже обработан — повтор от Stripe/Telegram пропущен")
+        return
     db.insert_payment(tg_id, amount, 0, charge_id, provider=provider, currency=currency)
     lang = db.get_subscriber_language(tg_id)
-    contacts = db.list_contacts_since(7)
-    emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
-    if emails:
-        await bot.send_message(
-            tg_id, t(lang, "digest_delivered", count=len(emails)) + "\n\n" + "\n".join(emails)
-        )
-    else:
-        await bot.send_message(tg_id, t(lang, "digest_empty"))
+    emails = weekly_emails()
+    try:
+        if emails:
+            await send_long(bot, tg_id, t(lang, "digest_delivered", count=len(emails)), emails,
+                            filename="emails_last_7_days.txt")
+        else:
+            await bot.send_message(tg_id, t(lang, "digest_empty"))
+    except TelegramAPIError as e:
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, f"⚠️ Дайджест оплачен, но не доставлен id{tg_id}: "
+                                                 f"{html.escape(str(e))}. Отправьте вручную.")
+            except TelegramAPIError:
+                pass
 
     username_row = db.find_subscriber_by_handle(str(tg_id))
     handle = f"@{username_row['username']}" if username_row and username_row["username"] else f"id{tg_id}"
@@ -1394,6 +1456,11 @@ async def finalize_subscription_payment(bot: Bot, tg_id: int, days: int, amount,
     реферальный бонус, уведомление админу. Должности НЕ разблокируются —
     выбор постоянный, продление лишь продлевает доступ по уже выбранным
     должностям (см. permanent lock, cb_subscribe_done)."""
+    if charge_id and db.payment_exists(charge_id):
+        # Stripe повторяет вебхук, если ответ задержался, — без этой проверки
+        # одна оплата продлевала подписку дважды (и дважды давала реф. бонус)
+        print(f"[finalize_subscription_payment] платёж {charge_id} уже обработан — повтор пропущен")
+        return
     is_first_payment = db.count_payments(tg_id) == 0
     db.insert_payment(tg_id, amount, days, charge_id, provider=provider, currency=currency)
     new_until = db.extend_subscription(tg_id, days)
@@ -1457,6 +1524,12 @@ async def process_successful_payment(message: Message):
         days, price = int(days_str), int(price_str)
     except (ValueError, AttributeError):
         days, price = SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS
+    # сверяем с реально оплаченной суммой: дни выдаём пропорционально оплате,
+    # не больше, чем по текущему тарифу
+    paid = sp.total_amount or 0
+    fair_days = SUBSCRIPTION_DAYS * paid // max(SUBSCRIPTION_PRICE_STARS, 1)
+    days = max(1, min(days, fair_days))
+    price = paid
 
     await finalize_subscription_payment(
         message.bot, tg_id, days, price, "XTR", sp.telegram_payment_charge_id,
@@ -1781,7 +1854,19 @@ def consult_keyboard() -> InlineKeyboardMarkup:
 async def handle_vacancy_text(message: Message):
     if not admin_only(message.from_user.id):
         return
+    await process_vacancy_text(message, message.text)
 
+
+# вакансия, присланная КАРТИНКОЙ с подписью (или пересланный пост с фото) —
+# раньше бот такие сообщения молча игнорировал
+@router.message(F.caption & ~F.caption.startswith("/") & (F.photo | F.forward_origin))
+async def handle_vacancy_caption(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await process_vacancy_text(message, message.caption)
+
+
+async def process_vacancy_text(message: Message, raw: str):
     user_id = message.from_user.id
 
     # режим исправления — админ прислал текст с правильными полями
@@ -1789,8 +1874,8 @@ async def handle_vacancy_text(message: Message):
     if user_id in pending_corrections:
         vacancy_id = pending_corrections.pop(user_id)
         row = db.get_vacancy(vacancy_id)
-        corrected_fields = parse_template_text_to_fields(message.text)
-        db.insert_correction(row["raw_text"] or "", json.dumps(corrected_fields, ensure_ascii=False))
+        corrected_fields = parse_template_text_to_fields(raw)
+        db.insert_correction((row["raw_text"] if row else "") or "", json.dumps(corrected_fields, ensure_ascii=False))
         await message.answer(
             "Спасибо, запомнил. На похожих вакансиях в следующий раз буду разбирать точнее."
         )
@@ -1802,20 +1887,25 @@ async def handle_vacancy_text(message: Message):
         global _ad_counter
         _ad_counter += 1
         ad_id = _ad_counter
-        ad_drafts[ad_id] = message.text
+        # html_text сохраняет форматирование админа и экранирует «<», «&» —
+        # иначе такой символ в рекламе ломал публикацию
+        ad_drafts[ad_id] = message.html_text if message.text else html.escape(raw, quote=False)
         await message.answer(
-            message.text + "\n\n<i>Опубликовать этот рекламный пост?</i>",
+            ad_drafts[ad_id] + "\n\n<i>Опубликовать этот рекламный пост?</i>",
             reply_markup=ad_keyboard(ad_id),
         )
         return
 
     status_msg = await message.answer("Разбираю...")
     auto = is_auto_publish()
-    for fields in ai_parse_batch(message.text):
+    # разбор через Claude идёт в отдельном потоке: синхронный вызов API занимал
+    # 10–60 сек и на это время замораживал ВЕСЬ бот (кнопки подписчиков,
+    # очередь, вебхук Stripe, точечные рассылки)
+    for fields in await asyncio.to_thread(ai_parse_batch, raw):
         key = dedup_key_for(fields)
         dup = db.find_recent_duplicate(key)
 
-        vacancy_id = db.insert_vacancy(fields, key, raw_text=message.text)
+        vacancy_id = db.insert_vacancy(fields, key, raw_text=raw)
         text = render_template(fields)
 
         if dup:
@@ -1831,9 +1921,9 @@ async def handle_vacancy_text(message: Message):
             try:
                 await do_publish(message.bot, vacancy_id)
                 await message.answer(text + "\n\n✅ Опубликовано автоматически")
-            except TelegramAPIError as e:
+            except Exception as e:
                 await message.answer(
-                    f"❌ Не удалось опубликовать автоматически: {e}\n\n{text}",
+                    f"❌ Не удалось опубликовать автоматически: {html.escape(str(e))}\n\n{text}",
                     reply_markup=draft_keyboard(vacancy_id),
                 )
         else:
@@ -2291,9 +2381,15 @@ async def cmd_refund(message: Message, command: CommandObject):
     if not row:
         await message.answer(f"Не нашёл {handle} в базе подписчиков.")
         return
-    payment = db.get_last_unrefunded_payment(row["tg_id"])
+    # вернуть автоматически можно только Stars; оплату картой возвращают в Stripe Dashboard
+    payment = db.get_last_unrefunded_payment(row["tg_id"], provider="stars")
     if not payment:
-        await message.answer(f"У {handle} нет неоплаченных возвратом платежей.")
+        other = db.get_last_unrefunded_payment(row["tg_id"])
+        if other and other["provider"] == "stripe":
+            await message.answer(f"Последняя оплата {handle} — картой (Stripe). Возврат делается в Stripe "
+                                 f"Dashboard → Payments → Refund; доступ снять — /revoke {handle}.")
+        else:
+            await message.answer(f"У {handle} нет платежей звёздами, которые можно вернуть.")
         return
     try:
         await message.bot.refund_star_payment(
@@ -2303,7 +2399,9 @@ async def cmd_refund(message: Message, command: CommandObject):
         await message.answer(f"❌ Не удалось вернуть: {e}")
         return
     db.mark_payment_refunded(payment["id"])
-    await message.answer(f"✅ Возвращено {payment['amount_stars']}⭐ пользователю {handle}.")
+    db.shorten_subscription(row["tg_id"], payment["days"] or 0)  # деньги вернули — оплаченные дни снимаем
+    await message.answer(f"✅ Возвращено {payment['amount_stars']}⭐ пользователю {handle}, "
+                         f"доступ уменьшен на {payment['days'] or 0} дн.")
 
 
 @router.message(Command("revenue"))
@@ -2478,7 +2576,7 @@ async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
             if tg_id not in recipients:
                 recipients.append(tg_id)
     for tg_id in recipients:
-        if db.was_notification_sent(tg_id, vacancy_id):
+        if db.was_notification_sent(tg_id, vacancy_id) or db.is_blocked(tg_id):
             continue
         try:
             lang = db.get_subscriber_language(tg_id)
@@ -2530,6 +2628,9 @@ async def cmd_applications(message: Message):
 
 @router.callback_query(F.data.startswith("adpub:"))
 async def cb_ad_publish(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer()
+        return
     ad_id = int(callback.data.split(":")[1])
     text = ad_drafts.pop(ad_id, None)
     if not text:
@@ -2542,6 +2643,9 @@ async def cb_ad_publish(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("adcancel:"))
 async def cb_ad_cancel(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer()
+        return
     ad_id = int(callback.data.split(":")[1])
     ad_drafts.pop(ad_id, None)
     await callback.message.edit_text("Отменено")
@@ -2571,23 +2675,35 @@ async def cmd_testchannel(message: Message):
 
 @router.callback_query(F.data.startswith("pub:"))
 async def cb_publish(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer()
+        return
     vacancy_id = int(callback.data.split(":")[1])
     try:
-        await do_publish(callback.bot, vacancy_id)
-    except TelegramAPIError as e:
+        published = await do_publish(callback.bot, vacancy_id)
+    except Exception as e:
         await callback.message.answer(
-            f"❌ Не удалось опубликовать: {e}\n\n"
+            f"❌ Не удалось опубликовать: {html.escape(str(e))}\n\n"
             f"Частая причина — бот не админ канала {CHANNEL_ID} "
             f"или у него нет права «Публикация сообщений»."
         )
         await callback.answer("Ошибка публикации")
         return
-    await callback.message.edit_text(callback.message.html_text + "\n\n✅ Опубликовано")
+    if not published:
+        await callback.answer("Эта вакансия уже опубликована (или отменена) — повтора не будет.", show_alert=True)
+        return
     await callback.answer("Опубликовано в канал")
+    try:
+        await callback.message.edit_text(callback.message.html_text + "\n\n✅ Опубликовано")
+    except TelegramAPIError:
+        await callback.message.edit_reply_markup(reply_markup=None)
 
 
 @router.callback_query(F.data.startswith("queue:"))
 async def cb_queue(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer()
+        return
     vacancy_id = int(callback.data.split(":")[1])
     await callback.message.edit_reply_markup(reply_markup=queue_delay_keyboard(vacancy_id))
     await callback.answer()
@@ -2595,8 +2711,15 @@ async def cb_queue(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("queuedelay:"))
 async def cb_queue_delay(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer()
+        return
     _, vacancy_id_str, hours_str = callback.data.split(":")
     vacancy_id, hours = int(vacancy_id_str), int(hours_str)
+    row = db.get_vacancy(vacancy_id)
+    if not row or row["status"] in ("published", "publishing", "cancelled"):
+        await callback.answer("Вакансия уже опубликована или отменена.", show_alert=True)
+        return
     slot = datetime.now() + timedelta(hours=hours)
     db.set_schedule(vacancy_id, slot.isoformat())
     await callback.message.edit_text(
@@ -2607,6 +2730,9 @@ async def cb_queue_delay(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer()
+        return
     vacancy_id = int(callback.data.split(":")[1])
     db.set_status(vacancy_id, "cancelled")
     await callback.message.edit_text("Отменено")
@@ -2615,6 +2741,9 @@ async def cb_cancel(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("fix:"))
 async def cb_fix(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer()
+        return
     vacancy_id = int(callback.data.split(":")[1])
     pending_corrections[callback.from_user.id] = vacancy_id
     await callback.message.answer(
@@ -2622,6 +2751,109 @@ async def cb_fix(callback: CallbackQuery):
         "неверные строки, оставив те же эмодзи-метки (🚢 Vessel:, 🌍 Region: и т.д.)."
     )
     await callback.answer()
+
+
+BACKUP_HOUR = int(os.getenv("BACKUP_HOUR", "3"))  # час ночного бэкапа базы админу; -1 — выключить
+
+
+def _make_backup_file() -> tuple[bytes, str]:
+    """Консистентная копия SQLite (через backup API — безопасно при работающем боте)."""
+    import sqlite3
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    src = db.get_conn()
+    dst = sqlite3.connect(tmp.name)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    with open(tmp.name, "rb") as f:
+        data = f.read()
+    os.unlink(tmp.name)
+    return data, f"offshoreatsea_backup_{datetime.now():%Y-%m-%d_%H%M}.db"
+
+
+async def send_backup(bot: Bot, chat_ids: list[int]):
+    data, name = await asyncio.to_thread(_make_backup_file)
+    if len(data) > 49 * 1024 * 1024:
+        for cid in chat_ids:
+            await bot.send_message(cid, f"⚠️ База {len(data) // 1024 // 1024} МБ — больше лимита Telegram "
+                                        f"(50 МБ), бэкап файлом невозможен.")
+        return
+    for cid in chat_ids:
+        try:
+            await bot.send_document(cid, BufferedInputFile(data, filename=name),
+                                    caption="💾 Резервная копия базы бота (подписчики, оплаты, вакансии, клиенты).")
+        except TelegramAPIError as e:
+            print(f"[backup] не удалось отправить {cid}: {e}")
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await send_backup(message.bot, [message.chat.id])
+
+
+async def backup_worker(bot: Bot):
+    """Раз в сутки присылает админам копию базы — если Volume на Railway
+    когда-нибудь пропадёт или сломается, подписчики и оплаты не потеряются."""
+    last_day = None
+    while True:
+        try:
+            now = datetime.now()
+            if BACKUP_HOUR >= 0 and now.hour == BACKUP_HOUR and last_day != now.date():
+                last_day = now.date()
+                await send_backup(bot, ADMIN_IDS[:1])  # только главному админу
+        except Exception as e:
+            print(f"[backup_worker] {type(e).__name__}: {e}")
+        await asyncio.sleep(600)
+
+
+@router.message(Command("health"))
+async def cmd_health(message: Message):
+    """Одна команда, чтобы понять, всё ли работает."""
+    if not admin_only(message.from_user.id):
+        return
+    conn = db.get_conn()
+    try:
+        q = lambda sql, *a: conn.execute(sql, a).fetchone()[0]
+        today = datetime.now().strftime("%Y-%m-%d")
+        published_today = q("SELECT COUNT(*) FROM vacancies WHERE status='published' AND created_at LIKE ?", today + "%")
+        queued = q("SELECT COUNT(*) FROM vacancies WHERE status='queued'")
+        stuck = q("SELECT COUNT(*) FROM vacancies WHERE status='publishing'")
+        last_pub = q("SELECT MAX(created_at) FROM vacancies WHERE status='published'") or "—"
+        active_subs = q("SELECT COUNT(*) FROM subscribers WHERE subscription_until > ?", datetime.now().isoformat())
+        sent_today = q("SELECT COUNT(*) FROM mail_applications WHERE status='sent' AND sent_at LIKE ?", today + "%")
+        failed_today = q("SELECT COUNT(*) FROM mail_applications WHERE status='failed' AND created_at LIKE ?", today + "%")
+        drafts = q("SELECT COUNT(*) FROM mail_applications WHERE status='draft'")
+        campaigns = conn.execute("SELECT id, full_name FROM mail_clients WHERE mailbase_active = 1").fetchall()
+        paused = conn.execute("SELECT full_name, gmail_blocked_until FROM mail_clients "
+                              "WHERE gmail_blocked_until > ?", (datetime.now().isoformat(),)).fetchall()
+        bounces = q("SELECT COUNT(*) FROM mail_bounces")
+    finally:
+        conn.close()
+    size_mb = os.path.getsize(db.DB_PATH) / 1024 / 1024 if os.path.exists(db.DB_PATH) else 0
+    on_volume = db.DB_PATH.startswith("/data")
+    lines = [
+        "🩺 <b>Состояние бота</b>\n",
+        f"🗄 База: {size_mb:.1f} МБ · {'✅ на Volume' if on_volume else '⚠️ НЕ на Volume — данные сотрутся при деплое (DB_PATH)'}",
+        f"📢 Опубликовано сегодня: {published_today} · в очереди: {queued}"
+        + (f" · ⚠️ зависли в публикации: {stuck}" if stuck else ""),
+        f"🕒 Последняя публикация: {str(last_pub)[:16].replace('T', ' ')}",
+        f"👥 Активных подписок: {active_subs}",
+        f"✉️ Писем клиентов сегодня: {sent_today}" + (f" · ❌ ошибок: {failed_today}" if failed_today else "")
+        + (f" · 📝 ждут подтверждения: {drafts}" if drafts else ""),
+        f"🎯 Точечных рассылок идёт: {len(campaigns)}"
+        + (" (" + ", ".join(html.escape(c['full_name']) for c in campaigns) + ")" if campaigns else ""),
+        f"📭 Недоставляемых адресов в базе: {bounces}",
+    ]
+    if paused:
+        lines.append("⛔️ Ящики на паузе (лимит почты): " + ", ".join(
+            f"{html.escape(p['full_name'])} до {p['gmail_blocked_until'][11:16]}" for p in paused))
+    await message.answer("\n".join(lines))
 
 
 async def digest_worker(bot: Bot):
@@ -2635,6 +2867,15 @@ async def digest_worker(bot: Bot):
                     await do_publish(bot, row["id"])
                 except Exception as e:
                     print(f"[digest_worker] не удалось опубликовать #{row['id']}: {type(e).__name__}: {e}")
+                    # не долбим канал каждую минуту — следующая попытка через 15 мин,
+                    # и сообщаем админу, чтобы отложенная вакансия не пропала молча
+                    db.set_schedule(row["id"], (datetime.now() + timedelta(minutes=15)).isoformat())
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await bot.send_message(admin_id, f"⚠️ Отложенная вакансия #{row['id']} не опубликовалась: "
+                                                             f"{html.escape(str(e))[:300]}\nПовторю через 15 минут.")
+                        except TelegramAPIError:
+                            pass
         except Exception as e:
             print(f"[digest_worker] ошибка: {type(e).__name__}: {e}")
         await asyncio.sleep(60)
@@ -2684,6 +2925,7 @@ async def scheduled_ads_worker(bot: Bot):
 
 async def main():
     db.init_db()
+    db.reset_stuck_publishing()
     email_apply.init_tables()
     email_apply.setup(ADMIN_IDS, claude, RANK_TAGS, TAG_LABELS)
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -2695,6 +2937,7 @@ async def main():
     asyncio.create_task(scheduled_ads_worker(bot))
     asyncio.create_task(email_apply.mail_base_worker(bot))
     asyncio.create_task(email_apply.bounce_worker(bot))  # ловит письма «не доставлено» и исключает такие адреса
+    asyncio.create_task(backup_worker(bot))
     # текст, видимый в ПУСТОМ чате до первого нажатия Start — ставится через
     # Bot API, не хранится нигде в БД, просто применяется заново при каждом
     # старте, чтобы не зависеть от ручной настройки через BotFather

@@ -7,7 +7,9 @@
 import hashlib
 import hmac
 import json
+import asyncio
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -64,7 +66,10 @@ def vacancy_to_dict(row) -> dict:
         "salary": row["salary"],
         "documents": as_list(row["documents"]),
         "requirements": as_list(row["requirements"]),
-        "contact": row["contact"],
+        # контакт (email работодателя) в публичный API НЕ отдаём: /api/vacancies
+        # открыт без авторизации, и любой мог выгрузить всю базу email — то, что
+        # бот продаёт как платный дайджест. Мини-приложение контакт не показывает.
+        "contact": None,
         "hashtags": row["hashtags"],
     }
 
@@ -84,6 +89,7 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
                on_stripe_renewal=None, on_stripe_upcoming=None,
                on_stripe_unmatched_payment=None) -> web.Application:
     app = web.Application()
+    _last_apply: dict[int, float] = {}
 
     def get_authenticated_tg_id(init_data: str) -> int | None:
         """Проверяет подпись initData и достаёт id пользователя. Используется
@@ -116,7 +122,18 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
         event_type = event["type"]
         obj = event["data"]["object"]
 
-        if event_type == "checkout.session.completed":
+        # обрабатываем ДО ответа: если бот перезапустится посреди обработки, Stripe
+        # не получит 200 и пришлёт событие ещё раз — оплата не потеряется.
+        # Повторы одной и той же оплаты отсекаются по charge_id (payment_exists)
+        await _process_stripe_event(event_type, obj)
+        return web.Response(status=200, text="ok")
+
+    async def _process_stripe_event(event_type: str, obj) -> None:
+        if event_type == "checkout.session.completed" and obj.get("payment_status") == "unpaid":
+            # отложенные способы оплаты: деньги ещё не пришли — ждём
+            # checkout.session.async_payment_succeeded
+            return
+        if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
             # ПЕРВАЯ оплата подписки/дайджеста — Stripe создаёт checkout-сессию
             # только один раз, при следующих продлениях этого события больше
             # не будет (см. invoice.paid ниже)
@@ -182,8 +199,6 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
                     await on_stripe_upcoming(bot, customer_id, amount, currency)
                 except Exception as e:
                     print(f"[stripe webhook] Ошибка обработки напоминания для customer={customer_id}: {e}")
-
-        return web.Response(status=200, text="ok")
 
     async def handle_get_profile(request: web.Request) -> web.Response:
         init_data = request.query.get("initData", "")
@@ -255,13 +270,19 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
         except json.JSONDecodeError:
             tg_user = {}
 
-        vacancy_id = body.get("vacancy_id")
-        contact = (body.get("contact") or "").strip()
-        message = (body.get("message") or "").strip()
-        name = (body.get("name") or tg_user.get("first_name") or "").strip()
+        vacancy_id = str(body.get("vacancy_id") or "")
+        contact = (body.get("contact") or "").strip()[:200]
+        message = (body.get("message") or "").strip()[:2000]
+        name = (body.get("name") or tg_user.get("first_name") or "").strip()[:100]
 
-        if not vacancy_id or not contact:
+        if not vacancy_id.isdigit() or not contact or not db.get_vacancy(int(vacancy_id)):
             return web.json_response({"error": "missing_fields"}, status=400)
+        # не больше одного отклика в 20 секунд от одного человека — защита от спама админам
+        uid = tg_user.get("id") or 0
+        now = time.monotonic()
+        if now - _last_apply.get(uid, 0) < 20:
+            return web.json_response({"error": "too_fast"}, status=429)
+        _last_apply[uid] = now
 
         db.insert_application(
             vacancy_id=int(vacancy_id),
@@ -276,11 +297,13 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
         position = vacancy["position"] if vacancy else "вакансия"
         admin_ids = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-        notify_lines = [f"📥 Новый отклик на «{position}»", "", f"Имя: {name or '—'}", f"Контакт: {contact}"]
+        esc = lambda v: str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        notify_lines = [f"📥 Новый отклик на «{esc(position)}»", "", f"Имя: {esc(name or '—')}",
+                        f"Контакт: {esc(contact)}"]
         if tg_user.get("username"):
-            notify_lines.append(f"Telegram: @{tg_user['username']}")
+            notify_lines.append(f"Telegram: @{esc(tg_user['username'])}")
         if message:
-            notify_lines.append(f"\nСообщение: {message}")
+            notify_lines.append(f"\nСообщение: {esc(message)}")
         notify_text = "\n".join(notify_lines)
 
         for admin_id in admin_ids:

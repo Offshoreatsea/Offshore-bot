@@ -286,6 +286,33 @@ def set_status(vacancy_id: int, status: str, channel_message_id: int | None = No
     conn.close()
 
 
+def reset_stuck_publishing():
+    """После перезапуска ни одна вакансия не может публиковаться «прямо сейчас» —
+    зависшие в статусе 'publishing' возвращаем в черновики."""
+    conn = get_conn()
+    conn.execute("UPDATE vacancies SET status = CASE WHEN scheduled_time IS NOT NULL THEN 'queued' ELSE 'draft' END "
+                 "WHERE status = 'publishing'")
+    conn.commit()
+    conn.close()
+
+
+def claim_for_publish(vacancy_id: int) -> str | None:
+    """Атомарно помечает вакансию как «публикуется». Возвращает прежний статус
+    (чтобы вернуть его при ошибке) или None, если её публиковать нельзя:
+    уже опубликована / публикуется прямо сейчас / отменена / не найдена."""
+    conn = get_conn()
+    row = conn.execute("SELECT status FROM vacancies WHERE id = ?", (vacancy_id,)).fetchone()
+    if not row or row["status"] in ("published", "publishing", "cancelled"):
+        conn.close()
+        return None
+    prev = row["status"] or "draft"
+    cur = conn.execute("UPDATE vacancies SET status = 'publishing' WHERE id = ? AND status = ?",
+                       (vacancy_id, prev))
+    conn.commit()
+    conn.close()
+    return prev if cur.rowcount == 1 else None
+
+
 def set_schedule(vacancy_id: int, scheduled_time: str):
     conn = get_conn()
     conn.execute(
@@ -467,6 +494,10 @@ def extend_subscription(tg_id: int, days: int):
     даты истечения, если она ещё не прошла — чтобы досрочная повторная
     оплата не сгорала впустую)."""
     conn = get_conn()
+    # человек мог нажать /subscribe до выбора языка — строки в subscribers ещё
+    # нет, и UPDATE ниже молча ничего не делал (триал «выдавался», но не сохранялся)
+    conn.execute("INSERT OR IGNORE INTO subscribers (tg_id, subscribed_at) VALUES (?, ?)",
+                 (tg_id, datetime.now().isoformat()))
     row = conn.execute(
         "SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)
     ).fetchone()
@@ -571,6 +602,13 @@ def revoke_subscription(tg_id: int):
     conn.close()
 
 
+def payment_exists(charge_id: str) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT 1 FROM payments WHERE charge_id = ? LIMIT 1", (charge_id,)).fetchone()
+    conn.close()
+    return bool(row)
+
+
 def insert_payment(tg_id: int, amount: float, days: int, charge_id: str,
                     provider: str = "stars", currency: str = "XTR"):
     conn = get_conn()
@@ -583,15 +621,33 @@ def insert_payment(tg_id: int, amount: float, days: int, charge_id: str,
     conn.close()
 
 
-def get_last_unrefunded_payment(tg_id: int):
+def get_last_unrefunded_payment(tg_id: int, provider: str | None = None):
     conn = get_conn()
-    row = conn.execute(
-        """SELECT * FROM payments WHERE tg_id = ? AND refunded = 0
-           ORDER BY id DESC LIMIT 1""",
-        (tg_id,),
-    ).fetchone()
+    if provider:
+        row = conn.execute(
+            """SELECT * FROM payments WHERE tg_id = ? AND refunded = 0 AND provider = ?
+               ORDER BY id DESC LIMIT 1""",
+            (tg_id, provider),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """SELECT * FROM payments WHERE tg_id = ? AND refunded = 0
+               ORDER BY id DESC LIMIT 1""",
+            (tg_id,),
+        ).fetchone()
     conn.close()
     return row
+
+
+def shorten_subscription(tg_id: int, days: int):
+    """Снимает N дней доступа (после возврата денег)."""
+    conn = get_conn()
+    row = conn.execute("SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)).fetchone()
+    if row and row["subscription_until"] and days:
+        new_until = (datetime.fromisoformat(row["subscription_until"]) - timedelta(days=days)).isoformat()
+        conn.execute("UPDATE subscribers SET subscription_until = ? WHERE tg_id = ?", (new_until, tg_id))
+        conn.commit()
+    conn.close()
 
 
 def mark_payment_refunded(payment_id: int):
