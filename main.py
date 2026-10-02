@@ -12,7 +12,7 @@ import stripe
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
@@ -954,7 +954,7 @@ async def do_publish(bot: Bot, vacancy_id: int):
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
-    if command.args and command.args.startswith("apply_"):
+    if command.args and command.args.startswith("apply_") and command.args[6:].isdigit():
         vacancy_id = int(command.args.replace("apply_", ""))
         db.increment_clicks(vacancy_id)
         row = db.get_vacancy(vacancy_id)
@@ -2088,8 +2088,32 @@ async def cmd_remove_ad(message: Message, command: CommandObject):
         await message.answer(f"Не нашёл рекламу #{arg}.")
 
 
+# неподтверждённая рассылка админа: (tg_id получателя или None = всем, текст).
+# Храним в памяти, а не в callback_data — там лимит 64 байта
+_pending_broadcasts: dict[int, tuple[int | None, str, str]] = {}
+
+
+def _bcast_keyboard(label: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=label, callback_data="bcast_confirm"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="bcast_cancel"),
+    ]])
+
+
+async def _bcast_preview(message: Message, preview: str, label: str):
+    try:
+        await message.answer(preview, reply_markup=_bcast_keyboard(label))
+    except TelegramAPIError as e:
+        _pending_broadcasts.pop(message.from_user.id, None)
+        await message.answer(f"❌ Telegram не принял текст (скорее всего, ошибка в HTML-разметке <b> и т.п.): "
+                             f"{str(e)[:200]}", parse_mode=None)
+
+
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: Message, command: CommandObject):
+    """/broadcast Текст — всем, кто пользовался ботом; /broadcast @ник Текст — одному.
+    Перед отправкой показывает превью с кнопками «Отправить / Отмена», чтобы
+    опечатка не улетела мгновенно всей базе."""
     if not admin_only(message.from_user.id):
         return
     raw = (command.args or "").strip()
@@ -2098,13 +2122,13 @@ async def cmd_broadcast(message: Message, command: CommandObject):
             "Использование:\n"
             "/broadcast Текст — всем, кто пользовался ботом\n"
             "/broadcast @ник Текст — только этому человеку\n\n"
-            "Можно писать несколько строк — всё после ника уйдёт как есть."
+            "Можно писать несколько строк — всё после ника уйдёт как есть. "
+            "Перед отправкой покажу превью."
         )
         return
 
     # если первое слово похоже на адресата (@ник или числовой id) и реально
-    # находится в базе — считаем это точечной рассылкой одному человеку,
-    # а не частью текста сообщения
+    # находится в базе — это сообщение одному человеку, а не часть текста
     first_word, _, rest = raw.partition(" ")
     target_row = None
     if first_word.startswith("@") or first_word.isdigit():
@@ -2115,31 +2139,55 @@ async def cmd_broadcast(message: Message, command: CommandObject):
         if not text:
             await message.answer(f"Использование: /broadcast {first_word} Текст сообщения")
             return
-        tg_id = target_row["tg_id"]
-        try:
-            await message.bot.send_message(tg_id, text)
-            await message.answer(f"✅ Отправлено {first_word}.")
-        except TelegramAPIError as e:
-            await message.answer(f"❌ Не удалось отправить {first_word}: {e}")
+        _pending_broadcasts[message.from_user.id] = (target_row["tg_id"], text, first_word)
+        await _bcast_preview(message, f"Превью сообщения для {first_word}:\n\n{text}", "✅ Отправить")
         return
 
-    text = raw
     ids = db.get_all_bot_users()
     if not ids:
         await message.answer("Пока никто не пользовался ботом — рассылать некому.")
         return
+    _pending_broadcasts[message.from_user.id] = (None, raw, "")
+    await _bcast_preview(message, f"Превью сообщения для {len(ids)} пользователей:\n\n{raw}",
+                         f"✅ Отправить всем ({len(ids)})")
 
-    await message.answer(f"⏳ Рассылаю сообщение {len(ids)} пользователям...")
+
+@router.callback_query(F.data == "bcast_cancel")
+async def cb_broadcast_cancel(callback: CallbackQuery):
+    _pending_broadcasts.pop(callback.from_user.id, None)
+    await callback.message.edit_text("Рассылка отменена.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "bcast_confirm")
+async def cb_broadcast_confirm(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer()
+        return
+    pending = _pending_broadcasts.pop(callback.from_user.id, None)
+    if not pending:
+        await callback.answer("Текст рассылки не найден — отправьте /broadcast заново.", show_alert=True)
+        return
+    target, text, handle = pending
+    await callback.answer()
+    if target is not None:
+        try:
+            await send_with_retry(callback.bot, target, text)
+            await callback.message.edit_text(f"✅ Отправлено {handle}.")
+        except TelegramAPIError as e:
+            await callback.message.edit_text(f"❌ Не удалось отправить {handle}: {e}")
+        return
+    ids = db.get_all_bot_users()
+    await callback.message.edit_text(f"⏳ Рассылаю сообщение {len(ids)} пользователям...")
     sent, failed = 0, 0
     for tg_id in ids:
         try:
-            await message.bot.send_message(tg_id, text)
+            await send_with_retry(callback.bot, tg_id, text)
             sent += 1
         except TelegramAPIError:
             failed += 1
         await asyncio.sleep(0.05)  # не спамим Telegram API пачкой без пауз
-
-    await message.answer(f"✅ Готово. Разослано: {sent}, не доставлено: {failed} (из {len(ids)}).")
+    await callback.message.answer(f"✅ Готово. Разослано: {sent}, не доставлено: {failed} (из {len(ids)}).")
 
 
 @router.message(Command("extendall"))
@@ -2398,6 +2446,19 @@ async def cb_subscribe_done(callback: CallbackQuery):
     await callback.answer()
 
 
+async def send_with_retry(bot: Bot, chat_id, text: str, **kwargs):
+    """send_message с учётом флуд-контроля Telegram: при массовой отправке
+    Telegram иногда отвечает «подождите N секунд» — раньше такой человек
+    просто молча не получал сообщение. Теперь ждём и пробуем ещё раз."""
+    for attempt in range(3):
+        try:
+            return await bot.send_message(chat_id, text, **kwargs)
+        except TelegramRetryAfter as e:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(getattr(e, "retry_after", 5) + 1)
+
+
 async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
     """Дублирует свежеопубликованную вакансию в личку ВСЕМ, кто выбрал этот
     position_tag — независимо от того, платят они сейчас или нет. Разница
@@ -2422,8 +2483,8 @@ async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
         try:
             lang = db.get_subscriber_language(tg_id)
             hide_contact = not db.is_subscription_active(tg_id)
-            await bot.send_message(
-                tg_id, render_template(fields, hide_contact=hide_contact, lang=lang),
+            await send_with_retry(
+                bot, tg_id, render_template(fields, hide_contact=hide_contact, lang=lang),
                 reply_markup=channel_keyboard(vacancy_id),
             )
             db.mark_notification_sent(tg_id, vacancy_id)
@@ -2564,31 +2625,39 @@ async def cb_fix(callback: CallbackQuery):
 
 
 async def digest_worker(bot: Bot):
+    # любая ошибка внутри цикла раньше молча убивала воркер навсегда — и
+    # отложенные посты переставали публиковаться до следующего деплоя
     while True:
-        due = db.get_due_queue(datetime.now().isoformat())
-        for row in due:
-            try:
-                await do_publish(bot, row["id"])
-            except TelegramAPIError:
-                pass
+        try:
+            due = db.get_due_queue(datetime.now().isoformat())
+            for row in due:
+                try:
+                    await do_publish(bot, row["id"])
+                except Exception as e:
+                    print(f"[digest_worker] не удалось опубликовать #{row['id']}: {type(e).__name__}: {e}")
+        except Exception as e:
+            print(f"[digest_worker] ошибка: {type(e).__name__}: {e}")
         await asyncio.sleep(60)
 
 
 async def subscription_reminder_worker(bot: Bot):
     # проверяем раз в час — часто чаще и не нужно, окно напоминания 24ч
     while True:
-        expiring = db.get_expiring_subscribers(within_hours=24)
-        for row in expiring:
-            lang = row["language"]
-            try:
-                await bot.send_message(
-                    row["tg_id"],
-                    t(lang, "expiry_reminder"),
-                    reply_markup=payment_keyboard(lang, row["tg_id"]),
-                )
+        try:
+            expiring = db.get_expiring_subscribers(within_hours=24)
+            for row in expiring:
+                lang = row["language"]
+                try:
+                    await bot.send_message(
+                        row["tg_id"],
+                        t(lang, "expiry_reminder"),
+                        reply_markup=payment_keyboard(lang, row["tg_id"]),
+                    )
+                except TelegramAPIError:
+                    pass  # человек заблокировал бота — повторять каждый час смысла нет
                 db.mark_reminder_sent(row["tg_id"], row["subscription_until"])
-            except TelegramAPIError:
-                pass
+        except Exception as e:
+            print(f"[subscription_reminder_worker] ошибка: {type(e).__name__}: {e}")
         await asyncio.sleep(3600)
 
 
@@ -2597,16 +2666,19 @@ async def scheduled_ads_worker(bot: Bot):
     # ЧЧ:ММ; сама защита от повторной отправки в течение той же минуты —
     # через last_sent_date (проверяется по сегодняшней дате, не по времени)
     while True:
-        now = datetime.now()
-        now_hhmm = now.strftime("%H:%M")
-        today = now.strftime("%Y-%m-%d")
-        due = db.get_due_scheduled_ads(now_hhmm, today)
-        for ad in due:
-            try:
-                await bot.send_message(chat_id=CHANNEL_ID, text=ad["text"])
-                db.mark_scheduled_ad_sent(ad["id"], today)
-            except TelegramAPIError as e:
-                print(f"[scheduled_ads_worker] Не удалось опубликовать рекламу #{ad['id']}: {e}")
+        try:
+            now = datetime.now()
+            now_hhmm = now.strftime("%H:%M")
+            today = now.strftime("%Y-%m-%d")
+            due = db.get_due_scheduled_ads(now_hhmm, today)
+            for ad in due:
+                try:
+                    await bot.send_message(chat_id=CHANNEL_ID, text=ad["text"])
+                    db.mark_scheduled_ad_sent(ad["id"], today)
+                except TelegramAPIError as e:
+                    print(f"[scheduled_ads_worker] Не удалось опубликовать рекламу #{ad['id']}: {e}")
+        except Exception as e:
+            print(f"[scheduled_ads_worker] ошибка: {type(e).__name__}: {e}")
         await asyncio.sleep(60)
 
 
@@ -2622,6 +2694,7 @@ async def main():
     asyncio.create_task(subscription_reminder_worker(bot))
     asyncio.create_task(scheduled_ads_worker(bot))
     asyncio.create_task(email_apply.mail_base_worker(bot))
+    asyncio.create_task(email_apply.bounce_worker(bot))  # ловит письма «не доставлено» и исключает такие адреса
     # текст, видимый в ПУСТОМ чате до первого нажатия Start — ставится через
     # Bot API, не хранится нигде в БД, просто применяется заново при каждом
     # старте, чтобы не зависеть от ручной настройки через BotFather

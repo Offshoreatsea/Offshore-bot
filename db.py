@@ -1,18 +1,48 @@
 import os
+import random
 import sqlite3
+import time
 from datetime import datetime, timedelta
 
 DB_PATH = os.getenv("DB_PATH") or "bot.db"
 
 
+class _RetryConnection(sqlite3.Connection):
+    """Соединение, которое повторяет операцию при "database is locked".
+    В боте одновременно пишут хендлеры, воркеры (очередь, точечная рассылка,
+    проверка возвратов) и веб-сервер, а у SQLite один писатель за раз —
+    без повтора запрос иногда падал, и письмо/подписка не сохранялись.
+    Повтор безопасен: упавший запрос не применился."""
+
+    def _retry(self, fn, *args, **kwargs):
+        for attempt in range(8):
+            try:
+                return fn(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower() or attempt == 7:
+                    raise
+                time.sleep(0.05 * (attempt + 1) + random.random() * 0.05)
+
+    def execute(self, *args, **kwargs):
+        return self._retry(super().execute, *args, **kwargs)
+
+    def commit(self):
+        return self._retry(super().commit)
+
+
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    # ждать освобождения блокировки до 30 с вместо стандартных 5 с
+    conn = sqlite3.connect(DB_PATH, timeout=30, factory=_RetryConnection)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")  # безопасно вместе с WAL
     return conn
 
 
 def init_db():
     conn = get_conn()
+    # WAL: читатели не блокируют писателя и наоборот (режим хранится в файле базы)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS vacancies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
