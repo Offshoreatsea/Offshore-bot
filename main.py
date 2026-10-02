@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 
 import anthropic
@@ -15,6 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
@@ -23,6 +25,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
+    LinkPreviewOptions,
     MenuButtonWebApp,
     Message,
     PreCheckoutQuery,
@@ -1005,6 +1008,197 @@ async def _after_publish(bot: Bot, vacancy_id: int, fields: dict):
         print(f"[do_publish] Черновики email-откликов не созданы: {e}")
 
 
+# ---------------------------------------------------------------- инструкция для админов (по кнопкам)
+# Видна ТОЛЬКО админам: команда /admin, кнопка в /start админа. Обычные
+# пользователи ни команду, ни кнопки не видят (admin_only на каждом шаге).
+
+ADMIN_HELP = {
+    "pub": ("📢 Публикация вакансий",
+        "<b>Как выложить вакансию</b>\n"
+        "1. Пришлите боту текст вакансии в любом формате. Можно несколько сразу через <code>---</code>, "
+        "скриншот с подписью или пересланный пост.\n"
+        "2. Бот разберёт текст и покажет черновик с кнопками:\n"
+        "• <b>Опубликовать сейчас</b> — пост уходит в канал;\n"
+        "• <b>В очередь</b> — выберите задержку 1–8 ч, пост выйдет сам;\n"
+        "• <b>✏️ Исправить</b> — пришлите исправленный текст с теми же метками (🚢 Vessel:, 🌍 Region: …), "
+        "бот запомнит и в следующий раз разберёт точнее;\n"
+        "• <b>Отмена</b> — черновик удаляется.\n"
+        "3. Если похожая вакансия уже была, бот предупредит: «Всё равно опубликовать».\n\n"
+        "<b>Что происходит после публикации</b>\n"
+        "• вакансия уходит в личку подписчикам этой должности;\n"
+        "• если в ней есть email — клиентам с подходящей должностью готовятся отклики (раздел «Отклики»).\n\n"
+        "<b>Команды</b>\n"
+        "/autopublish on|off — публиковать без подтверждения\n"
+        "/stats — сводка за сегодня, /stats 7 — за 7 дней\n"
+        "/testchannel — проверить, может ли бот писать в канал\n"
+        "/contacts — все email/агентства из вакансий"),
+    "subs": ("👥 Подписчики и оплаты",
+        "<b>Как это устроено</b>\n"
+        "Кандидат жмёт «Get More Offers» → выбирает язык → получает 3 дня бесплатно → выбирает до 2 должностей. "
+        "После «Готово» выбор фиксируется до следующей оплаты. Дальше — оплата картой (Stripe).\n\n"
+        "<b>Смотреть</b>\n"
+        "/subscribers — сколько подписчиков и по каким должностям\n"
+        "/subscriberslist — полный список: ник, должности, до какого числа оплачено\n"
+        "/revenue [дней] — доход за период\n\n"
+        "<b>Управлять доступом</b>\n"
+        "/grant @ник 30 — выдать доступ вручную (оплатил не через бота)\n"
+        "/extendall 3 — подарить всем подписчикам 3 дня\n"
+        "/revoke @ник — снять доступ сразу\n"
+        "/refund @ник — вернуть оплату звёздами (карту — в Stripe Dashboard, затем /revoke)\n\n"
+        "<b>Должности подписчика</b>\n"
+        "/unlockpositions @ник — дать человеку перевыбрать должности\n"
+        "/lockpositions @ник — зафиксировать снова\n"
+        "/unlockall — разблокировать выбор всем\n"
+        "/testmatch — проверить, кому уйдёт вакансия по тегу\n\n"
+        "<b>Порядок</b>\n"
+        "/blockuser @ник · /unblockuser @ник — бот перестаёт/начинает отвечать человеку\n\n"
+        "Человек может сам: /mysubscription (сколько дней осталось), /managesubscription (отменить карту)."),
+    "mail": ("📧 Отклики клиентов (CV по email)",
+        "<b>Что это</b>\n"
+        "Ваши клиенты-моряки: бот отправляет их CV с их же почты на email из вакансий канала по их должности.\n\n"
+        "<b>Добавить клиента</b> — /mail → ➕ Добавить клиента:\n"
+        "имя → почта → <b>пароль приложения</b> (для Gmail: 16 символов, нужна двухэтапная проверка) → должности → "
+        "телефон → CV (PDF) → тема → письмо → режим.\n\n"
+        "<b>Режимы</b>\n"
+        "🤖 автоматически — письмо уходит само, вам приходит уведомление;\n"
+        "✋ через кнопку — приходит черновик, отправка по ✅ Send.\n\n"
+        "<b>Карточка клиента</b> (/mail → нажать на имя)\n"
+        "• 🚀 Разослать по базе (1–5 дн.) — CV всем HR из вакансий за последние дни, любые должности;\n"
+        "• 🎯 Разослать точечно — рассылка по вашему файлу с адресами (отдельный раздел);\n"
+        "• 👔 Должности, 📌 Тема, 📄 Письмо, 📎 CV, 🔑 Пароль почты — изменить данные;\n"
+        "• 👁 Как выглядит письмо, 🧪 Тестовое письмо — проверить перед запуском;\n"
+        "• ▶️/⏸ — включить/поставить клиента на паузу; 📜 История — последние письма.\n\n"
+        "<b>Правила</b>: одному HR — не чаще раза в 24 ч, дневной лимит откликов, пауза между письмами, "
+        "письмо каждый раз слегка перефразируется. Ответы работодателей приходят клиенту на почту, "
+        "копия каждого письма — в его «Отправленные»."),
+    "mb": ("🎯 Точечная рассылка по базе",
+        "<b>Запуск</b>\n"
+        "1. /mail → клиент → 🎯 Разослать точечно → пришлите файл .csv или .xlsx с адресами "
+        "(любая раскладка, бот сам найдёт все email и уберёт мусор и дубли).\n"
+        "2. Проверьте первые адреса в ответе бота → выберите дату старта в календаре.\n"
+        "3. Выберите окно времени (например 09:00–18:00) — шлём только в будни.\n"
+        "4. Выберите интервал между письмами — рядом показано, за сколько дней уйдёт вся база.\n\n"
+        "<b>Как бот шлёт</b>\n"
+        "• адреса в случайном порядке, интервал каждый раз ±15%;\n"
+        "• до 350 писем кампании в день и 450 с ящика всего — письма распределяются по окну равномерно;\n"
+        "• на один корпоративный домен — не чаще раза в 20 мин;\n"
+        "• домены без почтового сервера и мусорные адреса пропускаются;\n"
+        "• после окончания окна — «Итог дня»: сколько ушло и сколько осталось.\n\n"
+        "<b>Если что-то пошло не так</b>\n"
+        "• почта не принимает пароль или идут ошибки подряд → кампания на паузе 1 ч, потом продолжит сама;\n"
+        "• почта упёрлась в дневной лимит → ящик на паузе 24 ч, письма не теряются;\n"
+        "• «такого адреса нет» / возврат «не доставлено» → адрес помечается 📭, в точечных рассылках "
+        "на него больше не шлём (отклики на вакансии это не трогает).\n\n"
+        "<b>Команды</b>\n"
+        "/mbcheck ID — сколько ушло, что не дошло, темп и прогноз\n"
+        "/mbstop ID — остановить · /mbresume ID — возобновить с теми же настройками\n"
+        "/bounces — недоставленные адреса · /bounces ID — проверить ящик клиента прямо сейчас\n\n"
+        "ID клиента — в /mail, в карточке клиента."),
+    "tg": ("📣 Реклама и сообщения в Telegram",
+        "<b>Реклама в канале</b>\n"
+        "/ad — следующий ваш текст выйдет в канал рекламным постом с кнопкой «Консультация» "
+        "(сначала покажу превью)\n"
+        "/addad 18:00 Текст — ставить рекламу каждый день в это время\n"
+        "/listads — список · /removead ID — удалить\n\n"
+        "<b>Сообщения пользователям бота</b>\n"
+        "/broadcast Текст — всем, кто пользовался ботом\n"
+        "/broadcast @ник Текст — одному человеку\n"
+        "Перед отправкой всегда показываю превью с кнопками «Отправить / Отмена».\n\n"
+        "<b>Платный email-дайджест</b>\n"
+        "/getemails — так его видят пользователи (покупка картой). Вам при /start приходит список email за неделю бесплатно."),
+    "srv": ("🛠 Обслуживание",
+        "/health — состояние бота одной командой: база на Volume или нет, очередь, рассылки, ящики на паузе\n"
+        "/backup — копия базы файлом прямо сейчас; автоматически бот присылает её каждую ночь\n"
+        "/testchannel — доступ бота к каналу\n"
+        "/search — мини-приложение с поиском вакансий · /applications — отклики из мини-приложения\n\n"
+        "<b>Если бот «молчит» после обновления</b>\n"
+        "1. Railway → сервис → Deployments: последний деплой зелёный?\n"
+        "2. /health — строка «База»: должно быть «✅ на Volume».\n"
+        "3. /testchannel — у бота есть право публиковать в канале?"),
+}
+NO_PREVIEW_OPTS = LinkPreviewOptions(is_disabled=True)
+ADMIN_HELP_ORDER = ["pub", "subs", "mail", "mb", "tg", "srv"]
+
+
+def admin_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(ADMIN_HELP_ORDER), 2):
+        rows.append([InlineKeyboardButton(text=ADMIN_HELP[k][0], callback_data=f"ahelp:{k}")
+                     for k in ADMIN_HELP_ORDER[i:i + 2]])
+    rows.append([InlineKeyboardButton(text="🩺 Состояние", callback_data="aquick:health"),
+                 InlineKeyboardButton(text="📊 Статистика", callback_data="aquick:stats"),
+                 InlineKeyboardButton(text="📧 Клиенты", callback_data="aquick:mail")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+ADMIN_MENU_TEXT = ("📖 <b>Меню администратора</b>\n\n"
+                   "Чтобы выложить вакансию — просто пришлите её текст боту.\n"
+                   "Ниже — инструкция по каждому разделу и быстрые кнопки. Это меню видят только админы.")
+
+
+@router.message(Command("admin", "help"))
+async def cmd_admin_menu(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer(ADMIN_MENU_TEXT, reply_markup=admin_menu_keyboard())
+
+
+@router.callback_query(F.data.startswith("ahelp:"))
+async def cb_admin_help(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer()
+        return
+    key = callback.data.split(":", 1)[1]
+    if key == "home" or key not in ADMIN_HELP:
+        text, kb = ADMIN_MENU_TEXT, admin_menu_keyboard()
+    else:
+        title, body = ADMIN_HELP[key]
+        text = f"<b>{title}</b>\n\n{body}"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="ahelp:home")]])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, link_preview_options=NO_PREVIEW_OPTS)
+    except TelegramAPIError:
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("aquick:"))
+async def cb_admin_quick(callback: CallbackQuery, state: FSMContext):
+    if not admin_only(callback.from_user.id):
+        await callback.answer()
+        return
+    action = callback.data.split(":", 1)[1]
+    await callback.answer()
+    msg = callback.message
+    if action == "health":
+        fake = _AdminMsgProxy(msg, callback.from_user)
+        await cmd_health(fake)
+    elif action == "stats":
+        fake = _AdminMsgProxy(msg, callback.from_user)
+        await cmd_stats(fake, SimpleNamespace(args=None))
+    elif action == "mail":
+        await state.clear()
+        text, kb = email_apply.home_view()
+        await msg.answer(text, reply_markup=kb)
+
+
+class _AdminMsgProxy:
+    """Позволяет вызвать обработчик команды (/health, /stats) из кнопки:
+    подставляет того, кто нажал, вместо автора исходного сообщения бота."""
+
+    def __init__(self, msg: Message, user):
+        self._msg = msg
+        self.from_user = user
+        self.chat = msg.chat
+        self.bot = msg.bot
+
+    async def answer(self, *args, **kwargs):
+        return await self._msg.answer(*args, **kwargs)
+
+    def __getattr__(self, item):
+        return getattr(self._msg, item)
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
     if command.args and command.args.startswith("apply_") and command.args[6:].isdigit():
@@ -1047,39 +1241,8 @@ async def cmd_start(message: Message, command: CommandObject):
     if admin_only(message.from_user.id):
         mode = "включена" if is_auto_publish() else "выключена"
         await message.answer(
-            "Пришлите текст вакансии в любом формате (или пачку через ---).\n"
-            "Команды:\n"
-            "/stats — сводка за сегодня (/stats 7 — за 7 дней)\n"
-            "/contacts — список email/агентств из сохранённых вакансий\n"
-            "/testchannel — проверить доступ бота к каналу\n"
-            "/ad — опубликовать рекламный пост с кнопкой «Консультация»\n"
-            "/search — открыть поиск вакансий с фильтрами (мини-приложение)\n"
-            "/applications — последние отклики через мини-приложение\n"
-            "/subscribe — команда для кандидатов: подписка на вакансии по должности "
-            "(доступна любому, не только вам)\n"
-            "/subscribers — сколько людей подписалось и разбивка по должностям\n"
-            "/subscriberslist — полный список подписчиков (ник, должности, статус оплаты)\n"
-            "/getemails — платный email-дайджест за неделю (доступна любому, не только вам)\n"
-            "/managesubscription — управление/отмена подписки картой (доступна любому)\n"
-            "/mysubscription — сколько дней осталось + кнопка продлить (доступна любому)\n"
-            "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не через Stars\n"
-            "/extendall [дней] — продлить подписку ВСЕМ подписчикам бесплатно (акция)\n"
-            "/broadcast [текст] — всем, кто пользовался ботом; /broadcast @ник [текст] — только ему\n"
-            "/addad ЧЧ:ММ [текст] — запланировать рекламный пост в канал каждый день в это время\n"
-            "/listads — список запланированной рекламы\n"
-            "/removead [id] — удалить рекламу из расписания\n"
-            "/unlockpositions [@ник или id] — разблокировать должности без продления подписки\n"
-            "/lockpositions [@ник или id] — принудительно зафиксировать выбранные должности\n"
-            "/unlockall — разблокировать должности СРАЗУ ВСЕМ подписчикам\n"
-            "/revokeallpositions — снять должности у ВСЕХ (нужно подтверждение: /revokeallpositions confirm)\n"
-            "/revoke [@ник или id] — отписать вручную, доступ прекращается немедленно\n"
-            "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
-            "/revenue [дней] — доход в Stars за период (по умолчанию 7 дней)\n"
-            "/blockuser [@ник или id] — заблокировать (бот перестанет отвечать)\n"
-            "/unblockuser [@ник или id] — снять блокировку\n"
-            "/health — состояние бота: очередь, рассылки, ящики на паузе, возвраты\n"
-            "/backup — прислать копию базы данных файлом (автоматически — каждую ночь)\n"
-            f"/autopublish on|off — автопубликация без подтверждения (сейчас {mode})"
+            ADMIN_MENU_TEXT + f"\n\nАвтопубликация сейчас: <b>{mode}</b> (/autopublish on|off).",
+            reply_markup=admin_menu_keyboard(),
         )
         # email-дайджест за неделю — только тебе, никто другой это не увидит.
         # Обёрнуто в try/except: если тут что-то сломается, это не должно
