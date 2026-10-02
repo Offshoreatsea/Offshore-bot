@@ -2832,7 +2832,7 @@ async def cmd_health(message: Message):
         campaigns = conn.execute("SELECT id, full_name FROM mail_clients WHERE mailbase_active = 1").fetchall()
         paused = conn.execute("SELECT full_name, gmail_blocked_until FROM mail_clients "
                               "WHERE gmail_blocked_until > ?", (datetime.now().isoformat(),)).fetchall()
-        bounces = q("SELECT COUNT(*) FROM mail_bounces")
+        bounces = q("SELECT COUNT(*) FROM mail_bounces WHERE detected_at >= ?", email_apply.MAILBASE_BOUNCES_SINCE)
     finally:
         conn.close()
     size_mb = os.path.getsize(db.DB_PATH) / 1024 / 1024 if os.path.exists(db.DB_PATH) else 0
@@ -2848,7 +2848,7 @@ async def cmd_health(message: Message):
         + (f" · 📝 ждут подтверждения: {drafts}" if drafts else ""),
         f"🎯 Точечных рассылок идёт: {len(campaigns)}"
         + (" (" + ", ".join(html.escape(c['full_name']) for c in campaigns) + ")" if campaigns else ""),
-        f"📭 Недоставляемых адресов в базе: {bounces}",
+        f"📭 Недоставляемых адресов (точечная рассылка): {bounces}",
     ]
     if paused:
         lines.append("⛔️ Ящики на паузе (лимит почты): " + ", ".join(

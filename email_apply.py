@@ -110,11 +110,34 @@ def parse_email_file(data: bytes, filename: str) -> list[str]:
     found = EMAIL_RE.findall(" ".join(text_chunks))
     seen, out = set(), []
     for email in found:
-        key = email.strip().rstrip(".").lower()
-        if key not in seen:
-            seen.add(key)
-            out.append(email.strip().rstrip("."))
+        email = email.strip().strip(".,;:'\"()<>[]")
+        key = email.lower()
+        if key in seen or not _looks_deliverable(key):
+            continue
+        seen.add(key)
+        out.append(email)
     return out
+
+
+_JUNK_TLDS = {"png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "pdf", "doc", "docx", "xls", "xlsx", "js", "css"}
+_JUNK_LOCAL = ("noreply", "no-reply", "donotreply", "do-not-reply", "mailer-daemon", "postmaster", "bounce")
+_JUNK_DOMAINS = {"example.com", "example.org", "domain.com", "email.com", "test.com", "sentry.io"}
+
+
+def _looks_deliverable(addr: str) -> bool:
+    """Отсев мусора, который регулярка принимает за email: картинки «logo@2x.png»,
+    noreply-адреса, примеры из шаблонов. На такие письма только портят репутацию ящика."""
+    if len(addr) > 100 or addr.count("@") != 1:
+        return False
+    local, domain = addr.split("@")
+    if not local or "." not in domain or ".." in addr or domain.startswith(".") or domain.endswith("."):
+        return False
+    tld = domain.rsplit(".", 1)[-1]
+    if tld in _JUNK_TLDS or not re.fullmatch(r"[a-zа-я]{2,24}", tld):
+        return False
+    if any(local.startswith(j) for j in _JUNK_LOCAL) or domain in _JUNK_DOMAINS:
+        return False
+    return True
 
 
 def add_mail_base_targets(client_id: int, emails: list[str]) -> tuple[int, int]:
@@ -159,7 +182,8 @@ ADMIN_MAIL_COMMANDS = [
     ("mail", "📧 Рассылка резюме — меню"),
     ("mbcheck", "📋 Проверить базу точечной рассылки по id клиента"),
     ("mbstop", "⏸ Остановить точечную рассылку по id клиента"),
-    ("bounces", "📭 Недоставленные адреса / проверить ящик клиента"),
+    ("bounces", "📭 Недоставленные адреса точечной рассылки"),
+    ("mbresume", "▶️ Возобновить точечную рассылку по id клиента"),
 ]
 
 
@@ -262,6 +286,10 @@ def init_tables():
         ("mailbase_interval_sec", "INTEGER"),
         # Gmail отказал по дневному лимиту ящика (550 5.4.5) — до этого момента не шлём
         ("gmail_blocked_until", "TEXT"),
+        # пауза точечной рассылки (не принят пароль / подряд ошибки) — до этого момента не шлём
+        ("mailbase_paused_until", "TEXT"),
+        ("mailbase_pause_reason", "TEXT"),
+        ("mailbase_last_report_date", "TEXT"),
     ):
         if col not in cols:
             conn.execute(f"ALTER TABLE mail_clients ADD COLUMN {col} {ddl}")
@@ -383,8 +411,6 @@ def already_applied_to(client_id: int, to_email: str, exclude_app_id: int | None
     """Одному HR — одно CV от клиента не чаще MAIL_HR_COOLDOWN_HOURS (по умолчанию раз в
     сутки). Черновик/отправку в процессе (draft/sending) не дублируем НЕЗАВИСИМО от времени —
     это просто защита от двух параллельных писем на один и тот же адрес одновременно."""
-    if is_bounced(to_email):
-        return True  # адрес недоставляем (пришёл возврат) — не шлём на него никогда
     marks = ",".join("?" * len(statuses))
     if "sent" in statuses:
         # для "sent" — только за последние MAIL_HR_COOLDOWN_HOURS часов; для
@@ -407,14 +433,25 @@ def already_applied_to(client_id: int, to_email: str, exclude_app_id: int | None
         (client_id, to_email, *statuses, exclude_app_id or -1), one=True))
 
 
+# Блок-лист недоставляемых адресов работает ТОЛЬКО для точечной рассылки по базе
+# и учитывает только возвраты начиная с этой даты (раньше — не считаются)
+MAILBASE_BOUNCES_SINCE = os.getenv("MAILBASE_BOUNCES_SINCE", "2026-10-02")
+
+
 def is_bounced(to_email: str) -> bool:
-    return bool(_q("SELECT 1 FROM mail_bounces WHERE email = ?", ((to_email or "").strip().lower(),), one=True))
+    """Адрес в блок-листе точечной рассылки (используется только в ней)."""
+    return bool(_q("SELECT 1 FROM mail_bounces WHERE email = ? AND detected_at >= ?",
+                   ((to_email or "").strip().lower(), MAILBASE_BOUNCES_SINCE), one=True))
 
 
-def sent_today(client_id: int) -> int:
+def sent_today(client_id: int, include_mailbase: bool = False) -> int:
+    """Отправлено сегодня. По умолчанию — только отклики на вакансии (их лимит
+    MAIL_DAILY_LIMIT); include_mailbase=True — всё, что ушло с ящика за день
+    (для общего потолка ящика)."""
     today = datetime.now().strftime("%Y-%m-%d")
-    row = _q("""SELECT COUNT(*) AS n FROM mail_applications
-                WHERE client_id = ? AND status = 'sent' AND sent_at LIKE ?""",
+    extra = "" if include_mailbase else " AND vacancy_id IS NOT NULL"
+    row = _q(f"""SELECT COUNT(*) AS n FROM mail_applications
+                WHERE client_id = ? AND status = 'sent' AND sent_at LIKE ?{extra}""",
              (client_id, today + "%"), one=True)
     return row["n"]
 
@@ -899,9 +936,6 @@ async def send_app(bot: Bot, app_id: int) -> tuple[bool, str]:
         app = get_app(app_id)
         if app["status"] == "sent":
             return True, ""
-        if is_bounced(app["to_email"]):
-            set_app(app_id, status="skipped", error="адрес недоставляем (был возврат)")
-            return False, f"{app['to_email']} — адрес недоставляем (раньше пришёл возврат), пропускаю"
         if already_applied_to(client["id"], app["to_email"], exclude_app_id=app_id, statuses=("sent",)):
             set_app(app_id, status="skipped", error="этому HR уже отправляли")
             return False, f"на {app['to_email']} CV уже отправлялось"
@@ -1522,8 +1556,8 @@ async def cmd_mail_help(message: Message):
         "/testmail ID — тестовое письмо клиенту на его же почту\n"
         "/blast ID [1-5] — разослать CV клиента по всем HR из вакансий за 1–5 дн. (любые должности)\n"
         "/mbcheck ID — состояние точечной рассылки: сколько ушло, что не дошло\n"
-        "/mbstop ID — остановить точечную рассылку\n"
-        "/bounces — недоставленные адреса (📭); /bounces ID — проверить ящик клиента сейчас\n"
+        "/mbstop ID — остановить точечную рассылку · /mbresume ID — возобновить\n"
+        "/bounces — недоставленные адреса точечной рассылки (📭); /bounces ID — проверить ящик сейчас\n"
         "/drafts ID — черновики клиента, ждущие отправки\n"
         "/sendall ID — отправить все черновики клиента\n"
         "/applyto VACANCY_ID [CLIENT_ID] — отклик на уже опубликованную вакансию\n"
@@ -2023,7 +2057,6 @@ def client_view(client):
         f"📤 Сегодня: <b>{cc['today']}</b>/{MAIL_DAILY_LIMIT} · всего: {cc['sent']}"
         + (f" · 📝 ждут: <b>{cc['draft']}</b>" if cc["draft"] else "")
         + (f" · ❌ {cc['failed']}" if cc["failed"] else "")
-        + (f" · 📭 не дошло: {cc['bounced']}" if cc.get("bounced") else "")
     )
     cid = client["id"]
     b = lambda t, d: InlineKeyboardButton(text=t, callback_data=d)
@@ -2153,6 +2186,7 @@ async def cb_menu(callback: CallbackQuery, state: FSMContext):
                 + (f"📭 Недоставляемых адресов (возврат/нет такого ящика): {mb['bounced']}\n" if mb['bounced'] else "")
                 + (f"❌ Не ушло после 3 попыток: {mb['failed']}\n" if mb['failed'] else "")
                 + (gmail_blocked(client) + "\n" if gmail_blocked(client) else "")
+                + (_mailbase_paused(client) + "\n" if _mailbase_paused(client) else "")
                 + 
                 f"Окно: {client['mailbase_window_start']}–{client['mailbase_window_end']}, будни.\n\n"
                 "Остановить — только через /mbstop " + str(client["id"]),
@@ -2399,7 +2433,7 @@ async def _ask_interval(msg: Message, client_id: int, start: str, end: str, stat
     window_seconds = max(60, (wend_dt - wstart_dt).total_seconds())
     rows = []
     for sec in MAILBASE_INTERVAL_CHOICES:
-        per_day = max(1, int(window_seconds // sec))
+        per_day = max(1, min(int(window_seconds // sec), MAILBASE_DAILY_MAX))
         days = -(-pending // per_day)
         rows.append([InlineKeyboardButton(
             text=f"{_fmt_interval(sec)} (~{days} дн.)", callback_data=f"mbint:{client_id}:{sec}"
@@ -2431,6 +2465,7 @@ async def _start_mailbase(bot: Bot, client_id: int, interval_sec: int, state: FS
     await state.clear()
     update_client(
         client_id, mailbase_active=1, mailbase_start_date=start_date,
+        mailbase_paused_until=None, mailbase_pause_reason=None, mailbase_last_report_date=None,
         mailbase_window_start=start, mailbase_window_end=end, mailbase_interval_sec=interval_sec,
         mailbase_days_left=MAIL_BASE_WORKDAYS, mailbase_day_quota=None,
         mailbase_sent_today=0, mailbase_last_active_date=None,
@@ -2440,8 +2475,9 @@ async def _start_mailbase(bot: Bot, client_id: int, interval_sec: int, state: FS
     wstart_dt = datetime.strptime(start, "%H:%M")
     wend_dt = datetime.strptime(end, "%H:%M")
     window_seconds = max(60, (wend_dt - wstart_dt).total_seconds())
-    per_day = max(1, int(window_seconds // interval_sec))
+    per_day = max(1, min(int(window_seconds // interval_sec), MAILBASE_DAILY_MAX))
     days = -(-pending // per_day)
+    capped = int(window_seconds // interval_sec) > MAILBASE_DAILY_MAX
     text = (
         f"✅ <b>Точечная рассылка запланирована</b> — {html.escape(client['full_name'])}\n\n"
         f"📅 Старт: {start_date}, только будни (Пн-Пт)\n"
@@ -2449,8 +2485,13 @@ async def _start_mailbase(bot: Bot, client_id: int, interval_sec: int, state: FS
         f"⏱ Интервал: {_fmt_interval(interval_sec)} ± 15% случайно\n"
         f"📬 Адресов: {pending}, ~{per_day}/день → ориентировочно {days} рабочих дн.\n"
         f"✏️ Текст каждого письма слегка перефразируется Claude\n\n"
-        f"Не считается в обычный дневной лимит {MAIL_DAILY_LIMIT} писем — у кампании своя квота.\n"
-        f"Остановить: /mbstop {client_id}"
+        + (f"⚖️ Такой интервал дал бы больше {MAILBASE_DAILY_MAX} писем в день — бот сам растянет отправку "
+           f"равномерно на всё окно, чтобы почта не закрыла ящик.\n" if capped else "")
+        + f"🛡 Потолок: {MAILBASE_DAILY_MAX} писем кампании в день и {MAILBOX_DAILY_MAX} с ящика всего "
+        f"(вместе с откликами). Отклики на вакансии считаются отдельно, лимит {MAIL_DAILY_LIMIT}.\n"
+        f"🧹 Мусорные адреса и домены без почтового сервера пропускаются, на один корпоративный домен — "
+        f"не чаще раза в {MAILBASE_DOMAIN_GAP_MIN} мин.\n"
+        f"Остановить: /mbstop {client_id} · возобновить: /mbresume {client_id}"
     )
     if message:
         await message.answer(text)
@@ -2483,6 +2524,14 @@ async def cmd_mbcheck(message: Message, command: CommandObject):
     blocked = gmail_blocked(client)
     if blocked:
         lines.append("⛔️ " + blocked + "\n")
+    paused = _mailbase_paused(client)
+    if paused:
+        lines.append(paused + "\n")
+    if client["mailbase_active"] and mb["pending"]:
+        per_day = _mailbase_day_cap(client)
+        lines.append(f"📈 Темп: ~{per_day} писем в рабочий день (сегодня ушло {client['mailbase_sent_today'] or 0}), "
+                     f"осталось ~{-(-mb['pending'] // per_day)} раб. дн. Окно "
+                     f"{client['mailbase_window_start']}–{client['mailbase_window_end']}.\n")
     if not client["mailbase_active"] and mb["pending"]:
         lines.append("⏸ Рассылка сейчас НЕ активна (остановлена или ещё не запущена).\n")
     if pending_sample:
@@ -2514,7 +2563,31 @@ async def cmd_mbstop(message: Message, command: CommandObject):
     mb = mailbase_counts(client_id)
     await message.answer(f"⏸ Точечная рассылка остановлена — {html.escape(client['full_name'])}. "
                          f"Отправлено {mb['sent']} из {mb['total']}, оставшиеся адреса сохранены "
-                         f"(можно запустить заново через 🎯 в карточке клиента).")
+                         f"(возобновить с теми же настройками: /mbresume {client_id}).")
+
+
+@router.message(Command("mbresume"))
+async def cmd_mbresume(message: Message, command: CommandObject):
+    """Возобновить остановленную точечную рассылку с прежними настройками (окно, интервал)."""
+    if not is_admin(message.from_user.id):
+        return
+    if not (command.args or "").strip().isdigit():
+        return await message.answer("Формат: /mbresume [id клиента]")
+    client_id = int(command.args.strip())
+    client = get_client(client_id)
+    if not client:
+        return await message.answer("Клиент не найден.")
+    mb = mailbase_counts(client_id)
+    if not mb["pending"]:
+        return await message.answer("В базе клиента не осталось адресов для отправки.")
+    if not client["mailbase_window_start"] or not client["mailbase_interval_sec"]:
+        return await message.answer("Кампания ещё ни разу не настраивалась — запустите через 🎯 в карточке клиента.")
+    today = _mailbase_now().strftime("%Y-%m-%d")
+    update_client(client_id, mailbase_active=1, mailbase_paused_until=None, mailbase_pause_reason=None,
+                  mailbase_start_date=min(client["mailbase_start_date"] or today, today))
+    await message.answer(f"▶️ Точечная рассылка возобновлена — {html.escape(client['full_name'])}. "
+                         f"Осталось {mb['pending']} адресов, окно {client['mailbase_window_start']}–"
+                         f"{client['mailbase_window_end']}, ~{_mailbase_day_cap(client)} писем в рабочий день.")
 
 
 _mailbase_last_tick: dict[int, float] = {}
@@ -2530,7 +2603,11 @@ async def _mailbase_send(bot: Bot, client, to_email: str) -> tuple[bool, str]:
             return False, blocked
         if already_applied_to(client["id"], to_email, statuses=("sent",)):
             return False, "этому адресу уже отправляли (за последние сутки)"
-        subject, body = await compose({}, client)
+        # в базе нет конкретной вакансии — подставляем должности самого клиента
+        # (раньше в теме/письме выходило «Application for the advertised position»)
+        labels = [_pos_label(t) for t in (client["positions"] or "").split(",") if t]
+        general = {"position": " / ".join(dict.fromkeys(labels)) or "any suitable position", "vessel": "", "region": ""}
+        subject, body = await compose(general, client)
         app_id = insert_app(client["id"], None, to_email, subject, body)
         set_app(app_id, status="sending")
         try:
@@ -2549,26 +2626,143 @@ async def _mailbase_send(bot: Bot, client, to_email: str) -> tuple[bool, str]:
 
 
 MAILBASE_MAX_ATTEMPTS = int(os.getenv("MAILBASE_MAX_ATTEMPTS", "3"))  # попыток на один адрес базы
+# потолки в день: на кампанию и на ящик целиком (отклики + рассылка). Gmail
+# закрывает обычный ящик примерно после 500 писем в сутки — держимся ниже
+MAILBASE_DAILY_MAX = int(os.getenv("MAILBASE_DAILY_MAX", "350"))
+MAILBOX_DAILY_MAX = int(os.getenv("MAILBOX_DAILY_MAX", "450"))
+MAILBASE_PAUSE_MIN = int(os.getenv("MAILBASE_PAUSE_MIN", "60"))      # пауза кампании при сбоях ящика
+MAILBASE_FAIL_STREAK = int(os.getenv("MAILBASE_FAIL_STREAK", "5"))   # столько ошибок подряд → пауза
+# крупные почтовики — на них можно слать подряд; на корпоративный домен — не чаще 1 письма в N минут
+_FREE_DOMAINS = {"gmail.com", "googlemail.com", "yahoo.com", "outlook.com", "hotmail.com", "live.com", "icloud.com",
+                 "mail.ru", "yandex.ru", "ukr.net", "i.ua", "meta.ua", "bk.ru", "inbox.ru", "list.ru", "aol.com",
+                 "gmx.com", "gmx.de", "web.de", "proton.me", "protonmail.com"}
+MAILBASE_DOMAIN_GAP_MIN = int(os.getenv("MAILBASE_DOMAIN_GAP_MIN", "20"))
+_fail_streak: dict[int, int] = {}
+_domain_last: dict[tuple[int, str], float] = {}
+_mx_cache: dict[str, bool] = {}
 
 
 def _send_error_kind(err: str) -> str:
     """Классификация ошибки отправки:
     invalid   — сервер прямо сказал, что такого адреса нет (повторять бессмысленно);
-    quota     — лимит ящика у Google и т.п. (ящик на паузе, адрес не виноват);
+    quota     — дневной лимит ящика (ящик на паузе, адрес не виноват);
+    mailbox   — проблема ящика клиента (пароль не принят, не расшифровать пароль) — пауза кампании;
     transient — нет связи / временный отказ 4xx (повторим позже, попытку не тратим);
     other     — всё остальное (считаем попытку)."""
     t = (err or "").lower()
     if "дневной лимит ящика" in t or "5.4.5" in t or "sending limit" in t:
         return "quota"
+    if any(k in t for k in ("не приняла логин", "authentication", "5.7.8", "(535", " 535", "расшифровать пароль",
+                            "username and password not accepted", "application-specific password")):
+        return "mailbox"
     if any(k in t for k in ("recipientsrefused", "5.1.1", "5.1.0", "user unknown", "no such user",
                             "does not exist", "mailbox unavailable", "address rejected",
                             "invalid recipient", "recipient address rejected", "unknown user",
-                            "mailbox not found", "no mailbox")):
+                            "mailbox not found", "no mailbox", "domain not found", "no mx")):
         return "invalid"
     if any(k in t for k in ("нет соединения", "timeout", "timed out", "connection", " 421", "(421",
                             " 450", "(450", " 451", "(451", "temporar", "try again", "4.7.")):
         return "transient"
     return "other"
+
+
+def _domain_has_mail(domain: str) -> bool:
+    """Есть ли у домена почтовый сервер (MX или хотя бы A-запись). Нет — письмо
+    гарантированно вернётся, а возвраты портят репутацию ящика. Если DNS
+    недоступен или библиотеки нет — не мешаем отправке (считаем «да»)."""
+    if domain in _mx_cache:
+        return _mx_cache[domain]
+    ok = True
+    try:
+        import dns.resolver  # dnspython
+        res = dns.resolver.Resolver()
+        res.lifetime = 6
+        try:
+            res.resolve(domain, "MX")
+        except (dns.resolver.NoAnswer,):
+            try:
+                res.resolve(domain, "A")
+            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                ok = False
+        except dns.resolver.NXDOMAIN:
+            ok = False
+    except Exception:
+        ok = True  # нет библиотеки / таймаут DNS — не блокируем
+    _mx_cache[domain] = ok
+    return ok
+
+
+def _mailbase_paused(client) -> str | None:
+    try:
+        until = client["mailbase_paused_until"]
+    except (IndexError, KeyError):
+        until = None
+    if until and datetime.now().isoformat() < until:
+        return f"⏸ Точечная рассылка на паузе до {until[11:16]}: {client['mailbase_pause_reason'] or ''}"
+    return None
+
+
+async def _pause_mailbase(bot: Bot, client, reason: str):
+    until = (datetime.now() + timedelta(minutes=MAILBASE_PAUSE_MIN)).isoformat(timespec="minutes")
+    was = _mailbase_paused(client)
+    update_client(client["id"], mailbase_paused_until=until, mailbase_pause_reason=reason[:200])
+    if not was:
+        await _notify_admins(bot, f"⏸ <b>Точечная рассылка на паузе</b> — {html.escape(client['full_name'])}\n\n"
+                                  f"Причина: {html.escape(reason[:300])}\n"
+                                  f"Через {MAILBASE_PAUSE_MIN} мин бот попробует снова сам. Адреса не потеряны.")
+
+
+def _window_seconds(client) -> float:
+    ws = datetime.strptime(client["mailbase_window_start"] or "09:00", "%H:%M")
+    we = datetime.strptime(client["mailbase_window_end"] or "18:00", "%H:%M")
+    return max(60.0, (we - ws).total_seconds())
+
+
+def _mailbase_day_cap(client) -> int:
+    """Сколько писем кампании реально уйдёт за день с учётом окна, интервала и потолков."""
+    interval = client["mailbase_interval_sec"] or MAIL_SEND_INTERVAL
+    return max(1, min(int(_window_seconds(client) // interval), MAILBASE_DAILY_MAX))
+
+
+def _effective_interval(client) -> float:
+    """Интервал с учётом потолка: письма распределяются равномерно на всё окно,
+    а не уходят пачкой в первые часы с остановкой к обеду."""
+    interval = client["mailbase_interval_sec"] or MAIL_SEND_INTERVAL
+    return max(float(interval), _window_seconds(client) / max(MAILBASE_DAILY_MAX, 1))
+
+
+def _pick_target(client_id: int):
+    """Случайный адрес из очереди, но не на тот же корпоративный домен, что недавно:
+    несколько писем подряд на один домен — частая причина попасть в спам."""
+    rows = _q("SELECT * FROM mail_base_targets WHERE client_id = ? AND status = 'pending' "
+              "ORDER BY RANDOM() LIMIT 25", (client_id,))
+    now = time.monotonic()
+    for r in rows:
+        domain = r["email"].split("@")[-1].lower()
+        if domain in _FREE_DOMAINS:
+            return r
+        if now - _domain_last.get((client_id, domain), -1e9) >= MAILBASE_DOMAIN_GAP_MIN * 60:
+            return r
+    return rows[0] if rows else None
+
+
+async def _mailbase_report_if_due(bot: Bot, client, today_str: str, now_hm: str):
+    """После окончания окна — короткий итог дня по кампании."""
+    win_end = client["mailbase_window_end"] or "18:00"
+    if now_hm <= win_end or client["mailbase_last_report_date"] == today_str:
+        return
+    if client["mailbase_last_active_date"] != today_str:
+        return  # сегодня кампания не работала (выходной / ещё не началась)
+    update_client(client["id"], mailbase_last_report_date=today_str)
+    mb = mailbase_counts(client["id"])
+    per_day = _mailbase_day_cap(client)
+    days_left = -(-mb["pending"] // per_day) if mb["pending"] else 0
+    await _notify_admins(bot, f"🎯 <b>Итог дня</b> — {html.escape(client['full_name'])}\n"
+                              f"Сегодня отправлено: {client['mailbase_sent_today'] or 0}\n"
+                              f"Всего: {mb['sent']} из {mb['total']}, осталось {mb['pending']}"
+                              + (f" (~{days_left} раб. дн.)" if days_left else "")
+                              + (f"\n📭 недоставляемых: {mb['bounced']}" if mb["bounced"] else "")
+                              + (f" · ❌ не ушло: {mb['failed']}" if mb["failed"] else ""))
 
 
 async def _mail_base_tick_client(bot: Bot, client, now, today_str: str, now_hm: str):
@@ -2591,41 +2785,56 @@ async def _mail_base_tick_client(bot: Bot, client, now, today_str: str, now_hm: 
     if client["mailbase_last_active_date"] != today_str:
         update_client(client_id, mailbase_sent_today=0, mailbase_last_active_date=today_str)
         client = get_client(client_id)
-    if gmail_blocked(client):
-        return  # ящик на паузе после отказа Gmail — адреса остаются в очереди
+    await _mailbase_report_if_due(bot, client, today_str, now_hm)
+    if gmail_blocked(client) or _mailbase_paused(client):
+        return  # ящик на паузе — адреса остаются в очереди
     win_start = client["mailbase_window_start"] or "09:00"
     win_end = client["mailbase_window_end"] or "18:00"
     if not (win_start <= now_hm <= win_end):
         return
-    # общий потолок писем в день с ящика (отклики + рассылка вместе) — иначе
-    # почтовый сервер сам закрывает ящик на сутки, как было с Gmail
-    if sent_today(client_id) >= MAIL_DAILY_LIMIT:
+    # потолки: на кампанию в день и на ящик целиком (отклики + рассылка)
+    if (client["mailbase_sent_today"] or 0) >= MAILBASE_DAILY_MAX:
         return
-    interval = client["mailbase_interval_sec"] or MAIL_SEND_INTERVAL
+    if sent_today(client_id, include_mailbase=True) >= MAILBOX_DAILY_MAX:
+        return
     last = _mailbase_last_tick.get(client_id, 0)
-    if time.monotonic() - last < interval * random.uniform(0.85, 1.15):
+    if time.monotonic() - last < _effective_interval(client) * random.uniform(0.85, 1.15):
         return
-    # ORDER BY RANDOM() — перемешанный порядок отправки, не как шли в файле
-    target = _q("SELECT * FROM mail_base_targets WHERE client_id = ? AND status = 'pending' "
-                "ORDER BY RANDOM() LIMIT 1", (client_id,), one=True)
+    target = _pick_target(client_id)
     if not target:
         return
     _mailbase_last_tick[client_id] = time.monotonic()
-    if is_bounced(target["email"]):
+    addr = target["email"].strip().lower()
+    domain = addr.split("@")[-1]
+    if is_bounced(addr):
         _q("UPDATE mail_base_targets SET status = 'bounced', last_error = ? WHERE id = ?",
            ("адрес недоставляем (возврат ранее)", target["id"]), commit=True)
+        _mailbase_last_tick[client_id] = 0  # ничего не отправили — следующий адрес без ожидания
+        return
+    if not _looks_deliverable(addr) or not await asyncio.to_thread(_domain_has_mail, domain):
+        _q("UPDATE mail_base_targets SET status = 'invalid', last_error = ? WHERE id = ?",
+           ("у домена нет почтового сервера / адрес некорректный", target["id"]), commit=True)
+        _mailbase_last_tick[client_id] = 0
         return
     if already_applied_to(client_id, target["email"], statuses=("sent",)):
         _q("UPDATE mail_base_targets SET status = 'skipped', last_error = ? WHERE id = ?",
            ("уже получал CV за последние сутки", target["id"]), commit=True)
+        _mailbase_last_tick[client_id] = 0
         return
     ok, err = await _mailbase_send(bot, client, target["email"])
+    _domain_last[(client_id, domain)] = time.monotonic()
     if ok:
+        _fail_streak[client_id] = 0
         _q("UPDATE mail_base_targets SET status = 'sent', sent_at = ?, last_error = NULL WHERE id = ?",
            (datetime.now().isoformat(), target["id"]), commit=True)
         update_client(client_id, mailbase_sent_today=(client["mailbase_sent_today"] or 0) + 1)
         return
     kind = _send_error_kind(err)
+    if kind == "mailbox":
+        # пароль не принят и т.п. — виноват ящик, а не адрес: попытку не тратим, ставим кампанию на паузу
+        await _pause_mailbase(bot, client, "почта клиента не принимает вход — проверьте пароль приложения "
+                                           f"(/clientpass). {err}")
+        return
     attempts = (target["attempts"] or 0) + (0 if kind in ("quota", "transient") else 1)
     if kind == "invalid":
         status = "invalid"
@@ -2637,6 +2846,13 @@ async def _mail_base_tick_client(bot: Bot, client, now, today_str: str, now_hm: 
        (status, attempts, (err or "")[:300], target["id"]), commit=True)
     if kind == "invalid":
         _mark_bounced(client_id, target["email"], (err or "адрес отклонён сервером")[:300])
+        _fail_streak[client_id] = 0
+    elif kind in ("other", "transient"):
+        _fail_streak[client_id] = _fail_streak.get(client_id, 0) + 1
+        if _fail_streak[client_id] >= MAILBASE_FAIL_STREAK:
+            _fail_streak[client_id] = 0
+            await _pause_mailbase(bot, client, f"{MAILBASE_FAIL_STREAK} ошибок отправки подряд — похоже, почта "
+                                               f"временно ограничила ящик. Последняя: {err}")
     print(f"[mail_base_worker] не отправилось {target['email']} (клиент {client_id}, {kind}): {err}")
 
 
@@ -2668,10 +2884,9 @@ def _mark_bounced(client_id: int, to_email: str, reason: str):
     addr = (to_email or "").strip().lower()
     if not addr:
         return
-    _q("INSERT OR IGNORE INTO mail_bounces (email, client_id, reason, detected_at) VALUES (?, ?, ?, ?)",
+    # INSERT OR REPLACE — запись старше MAILBASE_BOUNCES_SINCE обновится свежей датой
+    _q("INSERT OR REPLACE INTO mail_bounces (email, client_id, reason, detected_at) VALUES (?, ?, ?, ?)",
        (addr, client_id, reason[:300], datetime.now().isoformat()), commit=True)
-    _q("UPDATE mail_applications SET status = 'bounced', error = ? WHERE client_id = ? "
-       "AND lower(to_email) = ? AND status = 'sent'", (("возврат: " + reason)[:300], client_id, addr), commit=True)
     _q("UPDATE mail_base_targets SET status = 'bounced', last_error = ? WHERE client_id = ? "
        "AND lower(email) = ? AND status IN ('sent', 'pending')", (("возврат: " + reason)[:300], client_id, addr),
        commit=True)
@@ -2719,11 +2934,12 @@ def _scan_bounces_sync(client) -> list[tuple[str, str]]:
     password = decrypt(client["enc_password"])
     if not password:
         return []
-    sent_to = {r["e"] for r in _q("SELECT DISTINCT lower(to_email) e FROM mail_applications WHERE client_id = ? "
+    sent_to = {r["e"] for r in _q("SELECT DISTINCT lower(email) e FROM mail_base_targets WHERE client_id = ? "
                                   "AND status IN ('sent', 'bounced')", (client["id"],))}
     if not sent_to:
         return []
-    since = datetime.now() - timedelta(days=BOUNCE_LOOKBACK_DAYS)
+    since = max(datetime.now() - timedelta(days=BOUNCE_LOOKBACK_DAYS),
+                datetime.fromisoformat(MAILBASE_BOUNCES_SINCE))
     since_str = f"{since.day:02d}-{_MONTHS[since.month - 1]}-{since.year}"
     out: list[tuple[str, str]] = []
     imap = imaplib.IMAP4_SSL(_imap_host(client), 993, timeout=40)
@@ -2765,7 +2981,7 @@ def _scan_bounces_sync(client) -> list[tuple[str, str]]:
                 if typ == "OK" and full and isinstance(full[0], tuple):
                     msg = _email_lib.message_from_bytes(full[0][1])
                     addrs, reason = _bounce_recipients(msg, sent_to, client["email"])
-                    out += [(a, reason) for a in addrs]
+                    out += [(a, reason) for a in addrs if a in sent_to]
                 _q("INSERT OR IGNORE INTO mail_bounce_seen (msg_key, seen_at) VALUES (?, ?)",
                    (key, datetime.now().isoformat()), commit=True)
     finally:
@@ -2777,7 +2993,9 @@ def _scan_bounces_sync(client) -> list[tuple[str, str]]:
 
 
 async def check_bounces_once(bot: Bot, only_client_id: int | None = None) -> int:
-    clients = [get_client(only_client_id)] if only_client_id else _q("SELECT * FROM mail_clients WHERE active = 1")
+    clients = [get_client(only_client_id)] if only_client_id else _q(
+        "SELECT * FROM mail_clients WHERE id IN (SELECT DISTINCT client_id FROM mail_base_targets "
+        "WHERE status IN ('sent', 'bounced'))")
     total = 0
     for client in clients:
         if not client:
@@ -2797,7 +3015,8 @@ async def check_bounces_once(bot: Bot, only_client_id: int | None = None) -> int
             sample = "\n".join(f"• {html.escape(a)} — {html.escape(r[:80])}" for a, r in new[:15])
             more = f"\n…и ещё {len(new) - 15}" if len(new) > 15 else ""
             await _notify_admins(bot, f"📭 <b>Не доставлено</b> — {html.escape(client['full_name'])}: "
-                                      f"{len(new)} адрес(ов). На них больше не шлём (ни этот, ни другие клиенты).\n\n"
+                                      f"{len(new)} адрес(ов) из точечной рассылки. В точечных рассылках на них больше не шлём "
+                                      f"(отклики на вакансии это не затрагивает).\n\n"
                                       f"{sample}{more}")
     return total
 
@@ -2827,11 +3046,13 @@ async def cmd_bounces(message: Message, command: CommandObject):
             await message.answer("Новых возвратов не найдено.")
         return
     rows = _q("SELECT b.email, b.reason, b.detected_at, c.full_name FROM mail_bounces b "
-              "LEFT JOIN mail_clients c ON c.id = b.client_id ORDER BY b.detected_at DESC LIMIT 25")
-    total = _q("SELECT COUNT(*) c FROM mail_bounces", one=True)["c"]
+              "LEFT JOIN mail_clients c ON c.id = b.client_id WHERE b.detected_at >= ? "
+              "ORDER BY b.detected_at DESC LIMIT 25", (MAILBASE_BOUNCES_SINCE,))
+    total = _q("SELECT COUNT(*) c FROM mail_bounces WHERE detected_at >= ?", (MAILBASE_BOUNCES_SINCE,), one=True)["c"]
     if not rows:
         return await message.answer("📭 Недоставленных адресов пока нет.\nПроверить ящик клиента сейчас: /bounces ID")
-    lines = [f"📭 <b>Недоставляемые адреса</b> — всего {total} (на них больше не шлём)\n"]
+    lines = [f"📭 <b>Недоставляемые адреса точечной рассылки</b> — всего {total}\n"
+             f"(с {MAILBASE_BOUNCES_SINCE}; в рассылках по базе на них не шлём, отклики на вакансии не затронуты)\n"]
     lines += [f"• {html.escape(r['email'])} — {html.escape((r['reason'] or '')[:60])} "
               f"({(r['detected_at'] or '')[5:16].replace('T', ' ')}, {html.escape(r['full_name'] or '?')})"
               for r in rows]
