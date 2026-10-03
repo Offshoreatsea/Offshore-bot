@@ -40,7 +40,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 
 import db
 import ranks
@@ -182,6 +182,8 @@ ADMIN_MAIL_COMMANDS = [
     ("admin", "📖 Инструкция и меню админа"),
     ("health", "🩺 Состояние бота"),
     ("backup", "💾 Копия базы данных"),
+    ("adminlog", "🛡 Журнал действий админов"),
+    ("lockdown", "🔴 Стоп-кран отправки писем"),
     ("mail", "📧 Рассылка резюме — меню"),
     ("mbcheck", "📋 Проверить базу точечной рассылки по id клиента"),
     ("mbstop", "⏸ Остановить точечную рассылку по id клиента"),
@@ -208,12 +210,47 @@ async def _install_admin_commands(bot: Bot):
 
 # ---------------------------------------------------------------- шифрование
 
-def _fernet() -> Fernet:
-    # MAIL_SECRET_KEY можно задать в Railway отдельно; если не задан — ключ
-    # выводится из BOT_TOKEN (при смене токена пароли клиентов придётся ввести заново)
-    secret = os.getenv("MAIL_SECRET_KEY") or ("mail:" + (os.getenv("BOT_TOKEN") or ""))
-    key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
-    return Fernet(key)
+def _key_from(secret: str) -> Fernet:
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
+
+
+def _fernet() -> MultiFernet:
+    """Шифрование паролей почты клиентов.
+    Новый ключ — MAIL_SECRET_KEY (задать в Railway, хранить отдельно от токена бота).
+    Старые ключи (из текущего BOT_TOKEN и, если задан, MAIL_OLD_BOT_TOKEN) остаются
+    для расшифровки — при старте бот сам перешифрует все пароли новым ключом.
+    Так пароли клиентов не пропадают при смене токена бота (например, после утечки)
+    и не расшифровываются одним только токеном."""
+    keys = []
+    if os.getenv("MAIL_SECRET_KEY"):
+        keys.append(_key_from(os.getenv("MAIL_SECRET_KEY")))
+    keys.append(_key_from("mail:" + (os.getenv("BOT_TOKEN") or "")))
+    if os.getenv("MAIL_OLD_BOT_TOKEN"):
+        keys.append(_key_from("mail:" + os.getenv("MAIL_OLD_BOT_TOKEN")))
+    return MultiFernet(keys)
+
+
+def rotate_mail_passwords() -> int:
+    """Перешифровывает пароли клиентов текущим основным ключом (если задан MAIL_SECRET_KEY)."""
+    if not os.getenv("MAIL_SECRET_KEY"):
+        return 0
+    f = _fernet()
+    primary = _key_from(os.getenv("MAIL_SECRET_KEY"))
+    n = 0
+    for r in _q("SELECT id, enc_password FROM mail_clients WHERE enc_password IS NOT NULL"):
+        token = r["enc_password"].encode()
+        try:
+            primary.decrypt(token)
+            continue  # уже зашифрован новым ключом
+        except (InvalidToken, ValueError):
+            pass
+        try:
+            new = f.rotate(token).decode()
+        except (InvalidToken, ValueError):
+            continue  # не расшифровался ни одним ключом — пароль нужно ввести заново
+        _q("UPDATE mail_clients SET enc_password = ? WHERE id = ?", (new, r["id"]), commit=True)
+        n += 1
+    return n
 
 
 def encrypt(value: str) -> str:
@@ -922,11 +959,20 @@ _client_locks: dict[int, asyncio.Lock] = {}
 _client_last_send: dict[int, float] = {}
 
 
+def sending_locked() -> bool:
+    """Аварийный стоп-кран: при включённом lockdown бот не отправляет ни одного
+    письма (ни отклики, ни точечную рассылку). Включается /lockdown на случай,
+    если что-то пошло не так или угнали аккаунт админа."""
+    return db.get_setting("email_lockdown", "off") == "on"
+
+
 async def send_app(bot: Bot, app_id: int) -> tuple[bool, str]:
     app = get_app(app_id)
     client = get_client(app["client_id"]) if app else None
     if not client:
         return False, "клиент удалён"
+    if sending_locked():
+        return False, "отправка писем приостановлена администратором (/lockdown)"
     blocked = gmail_blocked(client)
     if blocked:
         set_app(app_id, status="failed", error="лимит Gmail")
@@ -2605,6 +2651,8 @@ async def _mailbase_send(bot: Bot, client, to_email: str) -> tuple[bool, str]:
     рассылки своя, отдельно посчитанная дневная квота (см. _mail_base_tick)."""
     lock = _client_locks.setdefault(client["id"], asyncio.Lock())
     async with lock:
+        if sending_locked():
+            return False, "отправка писем приостановлена администратором (/lockdown)"
         blocked = gmail_blocked(get_client(client["id"]) or client)
         if blocked:
             return False, blocked
@@ -2644,6 +2692,11 @@ _FREE_DOMAINS = {"gmail.com", "googlemail.com", "yahoo.com", "outlook.com", "hot
                  "mail.ru", "yandex.ru", "ukr.net", "i.ua", "meta.ua", "bk.ru", "inbox.ru", "list.ru", "aol.com",
                  "gmx.com", "gmx.de", "web.de", "proton.me", "protonmail.com"}
 MAILBASE_DOMAIN_GAP_MIN = int(os.getenv("MAILBASE_DOMAIN_GAP_MIN", "20"))
+MAILBASE_SKIP_SCAN = int(os.getenv("MAILBASE_SKIP_SCAN", "40"))   # за тик пропустить столько «мёртвых» адресов, ища живой
+MAILBASE_CATCHUP_MAX = int(os.getenv("MAILBASE_CATCHUP_MAX", "5"))  # после простоя дослать за тик не больше стольких писем
+MAILBASE_STALL_MIN = int(os.getenv("MAILBASE_STALL_MIN", "40"))   # активная кампания молчит дольше — предупредить админа
+_mailbase_last_ok: dict[int, float] = {}
+_mailbase_stall_warned: dict[int, str] = {}
 _fail_streak: dict[int, int] = {}
 _domain_last: dict[tuple[int, str], float] = {}
 _mx_cache: dict[str, bool] = {}
@@ -2772,6 +2825,87 @@ async def _mailbase_report_if_due(bot: Bot, client, today_str: str, now_hm: str)
                               + (f" · ❌ не ушло: {mb['failed']}" if mb["failed"] else ""))
 
 
+async def _mailbase_send_one(bot: Bot, client) -> str:
+    """Одна попытка отправки по базе клиента. Возвращает:
+    "sent"  — письмо ушло;
+    "skip"  — адрес пропущен (возврат/мусор/уже писали) — слот не потрачен, берём следующий;
+    "stop"  — на этом тике для клиента больше не шлём (нет адресов / ящик встал на паузу / кончились потолки)."""
+    client_id = client["id"]
+    if (client["mailbase_sent_today"] or 0) >= MAILBASE_DAILY_MAX:
+        return "stop"
+    if sent_today(client_id, include_mailbase=True) >= MAILBOX_DAILY_MAX:
+        return "stop"
+    target = _pick_target(client_id)
+    if not target:
+        return "stop"
+    addr = target["email"].strip().lower()
+    domain = addr.split("@")[-1]
+    if is_bounced(addr):
+        _q("UPDATE mail_base_targets SET status = 'bounced', last_error = ? WHERE id = ?",
+           ("адрес недоставляем (возврат ранее)", target["id"]), commit=True)
+        return "skip"
+    if not _looks_deliverable(addr) or not await asyncio.to_thread(_domain_has_mail, domain):
+        _q("UPDATE mail_base_targets SET status = 'invalid', last_error = ? WHERE id = ?",
+           ("у домена нет почтового сервера / адрес некорректный", target["id"]), commit=True)
+        return "skip"
+    if already_applied_to(client_id, target["email"], statuses=("sent",)):
+        _q("UPDATE mail_base_targets SET status = 'skipped', last_error = ? WHERE id = ?",
+           ("уже получал CV за последние сутки", target["id"]), commit=True)
+        return "skip"
+    ok, err = await _mailbase_send(bot, client, target["email"])
+    _domain_last[(client_id, domain)] = time.monotonic()
+    if ok:
+        _fail_streak[client_id] = 0
+        _mailbase_last_ok[client_id] = time.monotonic()
+        _mailbase_stall_warned.pop(client_id, None)
+        _q("UPDATE mail_base_targets SET status = 'sent', sent_at = ?, last_error = NULL WHERE id = ?",
+           (datetime.now().isoformat(), target["id"]), commit=True)
+        # перечитываем счётчик из БД — не затираем параллельные отклики на вакансии
+        cur = get_client(client_id)
+        update_client(client_id, mailbase_sent_today=(cur["mailbase_sent_today"] or 0) + 1)
+        client["mailbase_sent_today"] = (cur["mailbase_sent_today"] or 0) + 1
+        return "sent"
+    kind = _send_error_kind(err)
+    if kind == "mailbox":
+        await _pause_mailbase(bot, client, "почта клиента не принимает вход — проверьте пароль приложения "
+                                           f"(/clientpass). {err}")
+        return "stop"
+    if kind == "quota":
+        return "stop"  # ящик встал на паузу внутри _mailbase_send; адрес остался pending
+    attempts = (target["attempts"] or 0) + (0 if kind == "transient" else 1)
+    status = "invalid" if kind == "invalid" else ("failed" if attempts >= MAILBASE_MAX_ATTEMPTS else "pending")
+    _q("UPDATE mail_base_targets SET status = ?, attempts = ?, last_error = ? WHERE id = ?",
+       (status, attempts, (err or "")[:300], target["id"]), commit=True)
+    if kind == "invalid":
+        _mark_bounced(client_id, target["email"], (err or "адрес отклонён сервером")[:300])
+        _fail_streak[client_id] = 0
+        return "skip"  # невалидный адрес — сразу берём следующий, не ждём
+    _fail_streak[client_id] = _fail_streak.get(client_id, 0) + 1
+    if _fail_streak[client_id] >= MAILBASE_FAIL_STREAK:
+        _fail_streak[client_id] = 0
+        await _pause_mailbase(bot, client, f"{MAILBASE_FAIL_STREAK} ошибок отправки подряд — похоже, почта "
+                                           f"временно ограничила ящик. Последняя: {err}")
+        return "stop"
+    print(f"[mail_base_worker] не отправилось {target['email']} (клиент {client_id}, {kind}): {err}")
+    return "skip"  # временная ошибка — адрес вернётся в очередь, пробуем следующий
+
+
+async def _mailbase_watchdog(bot: Bot, client, now_hm: str):
+    """Кампания активна, в окне, не на паузе, адреса есть — но давно ничего не ушло.
+    Чаще всего это ящик (пароль/лимит), но на всякий случай сообщаем админу один раз."""
+    cid = client["id"]
+    last_ok = _mailbase_last_ok.get(cid)
+    if last_ok is None:
+        _mailbase_last_ok[cid] = time.monotonic()
+        return
+    stalled_min = (time.monotonic() - last_ok) / 60
+    if stalled_min >= MAILBASE_STALL_MIN and _mailbase_stall_warned.get(cid) != now_hm[:2]:
+        _mailbase_stall_warned[cid] = now_hm[:2]  # не чаще раза в час
+        await _notify_admins(bot, f"⚠️ Точечная рассылка {html.escape(client['full_name'])}: за "
+                                  f"{int(stalled_min)} мин не ушло ни одного письма, хотя кампания активна. "
+                                  f"Проверьте: /mbcheck {cid}")
+
+
 async def _mail_base_tick_client(bot: Bot, client, now, today_str: str, now_hm: str):
     client_id = client["id"]
     if today_str < (client["mailbase_start_date"] or today_str):
@@ -2781,6 +2915,7 @@ async def _mail_base_tick_client(bot: Bot, client, now, today_str: str, now_hm: 
     pending = mailbase_counts(client_id)["pending"]
     if pending == 0:
         update_client(client_id, mailbase_active=0)
+        _mailbase_last_ok.pop(client_id, None)
         mb = mailbase_counts(client_id)
         await _notify_admins(bot, f"🎯 Точечная рассылка для {html.escape(client['full_name'])} завершена.\n"
                                   f"Отправлено: {mb['sent']} из {mb['total']}"
@@ -2799,68 +2934,30 @@ async def _mail_base_tick_client(bot: Bot, client, now, today_str: str, now_hm: 
     win_end = client["mailbase_window_end"] or "18:00"
     if not (win_start <= now_hm <= win_end):
         return
-    # потолки: на кампанию в день и на ящик целиком (отклики + рассылка)
-    if (client["mailbase_sent_today"] or 0) >= MAILBASE_DAILY_MAX:
-        return
-    if sent_today(client_id, include_mailbase=True) >= MAILBOX_DAILY_MAX:
-        return
+    # сколько писем «положено» отправить к этому моменту: интервал прошёл один раз →
+    # одно письмо; если бот стоял и прошло несколько интервалов → догоняем, но не
+    # больше MAILBASE_CATCHUP_MAX за тик, чтобы не уйти пачкой
+    interval = _effective_interval(client) * random.uniform(0.85, 1.15)
     last = _mailbase_last_tick.get(client_id, 0)
-    if time.monotonic() - last < _effective_interval(client) * random.uniform(0.85, 1.15):
+    elapsed = time.monotonic() - last
+    if last and elapsed < interval:
+        await _mailbase_watchdog(bot, client, now_hm)
         return
-    target = _pick_target(client_id)
-    if not target:
-        return
-    _mailbase_last_tick[client_id] = time.monotonic()
-    addr = target["email"].strip().lower()
-    domain = addr.split("@")[-1]
-    if is_bounced(addr):
-        _q("UPDATE mail_base_targets SET status = 'bounced', last_error = ? WHERE id = ?",
-           ("адрес недоставляем (возврат ранее)", target["id"]), commit=True)
-        _mailbase_last_tick[client_id] = 0  # ничего не отправили — следующий адрес без ожидания
-        return
-    if not _looks_deliverable(addr) or not await asyncio.to_thread(_domain_has_mail, domain):
-        _q("UPDATE mail_base_targets SET status = 'invalid', last_error = ? WHERE id = ?",
-           ("у домена нет почтового сервера / адрес некорректный", target["id"]), commit=True)
-        _mailbase_last_tick[client_id] = 0
-        return
-    if already_applied_to(client_id, target["email"], statuses=("sent",)):
-        _q("UPDATE mail_base_targets SET status = 'skipped', last_error = ? WHERE id = ?",
-           ("уже получал CV за последние сутки", target["id"]), commit=True)
-        _mailbase_last_tick[client_id] = 0
-        return
-    ok, err = await _mailbase_send(bot, client, target["email"])
-    _domain_last[(client_id, domain)] = time.monotonic()
-    if ok:
-        _fail_streak[client_id] = 0
-        _q("UPDATE mail_base_targets SET status = 'sent', sent_at = ?, last_error = NULL WHERE id = ?",
-           (datetime.now().isoformat(), target["id"]), commit=True)
-        update_client(client_id, mailbase_sent_today=(client["mailbase_sent_today"] or 0) + 1)
-        return
-    kind = _send_error_kind(err)
-    if kind == "mailbox":
-        # пароль не принят и т.п. — виноват ящик, а не адрес: попытку не тратим, ставим кампанию на паузу
-        await _pause_mailbase(bot, client, "почта клиента не принимает вход — проверьте пароль приложения "
-                                           f"(/clientpass). {err}")
-        return
-    attempts = (target["attempts"] or 0) + (0 if kind in ("quota", "transient") else 1)
-    if kind == "invalid":
-        status = "invalid"
-    elif attempts >= MAILBASE_MAX_ATTEMPTS:
-        status = "failed"
-    else:
-        status = "pending"  # попробуем ещё раз позже (адрес вернётся в случайную очередь)
-    _q("UPDATE mail_base_targets SET status = ?, attempts = ?, last_error = ? WHERE id = ?",
-       (status, attempts, (err or "")[:300], target["id"]), commit=True)
-    if kind == "invalid":
-        _mark_bounced(client_id, target["email"], (err or "адрес отклонён сервером")[:300])
-        _fail_streak[client_id] = 0
-    elif kind in ("other", "transient"):
-        _fail_streak[client_id] = _fail_streak.get(client_id, 0) + 1
-        if _fail_streak[client_id] >= MAILBASE_FAIL_STREAK:
-            _fail_streak[client_id] = 0
-            await _pause_mailbase(bot, client, f"{MAILBASE_FAIL_STREAK} ошибок отправки подряд — похоже, почта "
-                                               f"временно ограничила ящик. Последняя: {err}")
-    print(f"[mail_base_worker] не отправилось {target['email']} (клиент {client_id}, {kind}): {err}")
+    budget = 1 if not last else min(MAILBASE_CATCHUP_MAX, max(1, int(elapsed // max(interval, 1))))
+    sent_now, scans = 0, 0
+    while sent_now < budget and scans < MAILBASE_SKIP_SCAN:
+        res = await _mailbase_send_one(bot, client)
+        if res == "sent":
+            sent_now += 1
+            _mailbase_last_tick[client_id] = time.monotonic()
+        elif res == "skip":
+            scans += 1  # пропуск тик не тратит — ищем следующий живой адрес
+        else:  # stop
+            break
+    if sent_now == 0 and scans == 0:
+        # ничего не отправили и нечего было пропускать (нет адресов/потолки) — не копим «долг»
+        _mailbase_last_tick[client_id] = time.monotonic()
+    await _mailbase_watchdog(bot, client, now_hm)
 
 
 async def _mail_base_tick(bot: Bot):
@@ -2868,12 +2965,13 @@ async def _mail_base_tick(bot: Bot):
     now = _mailbase_now()
     today_str = now.strftime("%Y-%m-%d")
     now_hm = now.strftime("%H:%M")
-    for client in clients:
-        # ошибка у одного клиента не должна останавливать рассылку остальным
+    async def _one(client):
+        # ошибка/медленный SMTP у одного клиента не должны задерживать остальных
         try:
             await _mail_base_tick_client(bot, client, now, today_str, now_hm)
         except Exception as e:
             print(f"[mail_base_worker] клиент {client['id']}: {type(e).__name__}: {e}")
+    await asyncio.gather(*[_one(c) for c in clients])
 
 
 # ---------------------------------------------------------------- возвраты (недоставленные письма)

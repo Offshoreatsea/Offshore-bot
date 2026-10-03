@@ -35,6 +35,7 @@ from dotenv import load_dotenv
 
 import db
 import email_apply
+import features
 import ranks
 import webapp
 
@@ -1008,6 +1009,141 @@ async def _after_publish(bot: Bot, vacancy_id: int, fields: dict):
         print(f"[do_publish] Черновики email-откликов не созданы: {e}")
 
 
+# ---------------------------------------------------------------- защита: антифлуд и журнал действий админов
+
+FLOOD_LIMIT = int(os.getenv("FLOOD_LIMIT", "25"))        # действий (сообщений/кнопок) …
+FLOOD_WINDOW = int(os.getenv("FLOOD_WINDOW", "30"))      # … за столько секунд
+FLOOD_MUTE = int(os.getenv("FLOOD_MUTE", "300"))         # игнорировать флудера столько секунд
+_flood_hits: dict[int, list[float]] = {}
+_flood_muted: dict[int, float] = {}
+_flood_strikes: dict[int, list[float]] = {}
+
+
+class AntiFloodMiddleware:
+    """Ограничивает частоту действий НЕ-админов: бот-спамер или человек, жмущий
+    кнопки сотни раз, на время перестаёт получать ответы (бот при этом не
+    тормозит для остальных). Админов не трогает. Повторные флуды — сигнал админу."""
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is None or admin_only(user.id) or getattr(event, "successful_payment", None):
+            return await handler(event, data)  # оплату пропускаем всегда, даже флудеру
+        uid, now = user.id, time.monotonic()
+        if _flood_muted.get(uid, 0) > now:
+            if isinstance(event, CallbackQuery):
+                try:
+                    await event.answer()
+                except Exception:
+                    pass
+            return None
+        hits = [t for t in _flood_hits.get(uid, []) if now - t < FLOOD_WINDOW]
+        hits.append(now)
+        _flood_hits[uid] = hits
+        if len(hits) > FLOOD_LIMIT:
+            _flood_muted[uid] = now + FLOOD_MUTE
+            _flood_hits[uid] = []
+            strikes = [t for t in _flood_strikes.get(uid, []) if now - t < 3600] + [now]
+            _flood_strikes[uid] = strikes
+            bot = data.get("bot")
+            try:
+                if isinstance(event, Message):
+                    await event.answer("⏳ Too many requests. Please wait a few minutes.")
+                if bot and len(strikes) >= 3:
+                    handle = f"@{user.username}" if user.username else f"id{uid}"
+                    for admin_id in ADMIN_IDS:
+                        await bot.send_message(admin_id, f"🛡 Подозрительная активность: {handle} флудит боту "
+                                                         f"({len(strikes)} раза за час). Заблокировать: /blockuser {handle}")
+            except Exception:
+                pass
+            return None
+        if len(_flood_hits) > 20000:  # чистка памяти
+            for k in [k for k, v in _flood_hits.items() if not v or now - v[-1] > FLOOD_WINDOW]:
+                _flood_hits.pop(k, None)
+        return await handler(event, data)
+
+
+# команды, о которых сообщаем ВСЕМ админам: если чей-то аккаунт админа угонят,
+# вы сразу увидите, что от его имени раздают доступ или делают рассылку
+SENSITIVE_ADMIN_COMMANDS = ("/grant", "/revoke", "/refund", "/extendall", "/unlockall", "/revokeallpositions",
+                            "/broadcast", "/blockuser", "/unblockuser", "/autopublish", "/backup", "/removead",
+                            "/lockdown")
+
+
+class AdminAuditMiddleware:
+    async def __call__(self, handler, event, data):
+        text = getattr(event, "text", None) or ""
+        user = getattr(event, "from_user", None)
+        if user and text.startswith("/") and admin_only(user.id):
+            cmd = text.split()[0].split("@")[0].lower()
+            if cmd in SENSITIVE_ADMIN_COMMANDS:
+                try:
+                    db.log_admin_action(user.id, text[:300])
+                    bot = data.get("bot")
+                    who = f"@{user.username}" if user.username else f"id{user.id}"
+                    for admin_id in ADMIN_IDS:
+                        if admin_id != user.id and bot:
+                            await bot.send_message(admin_id, f"🛡 Админ {html.escape(who)} выполнил: "
+                                                             f"<code>{html.escape(text[:200])}</code>")
+                except Exception as e:
+                    print(f"[audit] {e}")
+        return await handler(event, data)
+
+
+@router.message(Command("lockdown"))
+async def cmd_lockdown(message: Message, command: CommandObject):
+    """Аварийный стоп-кран отправки писем. /lockdown on — остановить все письма
+    (отклики и точечные рассылки), /lockdown off — снять. Пост в канал и оплаты
+    это не трогает. На случай, если что-то пошло не так или угнали аккаунт."""
+    if not admin_only(message.from_user.id):
+        return
+    arg = (command.args or "").strip().lower()
+    if arg not in ("on", "off"):
+        cur = db.get_setting("email_lockdown", "off")
+        state = "🔴 ОСТАНОВЛЕНА" if cur == "on" else "🟢 работает"
+        await message.answer(
+            f"Сейчас отправка писем: <b>{state}</b>.\n\n"
+            "/lockdown on — аварийно остановить все письма\n"
+            "/lockdown off — снять блокировку"
+        )
+        return
+    db.set_setting("email_lockdown", arg)
+    if arg == "on":
+        await message.answer("🔴 Отправка всех писем ОСТАНОВЛЕНА. Отклики и точечные рассылки не уходят. "
+                             "Запланированные адреса не теряются. Снять: /lockdown off")
+    else:
+        await message.answer("🟢 Отправка писем возобновлена.")
+
+
+@router.message(Command("adminlog"))
+async def cmd_admin_log(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    rows = db.get_admin_log(30)
+    if not rows:
+        await message.answer("Журнал действий админов пуст.")
+        return
+    lines = ["🛡 <b>Последние важные действия админов</b>\n"]
+    lines += [f"{r['created_at'][5:16].replace('T', ' ')} · id{r['admin_id']}: "
+              f"<code>{html.escape(r['action'][:120])}</code>" for r in rows]
+    await message.answer("\n".join(lines))
+
+
+@router.my_chat_member()
+async def on_bot_added_somewhere(event):
+    """Бота добавили в чужую группу — сразу выходим (защита от спама через группы
+    и от того, чтобы кто-то использовал бота у себя)."""
+    try:
+        chat = event.chat
+        new_status = event.new_chat_member.status
+        if chat.type in ("group", "supergroup") and new_status in ("member", "administrator"):
+            adder = event.from_user.id if event.from_user else None
+            if not (adder and admin_only(adder)):
+                await event.bot.leave_chat(chat.id)
+                print(f"[security] вышел из чужой группы {chat.id} ({chat.title})")
+    except Exception as e:
+        print(f"[security] my_chat_member: {e}")
+
+
 # ---------------------------------------------------------------- инструкция для админов (по кнопкам)
 # Видна ТОЛЬКО админам: команда /admin, кнопка в /start админа. Обычные
 # пользователи ни команду, ни кнопки не видят (admin_only на каждом шаге).
@@ -1108,9 +1244,14 @@ ADMIN_HELP = {
         "/getemails — так его видят пользователи (покупка картой). Вам при /start приходит список email за неделю бесплатно."),
     "srv": ("🛠 Обслуживание",
         "/health — состояние бота одной командой: база на Volume или нет, очередь, рассылки, ящики на паузе\n"
-        "/backup — копия базы файлом прямо сейчас; автоматически бот присылает её каждую ночь\n"
+        "/backup — копия базы файлом прямо сейчас (ночной автобэкап выключен; включить — BACKUP_HOUR)\n"
         "/testchannel — доступ бота к каналу\n"
-        "/search — мини-приложение с поиском вакансий · /applications — отклики из мини-приложения\n\n"
+        "/search — мини-приложение с поиском вакансий · /applications — отклики из мини-приложения\n"
+        "/adminlog — журнал важных действий админов (выдача доступа, возвраты, рассылки)\n"
+        "/lockdown on|off — аварийно остановить/возобновить ВСЕ письма\n\n"
+        "<b>Защита</b>: кто шлёт боту слишком много запросов — бот на 5 мин перестаёт ему отвечать, "
+        "при повторах вам придёт предупреждение. В чужие группы бот не заходит. О важных командах "
+        "одного админа (/grant, /refund, /broadcast…) сразу узнают остальные.\n\n"
         "<b>Если бот «молчит» после обновления</b>\n"
         "1. Railway → сервис → Deployments: последний деплой зелёный?\n"
         "2. /health — строка «База»: должно быть «✅ на Volume».\n"
@@ -1998,6 +2139,9 @@ def after_subscribe_keyboard(lang: str | None = None, tg_id: int | None = None) 
         ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{tg_id}"
         share_url = f"https://t.me/share/url?url={ref_link}&text=" + t(lang, "referral_share_text")
         rows.append([InlineKeyboardButton(text=t(lang, "invite_friend"), url=share_url)])
+    rows.append([InlineKeyboardButton(text=features.L(lang, "btn_contract"), callback_data="feat:contract"),
+                 InlineKeyboardButton(text=features.L(lang, "btn_docs"), callback_data="feat:docs")])
+    rows.append([InlineKeyboardButton(text=features.L(lang, "btn_news"), callback_data="feat:news")])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
@@ -2916,7 +3060,7 @@ async def cb_fix(callback: CallbackQuery):
     await callback.answer()
 
 
-BACKUP_HOUR = int(os.getenv("BACKUP_HOUR", "3"))  # час ночного бэкапа базы админу; -1 — выключить
+BACKUP_HOUR = int(os.getenv("BACKUP_HOUR", "-1"))  # час ночного бэкапа базы админу; -1 — выключён (по умолчанию)
 
 
 def _make_backup_file() -> tuple[bytes, str]:
@@ -3012,6 +3156,11 @@ async def cmd_health(message: Message):
         f"🎯 Точечных рассылок идёт: {len(campaigns)}"
         + (" (" + ", ".join(html.escape(c['full_name']) for c in campaigns) + ")" if campaigns else ""),
         f"📭 Недоставляемых адресов (точечная рассылка): {bounces}",
+        ("🔴 <b>Отправка писем ОСТАНОВЛЕНА</b> (/lockdown off — снять)"
+         if db.get_setting("email_lockdown", "off") == "on" else "🟢 Отправка писем работает"),
+        ("🔑 Ключ шифрования паролей: ✅ задан"
+         if os.getenv("MAIL_SECRET_KEY") else
+         "🔑 ⚠️ MAIL_SECRET_KEY не задан — пароли почты шифруются токеном бота (менее надёжно)"),
     ]
     if paused:
         lines.append("⛔️ Ящики на паузе (лимит почты): " + ", ".join(
@@ -3089,11 +3238,21 @@ async def scheduled_ads_worker(bot: Bot):
 async def main():
     db.init_db()
     db.reset_stuck_publishing()
+    rotated = email_apply.rotate_mail_passwords()
+    if rotated:
+        print(f"[security] пароли почты {rotated} клиентов перешифрованы ключом MAIL_SECRET_KEY")
     email_apply.init_tables()
     email_apply.setup(ADMIN_IDS, claude, RANK_TAGS, TAG_LABELS)
+    features.init_tables()
+    features.setup(ADMIN_IDS, claude)
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
+    # защита: журнал важных команд админов и антифлуд для всех остальных
+    dp.message.outer_middleware(AdminAuditMiddleware())
+    dp.message.outer_middleware(AntiFloodMiddleware())
+    dp.callback_query.outer_middleware(AntiFloodMiddleware())
     dp.include_router(email_apply.router)  # раньше основного: его пошаговые диалоги должны ловить текст первыми
+    dp.include_router(features.router)     # инструменты подписчика (контракт/документы/новости)
     dp.include_router(router)
     asyncio.create_task(digest_worker(bot))
     asyncio.create_task(subscription_reminder_worker(bot))
@@ -3101,6 +3260,9 @@ async def main():
     asyncio.create_task(email_apply.mail_base_worker(bot))
     asyncio.create_task(email_apply.bounce_worker(bot))  # ловит письма «не доставлено» и исключает такие адреса
     asyncio.create_task(backup_worker(bot))
+    asyncio.create_task(features.docs_reminder_worker(bot))   # напоминания об окончании документов
+    asyncio.create_task(features.news_worker(bot))            # сбор новостей офшора
+    asyncio.create_task(features.news_digest_worker(bot))     # ежедневная сводка новостей тем, кто включил
     # текст, видимый в ПУСТОМ чате до первого нажатия Start — ставится через
     # Bot API, не хранится нигде в БД, просто применяется заново при каждом
     # старте, чтобы не зависеть от ручной настройки через BotFather
