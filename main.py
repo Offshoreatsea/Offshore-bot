@@ -57,11 +57,12 @@ STRIPE_DIGEST_PAYMENT_LINK = os.getenv("STRIPE_DIGEST_PAYMENT_LINK")  # отде
 BANNER_PATH = os.path.join(os.path.dirname(__file__), "assets", "promo_banner.jpg")
 _banner_file_id: str | None = None  # заполняется после первой отправки — дальше шлём по file_id, не перезаливая файл
 PORT = int(os.getenv("PORT", "8080"))
-SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "800"))
+SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "800"))  # legacy, Stars больше не показываем
+SUBSCRIPTION_PRICE_EUR = os.getenv("SUBSCRIPTION_PRICE_EUR", "1")  # цена подписки картой (отображение; реальная сумма — в Stripe)
 SUBSCRIPTION_DAYS = 30
 MAX_POSITIONS = 2
 REFERRAL_BONUS_DAYS = 3
-TRIAL_DAYS = 3
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "30"))
 TRIAL_BACKFILL_DAYS = 4  # чтобы не сливать всю базу разом при первом выборе должности
 EMAIL_DIGEST_PRICE_STARS = int(os.getenv("EMAIL_DIGEST_PRICE_STARS", "165"))  # оставлено для обратной совместимости с уже существующим Stars-инвойсом, если понадобится вернуть
 EMAIL_DIGEST_PRICE_USD = int(os.getenv("EMAIL_DIGEST_PRICE_USD", "5"))
@@ -198,7 +199,7 @@ TR = {
                   "What I can do:\n"
                   "📋 Instant alerts for up to 2 positions you pick\n"
                   "📧 Weekly list of recruiter emails from the channel\n"
-                  "🎁 3 days free to try, no card needed\n"
+                  "🎁 30 days free to try, no card needed\n🧰 Tools: contract check, documents + expiry reminders, offshore news\n"
                   "🔁 See your subscription status and renew anytime\n\n"
                   "⚠️ OffshoreAtSea is a vacancy aggregator only — we are not "
                   "the employer and are not responsible for working conditions "
@@ -218,15 +219,12 @@ TR = {
         "no_selection": "You haven't picked any position yet — tap one above.",
         "subscribed_summary": "Your alerts are set up for: {tags}",
         "contact_admin": "🆘 Contact admin",
-        "pay_intro": "Your free trial has ended. {price} Stars gets you 30 more days "
-                     "of instant notifications for the positions you choose.",
-        "pay_button": "⭐ Pay {price} Stars for 30 days",
+        "pay_intro": "Your free trial has ended. Subscription is €{price}/month — instant alerts "
+                     "for the positions you pick, plus all tools (contract check, documents, news).",
         "pay_button_card": "💳 Pay by card",
-        "pay_contact_admin": "💬 Can't pay with Stars? Message admin",
+        "pay_button_sub": "💳 Subscribe €{price}/mo by card",
         "trial_started": "🎉 You get {days} days free — no card needed. Choose your positions:",
         "referral_bonus": "🎁 A friend you invited just paid — you got +{days} days, now active until {until}!",
-        "invite_friend": "🎁 Invite a friend, get 3 free days",
-        "referral_share_text": "Get job alerts by position on OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Your job alerts subscription ends in less than 24 hours. Renew to keep getting instant notifications:",
         "revoked_notice": "Your job alerts subscription has been cancelled by the admin.",
         "bonus_extension": "🎁 We're giving you {days} days of access as a gift! Now active until {until}.",
@@ -241,6 +239,7 @@ TR = {
         "renew_button": "🔁 Renew subscription",
         "contact_locked": "📩 Contact: 🔒 hidden — subscribe to unlock recruiter contacts instantly: /managesubscription",
         "my_id_button": "🆔 My ID",
+        "back_button": "⬅️ Menu",
         "my_id_text": "Your Telegram ID: {id}",
         "digest_count_button": "🔢 How many emails available?",
         "digest_count_text": "📊 {count} recruiter emails available right now.",
@@ -249,7 +248,6 @@ TR = {
         "digest_demo_uses_left": "Free demo tries left: {left}",
         "digest_demo_exhausted": "You've used both free demo tries. Buy the full list to see all emails.",
         "digest_intro": "📧 Get all the recruiter emails from vacancies posted in the channel this week — ${price}, one-time purchase.",
-        "digest_pay_button": "⭐ Pay {price} Stars",
         "digest_menu_button": "📧 Get recruiter emails from this week",
         "digest_delivered": "✅ Here are {count} emails from the last 7 days:",
         "digest_empty": "No vacancies with contact emails were posted in the last 7 days.",
@@ -271,7 +269,7 @@ TR = {
                  "Что я умею:\n"
                  "📋 Мгновенные уведомления по 2 выбранным должностям\n"
                  "📧 Список email рекрутёров за неделю из канала\n"
-                 "🎁 3 дня бесплатно, карта не нужна\n"
+                 "🎁 30 дней бесплатно, карта не нужна\n🧰 Инструменты: проверка контракта, документы с напоминаниями, новости офшора\n"
                  "🔁 Всегда видно статус подписки, продление в один клик\n\n"
                  "⚠️ OffshoreAtSea — только агрегатор вакансий, мы не являемся "
                  "работодателем и не несём ответственности за условия труда "
@@ -291,15 +289,12 @@ TR = {
         "no_selection": "Вы ещё не выбрали ни одной должности — нажмите на любую выше.",
         "subscribed_summary": "Ваши подписки: {tags}",
         "contact_admin": "🆘 Написать администратору",
-        "pay_intro": "Ваш бесплатный период закончился. {price} ⭐ дают ещё 30 дней "
-                     "мгновенных уведомлений по выбранным должностям.",
-        "pay_button": "⭐ Оплатить {price} Stars за 30 дней",
+        "pay_intro": "Пробный период закончился. Подписка €{price}/месяц — мгновенные уведомления "
+                     "по выбранным должностям и все инструменты (контракт, документы, новости).",
         "pay_button_card": "💳 Оплатить картой",
-        "pay_contact_admin": "💬 Не можете оплатить Stars? Написать администратору",
-        "trial_started": "🎉 Вам доступны {days} дня бесплатно — без карты. Выберите должности:",
+        "pay_button_sub": "💳 Подписка €{price}/мес картой",
+        "trial_started": "🎉 Вам доступно {days} дней бесплатно — без карты. Выберите должности:",
         "referral_bonus": "🎁 Приглашённый вами друг оплатил — вам +{days} дня, теперь активно до {until}!",
-        "invite_friend": "🎁 Пригласить друга, получить 3 дня бесплатно",
-        "referral_share_text": "Уведомления о вакансиях по должности в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша подписка на уведомления заканчивается меньше чем через 24 часа. Продлите, чтобы не пропускать вакансии:",
         "revoked_notice": "Ваша подписка на уведомления отменена администратором.",
         "bonus_extension": "Даём доступ на {days} дня в подарок 🎁\nТеперь активно до {until}.",
@@ -314,6 +309,7 @@ TR = {
         "renew_button": "🔁 Продлить подписку",
         "contact_locked": "📩 Контакт: 🔒 скрыт — оформите подписку, чтобы сразу видеть контакты рекрутёров: /managesubscription",
         "my_id_button": "🆔 Мой ID",
+        "back_button": "⬅️ Меню",
         "my_id_text": "Ваш Telegram ID: {id}",
         "digest_count_button": "🔢 Сколько email доступно?",
         "digest_count_text": "📊 Сейчас доступно {count} email рекрутёров.",
@@ -322,7 +318,6 @@ TR = {
         "digest_demo_uses_left": "Осталось бесплатных попыток: {left}",
         "digest_demo_exhausted": "Вы уже использовали обе бесплатные попытки. Оформите подписку, чтобы увидеть полный список.",
         "digest_intro": "📧 Все email рекрутёров из вакансий, опубликованных в канале за эту неделю — ${price}, разовая покупка.",
-        "digest_pay_button": "⭐ Оплатить {price} Stars",
         "digest_menu_button": "📧 Получить email рекрутёров за неделю",
         "digest_delivered": "✅ Вот {count} email за последние 7 дней:",
         "digest_empty": "За последние 7 дней не было вакансий с контактным email.",
@@ -344,7 +339,7 @@ TR = {
                  "Що я вмію:\n"
                  "📋 Миттєві сповіщення за 2 обраними посадами\n"
                  "📧 Список email рекрутерів за тиждень з каналу\n"
-                 "🎁 3 дні безкоштовно, картка не потрібна\n"
+                 "🎁 30 днів безкоштовно, картка не потрібна\n🧰 Інструменти: перевірка контракту, документи з нагадуваннями, новини офшору\n"
                  "🔁 Завжди видно статус підписки, продовження в один клік\n\n"
                  "⚠️ OffshoreAtSea — лише агрегатор вакансій, ми не є "
                  "роботодавцем і не несемо відповідальності за умови праці "
@@ -364,15 +359,12 @@ TR = {
         "no_selection": "Ви ще не обрали жодної посади — натисніть на будь-яку вище.",
         "subscribed_summary": "Ваші підписки: {tags}",
         "contact_admin": "🆘 Написати адміністратору",
-        "pay_intro": "Ваш безкоштовний період закінчився. {price} ⭐ дають ще 30 днів "
-                     "миттєвих сповіщень за обраними посадами.",
-        "pay_button": "⭐ Оплатити {price} Stars за 30 днів",
+        "pay_intro": "Пробний період закінчився. Підписка €{price}/місяць — миттєві сповіщення "
+                     "за обраними посадами та всі інструменти (контракт, документи, новини).",
         "pay_button_card": "💳 Оплатити карткою",
-        "pay_contact_admin": "💬 Не можете оплатити Stars? Напишіть адміністратору",
-        "trial_started": "🎉 Вам доступні {days} дні безкоштовно — без картки. Оберіть посади:",
+        "pay_button_sub": "💳 Підписка €{price}/міс карткою",
+        "trial_started": "🎉 Вам доступно {days} днів безкоштовно — без картки. Оберіть посади:",
         "referral_bonus": "🎁 Запрошений вами друг оплатив — вам +{days} дні, тепер активно до {until}!",
-        "invite_friend": "🎁 Запросити друга, отримати 3 дні безкоштовно",
-        "referral_share_text": "Сповіщення про вакансії за посадою в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша підписка на сповіщення закінчується менш ніж за 24 години. Продовжте, щоб не пропускати вакансії:",
         "revoked_notice": "Вашу підписку на сповіщення скасовано адміністратором.",
         "bonus_extension": "Даруємо доступ на {days} дні у подарунок 🎁\nТепер активно до {until}.",
@@ -387,6 +379,7 @@ TR = {
         "renew_button": "🔁 Продовжити підписку",
         "contact_locked": "📩 Контакт: 🔒 приховано — оформіть підписку, щоб одразу бачити контакти рекрутерів: /managesubscription",
         "my_id_button": "🆔 Мій ID",
+        "back_button": "⬅️ Меню",
         "my_id_text": "Ваш Telegram ID: {id}",
         "digest_count_button": "🔢 Скільки email доступно?",
         "digest_count_text": "📊 Зараз доступно {count} email рекрутерів.",
@@ -395,7 +388,6 @@ TR = {
         "digest_demo_uses_left": "Залишилось безкоштовних спроб: {left}",
         "digest_demo_exhausted": "Ви вже використали обидві безкоштовні спроби. Оформіть підписку, щоб побачити повний список.",
         "digest_intro": "📧 Усі email рекрутерів з вакансій, опублікованих у каналі цього тижня — ${price}, разова покупка.",
-        "digest_pay_button": "⭐ Оплатити {price} Stars",
         "digest_menu_button": "📧 Отримати email рекрутерів за тиждень",
         "digest_delivered": "✅ Ось {count} email за останні 7 днів:",
         "digest_empty": "За останні 7 днів не було вакансій із контактним email.",
@@ -1170,7 +1162,7 @@ ADMIN_HELP = {
         "/contacts — все email/агентства из вакансий"),
     "subs": ("👥 Подписчики и оплаты",
         "<b>Как это устроено</b>\n"
-        "Кандидат жмёт «Get More Offers» → выбирает язык → получает 3 дня бесплатно → выбирает до 2 должностей. "
+        "Кандидат жмёт «Get More Offers» → выбирает язык → получает 30 дней бесплатно → выбирает до 2 должностей. "
         "После «Готово» выбор фиксируется до следующей оплаты. Дальше — оплата картой (Stripe).\n\n"
         "<b>Смотреть</b>\n"
         "/subscribers — сколько подписчиков и по каким должностям\n"
@@ -1436,10 +1428,10 @@ def payment_keyboard(lang: str | None = None, tg_id: int | None = None) -> Inlin
         # client_reference_id — единственный способ Stripe сообщить вебхуком,
         # какому именно tg_id принадлежит платёж
         stripe_url = f"{STRIPE_PAYMENT_LINK}?client_reference_id={tg_id}"
-        rows.append([InlineKeyboardButton(text=t(lang, "pay_button_card"), url=stripe_url)])
+        rows.append([InlineKeyboardButton(text=t(lang, "pay_button_sub", price=SUBSCRIPTION_PRICE_EUR), url=stripe_url)])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
-    rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
+    rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1460,7 +1452,7 @@ async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit:
         else:
             # триал уже был использован (или истекла платная подписка) —
             # теперь показываем настоящий экран оплаты
-            text = t(lang, "pay_intro", price=SUBSCRIPTION_PRICE_STARS)
+            text = t(lang, "pay_intro", price=SUBSCRIPTION_PRICE_EUR)
             markup = payment_keyboard(lang, tg_id)
     elif db.is_positions_locked(tg_id):
         selected = db.get_subscriber_positions(tg_id)
@@ -1475,31 +1467,6 @@ async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit:
         await target.edit_text(text, reply_markup=markup)
     else:
         await target.answer(text, reply_markup=markup)
-
-
-@router.callback_query(F.data.startswith("pay_sub:"))
-async def cb_pay_subscription(callback: CallbackQuery):
-    tg_id = callback.from_user.id
-    if throttled(tg_id):
-        await callback.answer()
-        return
-    if db.is_blocked(tg_id):
-        await callback.answer()
-        return
-    # дни и цену НЕ берём из callback_data: модифицированный клиент Telegram
-    # может прислать любые данные кнопки (например «365 дней за 1 звезду»)
-    days, price = SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS
-    await callback.bot.send_invoice(
-        chat_id=tg_id,
-        title=f"OffshoreAtSea — Job Alerts ({days} days)",
-        description=f"Instant vacancy alerts for the positions you choose, "
-                     f"{days} days of access.",
-        payload=f"subscription_{tg_id}_{days}_{price}",
-        currency="XTR",
-        prices=[LabeledPrice(label=f"Job Alerts — {days} days", amount=price)],
-        provider_token="",  # для Stars (XTR) provider_token не нужен
-    )
-    await callback.answer()
 
 
 async def send_manage_subscription_link(bot: Bot, tg_id: int, lang: str | None):
@@ -1564,7 +1531,8 @@ def subscription_status_keyboard(lang: str | None, tg_id: int, has_stripe_custom
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
     rows.append([InlineKeyboardButton(text=t(lang, "my_id_button"), callback_data="show_myid")])
-    rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
+    rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_button"), callback_data="cand:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1581,7 +1549,7 @@ async def send_my_subscription(bot: Bot, tg_id: int, lang: str | None):
     else:
         # подписки нет вообще (или истекла) — обычный экран оплаты, там уже
         # есть кнопка Stripe
-        text = t(lang, "pay_intro", price=SUBSCRIPTION_PRICE_STARS)
+        text = t(lang, "pay_intro", price=SUBSCRIPTION_PRICE_EUR)
         await bot.send_message(tg_id, text, reply_markup=payment_keyboard(lang, tg_id))
 
 
@@ -1605,6 +1573,19 @@ async def cb_my_subscription(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "cand:home")
+async def cb_candidate_home(callback: CallbackQuery):
+    """Кнопка «⬅️ Меню» у подписчика — возвращает в его главный экран
+    (выбор должностей / сводка подписки / экран оплаты, смотря по статусу)."""
+    tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
+    lang = db.get_subscriber_language(tg_id)
+    await show_department_or_paywall(callback.message, tg_id, lang, edit=True)
+    await callback.answer()
+
+
 def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=t(lang, "digest_count_button"), callback_data="digest_count")],
@@ -1615,9 +1596,10 @@ def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> Inline
         # отличает разовую покупку дайджеста от продления подписки
         stripe_url = f"{STRIPE_DIGEST_PAYMENT_LINK}?client_reference_id=digest_{tg_id}"
         rows.append([InlineKeyboardButton(text=t(lang, "pay_button_card"), url=stripe_url)])
-    rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
+    rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
     if tg_id:
         rows.append([InlineKeyboardButton(text=t(lang, "my_subscription_button"), callback_data="show_mysub")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_button"), callback_data="cand:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1684,27 +1666,6 @@ async def cb_show_digest(callback: CallbackQuery):
     await callback.message.answer(
         t(lang, "digest_intro", price=EMAIL_DIGEST_PRICE_USD),
         reply_markup=digest_keyboard(lang, tg_id),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "pay_digest")
-async def cb_pay_digest(callback: CallbackQuery):
-    tg_id = callback.from_user.id
-    if throttled(tg_id):
-        await callback.answer()
-        return
-    if db.is_blocked(tg_id):
-        await callback.answer()
-        return
-    await callback.bot.send_invoice(
-        chat_id=tg_id,
-        title="OffshoreAtSea — Weekly Email Digest",
-        description="All contact emails from vacancies posted in the channel over the last 7 days.",
-        payload=f"digest_{tg_id}",
-        currency="XTR",
-        prices=[LabeledPrice(label="Weekly Email Digest", amount=EMAIL_DIGEST_PRICE_STARS)],
-        provider_token="",
     )
     await callback.answer()
 
@@ -2135,10 +2096,6 @@ def after_subscribe_keyboard(lang: str | None = None, tg_id: int | None = None) 
     # должности зафиксированы после "Готово" — кнопки на их смену больше нет,
     # это осознанное решение (см. cb_subscribe_done); язык менять можно всегда
     rows = []
-    if tg_id:
-        ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{tg_id}"
-        share_url = f"https://t.me/share/url?url={ref_link}&text=" + t(lang, "referral_share_text")
-        rows.append([InlineKeyboardButton(text=t(lang, "invite_friend"), url=share_url)])
     rows.append([InlineKeyboardButton(text=features.L(lang, "btn_contract"), callback_data="feat:contract"),
                  InlineKeyboardButton(text=features.L(lang, "btn_docs"), callback_data="feat:docs")])
     rows.append([InlineKeyboardButton(text=features.L(lang, "btn_news"), callback_data="feat:news")])
@@ -2440,7 +2397,7 @@ async def cmd_add_ad(message: Message, command: CommandObject):
     if not time_part or not text or ":" not in time_part:
         await message.answer(
             "Использование: /addad ЧЧ:ММ Текст поста\n\n"
-            "Например: /addad 18:00 Попробуй бота — уведомления по твоей должности, 3 дня бесплатно!\n\n"
+            "Например: /addad 18:00 Попробуй бота — уведомления по твоей должности, 30 дней бесплатно!\n\n"
             "Постится в канал каждый день в это время."
         )
         return
@@ -3244,7 +3201,7 @@ async def main():
     email_apply.init_tables()
     email_apply.setup(ADMIN_IDS, claude, RANK_TAGS, TAG_LABELS)
     features.init_tables()
-    features.setup(ADMIN_IDS, claude)
+    features.setup(ADMIN_IDS, claude, CHANNEL_ID)
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     # защита: журнал важных команд админов и антифлуд для всех остальных
@@ -3268,9 +3225,9 @@ async def main():
     # старте, чтобы не зависеть от ручной настройки через BotFather
     try:
         await bot.set_my_description(
-            "🚢 Этот бот присылает вам офшорные вакансии по должности, "
-            "которую вы выберете при подписке. Бесплатно 3 дня, дальше — "
-            "платная подписка. Нажмите Start, чтобы начать."
+            "🚢 Этот бот присылает офшорные вакансии по вашей должности, плюс "
+            "проверка контракта, напоминания по документам и новости офшора. "
+            "30 дней бесплатно, дальше €1/месяц. Нажмите Start."
         )
         await bot.set_my_short_description(
             "Офшорные вакансии по вашей должности — прямо в личные сообщения"

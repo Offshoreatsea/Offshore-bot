@@ -37,6 +37,7 @@ router = Router()
 
 _admin_ids: list[int] = []
 _claude = None
+_channel_id = None   # куда админ публикует выбранную новость
 
 CONTRACT_MODEL = os.getenv("CONTRACT_MODEL", "claude-haiku-4-5-20251001")
 NEWS_MODEL = os.getenv("NEWS_MODEL", "claude-haiku-4-5-20251001")
@@ -55,10 +56,11 @@ NEWS_FEEDS = [u.strip() for u in os.getenv(
 ).split(",") if u.strip()]
 
 
-def setup(admin_ids, claude):
-    global _admin_ids, _claude
+def setup(admin_ids, claude, channel_id=None):
+    global _admin_ids, _claude, _channel_id
     _admin_ids = list(admin_ids)
     _claude = claude
+    _channel_id = channel_id
 
 
 # ---------------------------------------------------------------- локализация (en/ru/uk)
@@ -626,12 +628,16 @@ async def _show_news(target, tg_id, lang, edit):
         body = L(lang, "news_empty")
     else:
         body = _render_news(rows, lang)
-    toggle = L(lang, "news_toggle_off") if daily_on else L(lang, "news_toggle_on")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=(L(lang, "news_on") if daily_on else L(lang, "news_off")),
-                              callback_data="news:toggle")],
-        [InlineKeyboardButton(text="⬅️", callback_data="feat:home")],
-    ])
+    kb_rows = [[InlineKeyboardButton(text=(L(lang, "news_on") if daily_on else L(lang, "news_off")),
+                                     callback_data="news:toggle")]]
+    # админам — по кнопке на каждую новость: опубликовать её в канал подробным
+    # текстом без ссылок
+    if _is_admin(tg_id) and rows:
+        for i, r in enumerate(rows, 1):
+            kb_rows.append([InlineKeyboardButton(text=f"📢 Опубликовать #{i} в канал",
+                                                 callback_data=f"news:pub:{r['id']}")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️", callback_data="feat:home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     head = "📰 <b>Offshore</b>\n\n" if lang == "en" else "📰 <b>Офшор</b>\n\n"
     text = head + body
     if edit:
@@ -641,6 +647,87 @@ async def _show_news(target, tg_id, lang, edit):
         except Exception:
             pass
     await target.answer(text, reply_markup=kb, disable_web_page_preview=True)
+
+
+NEWS_PUBLISH_PROMPT = """You are the editor of an offshore/maritime jobs & industry Telegram channel.
+Turn the news item below into a ready-to-publish channel post IN RUSSIAN. Make it a detailed, standalone
+post (4–8 sentences): what happened, who is involved (companies, field/vessel/shipyard), where, key figures
+and what it means for the offshore industry and crews. Professional tone, a couple of fitting emojis, 2–4
+hashtags at the end. IMPORTANT: do NOT include any links or URLs. Do not invent facts beyond the item.
+
+Title: {title}
+Summary: {summary}
+Source: {source}
+"""
+
+
+def _expand_news_sync(row) -> str | None:
+    if not _claude:
+        return None
+    try:
+        resp = _claude.messages.create(
+            model=NEWS_MODEL, max_tokens=900,
+            messages=[{"role": "user", "content": NEWS_PUBLISH_PROMPT.format(
+                title=row["title"], summary=row["summary"] or "", source=row["source"] or "")}],
+        )
+        txt = resp.content[0].text.strip()
+        txt = re.sub(r"https?://\S+", "", txt)  # подстраховка: вырезаем любые ссылки
+        return txt or None
+    except Exception as e:
+        print(f"[features] разворот новости не удался: {type(e).__name__}: {e}")
+        return None
+
+
+@router.callback_query(F.data.startswith("news:pub:"))
+async def cb_news_publish(callback: CallbackQuery, state: FSMContext):
+    if not _is_admin(callback.from_user.id):
+        return await callback.answer()
+    if not _channel_id:
+        return await callback.answer("Канал не настроен (CHANNEL_ID).", show_alert=True)
+    news_id = int(callback.data.split(":")[2])
+    row = _q("SELECT * FROM news_items WHERE id = ?", (news_id,), one=True)
+    if not row:
+        return await callback.answer("Новость не найдена.", show_alert=True)
+    await callback.answer("Готовлю пост…")
+    post = await asyncio.to_thread(_expand_news_sync, row)
+    if not post:
+        post = f"📰 <b>{html.escape(row['title'])}</b>\n\n{html.escape(row['summary'] or '')}"
+    # предпросмотр админу с кнопкой подтверждения
+    _pending_news_posts[callback.from_user.id] = post
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Опубликовать в канал", callback_data="news:pubok"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="news:pubcancel"),
+    ]])
+    await callback.message.answer(f"Предпросмотр поста в канал:\n\n{post}", reply_markup=kb,
+                                  disable_web_page_preview=True)
+
+
+_pending_news_posts: dict[int, str] = {}
+
+
+@router.callback_query(F.data == "news:pubcancel")
+async def cb_news_pub_cancel(callback: CallbackQuery):
+    _pending_news_posts.pop(callback.from_user.id, None)
+    try:
+        await callback.message.edit_text("Публикация отменена.")
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == "news:pubok")
+async def cb_news_pub_ok(callback: CallbackQuery):
+    if not _is_admin(callback.from_user.id):
+        return await callback.answer()
+    post = _pending_news_posts.pop(callback.from_user.id, None)
+    if not post:
+        return await callback.answer("Текст не найден, выберите новость заново.", show_alert=True)
+    try:
+        await callback.bot.send_message(_channel_id, post, disable_web_page_preview=True)
+        await callback.message.edit_text("✅ Опубликовано в канал.")
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Не удалось опубликовать: {html.escape(str(e))}")
+    await callback.answer()
 
 
 @router.callback_query(F.data == "news:toggle")

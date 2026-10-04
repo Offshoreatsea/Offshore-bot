@@ -26,6 +26,28 @@ if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
 STATIC_DIR = Path(__file__).parent / "static"
+INIT_DATA_MAX_AGE = int(os.getenv("INIT_DATA_MAX_AGE", str(24 * 3600)))
+API_RATE_PER_MIN = int(os.getenv("API_RATE_PER_MIN", "60"))  # запросов к /api в минуту с одного IP
+_api_hits: dict[str, list[float]] = {}
+
+
+@web.middleware
+async def api_rate_limit(request, handler):
+    """Не даёт выкачивать API мини-приложения скриптом и заваливать бота запросами."""
+    if request.path.startswith("/api/"):
+        ip = request.headers.get("X-Forwarded-For", request.remote or "?").split(",")[0].strip()
+        now = time.monotonic()
+        hits = [t for t in _api_hits.get(ip, []) if now - t < 60]
+        if len(hits) >= API_RATE_PER_MIN:
+            return web.json_response({"error": "rate_limited"}, status=429)
+        hits.append(now)
+        _api_hits[ip] = hits
+        if len(_api_hits) > 50000:
+            _api_hits.clear()
+    response = await handler(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
 
 
 def validate_init_data(init_data: str, bot_token: str) -> dict | None:
@@ -39,6 +61,13 @@ def validate_init_data(init_data: str, bot_token: str) -> dict | None:
         return None
     received_hash = parsed.pop("hash", None)
     if not received_hash:
+        return None
+    # подпись старше суток не принимаем — иначе однажды перехваченный initData
+    # можно было бы использовать бесконечно
+    try:
+        if time.time() - int(parsed.get("auth_date", "0")) > INIT_DATA_MAX_AGE:
+            return None
+    except ValueError:
         return None
     data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
     secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
@@ -88,7 +117,7 @@ async def handle_vacancies(request: web.Request) -> web.Response:
 def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_payment=None,
                on_stripe_renewal=None, on_stripe_upcoming=None,
                on_stripe_unmatched_payment=None) -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[api_rate_limit], client_max_size=256 * 1024)
     _last_apply: dict[int, float] = {}
 
     def get_authenticated_tg_id(init_data: str) -> int | None:

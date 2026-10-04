@@ -602,6 +602,25 @@ def revoke_subscription(tg_id: int):
     conn.close()
 
 
+def log_admin_action(admin_id: int, action: str):
+    conn = get_conn()
+    conn.execute("""CREATE TABLE IF NOT EXISTS admin_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, action TEXT, created_at TEXT)""")
+    conn.execute("INSERT INTO admin_log (admin_id, action, created_at) VALUES (?, ?, ?)",
+                 (admin_id, action, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def get_admin_log(limit: int = 30):
+    conn = get_conn()
+    conn.execute("""CREATE TABLE IF NOT EXISTS admin_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, action TEXT, created_at TEXT)""")
+    rows = conn.execute("SELECT * FROM admin_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return rows
+
+
 def payment_exists(charge_id: str) -> bool:
     conn = get_conn()
     row = conn.execute("SELECT 1 FROM payments WHERE charge_id = ? LIMIT 1", (charge_id,)).fetchone()
