@@ -693,9 +693,20 @@ def _friendly_smtp_error(e: Exception) -> str:
     return f"{type(e).__name__}: {text[:300]}"
 
 
+def _clean_header(value: str) -> str:
+    """Убирает переносы строк и управляющие символы из значения заголовка.
+    Почтовая библиотека запрещает \\r и \\n в заголовках (защита от подмены),
+    а они иногда попадают в тему или адрес из шаблона/вакансии — тогда письмо
+    падало с 'Header values may not contain linefeed...'. Чистим и схлопываем пробелы."""
+    return re.sub(r"\s+", " ", (value or "").replace("\r", " ").replace("\n", " ")).strip()
+
+
 async def build_message(bot: Bot, client, to_email: str, subject: str, body: str) -> EmailMessage:
     msg = EmailMessage()
-    msg["From"] = formataddr((client["full_name"], client["email"]))
+    full_name = _clean_header(client["full_name"])
+    to_email = _clean_header(to_email)
+    subject = _clean_header(subject) or "Job application"
+    msg["From"] = formataddr((full_name, client["email"].strip()))
     msg["To"] = to_email
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
