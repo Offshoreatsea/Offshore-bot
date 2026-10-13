@@ -32,7 +32,7 @@ import socket
 import ssl
 from datetime import datetime, timedelta
 from email.message import EmailMessage
-from email.utils import formataddr, formatdate, make_msgid
+from email.utils import formataddr, formatdate, make_msgid, parseaddr
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, StateFilter
@@ -330,6 +330,8 @@ def init_tables():
         ("mailbase_paused_until", "TEXT"),
         ("mailbase_pause_reason", "TEXT"),
         ("mailbase_last_report_date", "TEXT"),
+        # структурированный разбор CV (JSON): rank, years, vessels, certs, nationality, availability
+        ("cv_profile", "TEXT"),
     ):
         if col not in cols:
             conn.execute(f"ALTER TABLE mail_clients ADD COLUMN {col} {ddl}")
@@ -347,6 +349,17 @@ def init_tables():
         )
     """)
     conn.execute("CREATE TABLE IF NOT EXISTS mail_bounce_seen (msg_key TEXT PRIMARY KEY, seen_at TEXT)")
+    # живые ответы работодателей на отклики клиента — чтобы видеть, что работает
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mail_replies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id INTEGER,
+            from_email TEXT,
+            subject TEXT,
+            received_at TEXT,
+            msg_key TEXT UNIQUE
+        )
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mail_apps_client_email ON mail_applications (client_id, to_email)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mb_targets_client ON mail_base_targets (client_id, status)")
     # письмо, которое отправлялось в момент перезапуска бота, навсегда оставалось
@@ -482,6 +495,17 @@ def is_bounced(to_email: str) -> bool:
     """Адрес в блок-листе точечной рассылки (используется только в ней)."""
     return bool(_q("SELECT 1 FROM mail_bounces WHERE email = ? AND detected_at >= ?",
                    ((to_email or "").strip().lower(), MAILBASE_BOUNCES_SINCE), one=True))
+
+
+def sent_last_24h(client_id: int) -> int:
+    """Сколько писем ушло с ящика за последние 24 часа (скользящее окно, как считает
+    сам Gmail). Используется для общего потолка ящика, чтобы не упереться в лимит
+    провайдера на стыке суток."""
+    cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+    row = _q("""SELECT COUNT(*) AS n FROM mail_applications
+                WHERE client_id = ? AND status = 'sent' AND sent_at > ?""",
+             (client_id, cutoff), one=True)
+    return row["n"]
 
 
 def sent_today(client_id: int, include_mailbase: bool = False) -> int:
@@ -690,6 +714,14 @@ def _friendly_smtp_error(e: Exception) -> str:
         return ("почта не приняла логин/пароль. Для Gmail нужен именно пароль приложения "
                 "(16 символов), а у аккаунта должна быть включена двухэтапная проверка. "
                 f"Ответ сервера: {text[:200]}")
+    if isinstance(e, (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused)) or "5.1.1" in text \
+            or "user unknown" in text.lower() or "does not exist" in text.lower() \
+            or "recipient address rejected" in text.lower():
+        return "адрес получателя не существует или отклонён почтовым сервером"
+    if isinstance(e, ValueError) and ("linefeed" in text or "carriage return" in text):
+        return "в теме или адресе был лишний перенос строки — бот его убрал, попробуйте отправить ещё раз"
+    if isinstance(e, smtplib.SMTPServerDisconnected) or "connection" in text.lower() or "timed out" in text.lower():
+        return "почтовый сервер временно недоступен — бот попробует позже"
     return f"{type(e).__name__}: {text[:300]}"
 
 
@@ -715,11 +747,29 @@ async def build_message(bot: Bot, client, to_email: str, subject: str, body: str
     if client["cv_file_id"]:
         buf = io.BytesIO()
         await bot.download(client["cv_file_id"], destination=buf)
-        filename = client["cv_filename"] or "CV.pdf"
+        orig = client["cv_filename"] or "CV.pdf"
+        ext = os.path.splitext(orig)[1] or ".pdf"
+        filename = _cv_attach_name(client, ext)
         mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         maintype, subtype = mime.split("/", 1)
         msg.add_attachment(buf.getvalue(), maintype=maintype, subtype=subtype, filename=filename)
     return msg
+
+
+def _cv_attach_name(client, ext: str = ".pdf") -> str:
+    """Имя вложения вида Surname_Rank_CV.pdf — красиво для HR."""
+    prof = _cv_profile(client)
+    surname = (prof.get("surname") or "").strip()
+    if not surname:
+        # берём последнее слово из полного имени
+        surname = (client["full_name"] or "").strip().split()[-1:] or [""]
+        surname = surname[0]
+    rank = (prof.get("rank") or "").strip()
+    parts = [p for p in (surname, rank, "CV") if p]
+    name = "_".join(parts) or "CV"
+    name = re.sub(r"[^\w.\- ]+", "", name).strip().replace(" ", "_")
+    name = re.sub(r"_+", "_", name)
+    return (name or "CV") + ext
 
 
 # ---------------------------------------------------------------- тексты письма
@@ -736,8 +786,19 @@ def make_subject(fields: dict, client) -> str:
     position = (fields.get("position") or "").strip() or _tag_labels.get(fields.get("position_tag"), "")
     position = re.sub(r"\s+", " ", position)[:70]
     vessel = (fields.get("vessel") or "").strip()
+    prof = _cv_profile(client)
     parts = [f"Application for {position}" if position else "Job application"]
-    if vessel and len(vessel) <= 35:
+    # краткая «визитка» кандидата из разобранного CV
+    card = []
+    nat = (prof.get("nationality") or "").strip()
+    if nat and len(nat) <= 25:
+        card.append(nat)
+    avail = (prof.get("availability") or "").strip()
+    if avail and len(avail) <= 25:
+        card.append(f"available {avail}")
+    if card:
+        parts.append(", ".join(card))
+    elif vessel and len(vessel) <= 35:
         parts.append(vessel)
     parts.append(client["full_name"])
     return " – ".join(parts)
@@ -764,20 +825,35 @@ def _compose_letter_sync(fields: dict, client) -> str:
          "salary", "requirements", "documents", "notes")
         if fields.get(k)
     )
+    prof = _cv_profile(client)
+    profile_lines = "\n".join(
+        f"{label}: {prof.get(key)}" for key, label in (
+            ("rank", "Rank"), ("years_experience", "Years at sea"),
+            ("vessel_types", "Vessel types"), ("certificates", "Certificates"),
+            ("nationality", "Nationality"), ("availability", "Availability"),
+        ) if prof.get(key)
+    )
     prompt = f"""Write the body of a short job-application email from a seafarer to a crewing
 agency / employer. English only. 80-140 words. Professional, specific, no clichés.
 
 Rules:
 - Start with "Dear Sir/Madam," (or "Dear Hiring Team,").
 - Mention the exact position (and vessel if given) from the vacancy.
-- Use ONLY facts from the candidate summary below; never invent certificates,
-  years, vessels or companies. If the summary is empty, stay general.
+- Tailor the letter: match the candidate's rank, vessel-type experience and
+  relevant certificates to THIS vacancy's requirements. Lead with the single
+  strongest matching point.
+- Use ONLY facts from the candidate profile/summary below; never invent
+  certificates, years, vessels or companies. If both are empty, stay general.
+- If availability is given, state when the candidate is ready to join.
 - Say the CV is attached.
 - Do NOT add a subject line, signature, name, phone or placeholders like [Name].
 - Plain text, no markdown.
 
 VACANCY:
 {vacancy}
+
+CANDIDATE PROFILE:
+{profile_lines or '(none)'}
 
 CANDIDATE SUMMARY:
 {client['about'] or '(no summary)'}
@@ -857,34 +933,65 @@ async def compose(fields: dict, client) -> tuple[str, str]:
     return subject, letter + "\n\n" + signature(client)
 
 
-def _summarize_cv_sync(pdf_bytes: bytes) -> str | None:
+CV_PARSE_PROMPT = (
+    "This is a seafarer's CV. Extract the facts and reply with ONLY a JSON object "
+    "(no markdown, no commentary) with these keys:\n"
+    '  "summary": a 4-6 line English plain-text summary (facts only),\n'
+    '  "surname": family name (Latin, one word) or "",\n'
+    '  "rank": current/highest rank, short (e.g. "Chief Officer", "2nd Engineer", "Master/SDPO") or "",\n'
+    '  "years_experience": total years at sea as a number string (e.g. "8") or "",\n'
+    '  "vessel_types": short list as one string (e.g. "PSV, AHTS, DP2 OSV") or "",\n'
+    '  "certificates": key certs with validity if shown (e.g. "BOSIET valid 2027, DP unlimited, STCW") or "",\n'
+    '  "nationality": nationality or "",\n'
+    '  "availability": availability / ready-from date or "".\n'
+    "Use ONLY facts present in the CV; empty string if not stated. Never invent."
+)
+
+
+def _parse_cv_sync(pdf_bytes: bytes) -> dict | None:
+    """Разбирает CV в структуру (JSON). Возвращает dict с ключами summary/rank/... или None."""
     if not _claude:
         return None
     try:
         resp = _claude.messages.create(
-            model=COVER_MODEL, max_tokens=500,
+            model=COVER_MODEL, max_tokens=700,
             messages=[{"role": "user", "content": [
                 {"type": "document", "source": {
                     "type": "base64", "media_type": "application/pdf",
                     "data": base64.b64encode(pdf_bytes).decode()}},
-                {"type": "text", "text": (
-                    "This is a seafarer's CV. Summarize in English in max 6 short lines, facts only: "
-                    "rank, total sea experience, vessel types, key certificates (e.g. DP, BOSIET, "
-                    "STCW, CoC grade), nationality, availability. No invented facts.")},
+                {"type": "text", "text": CV_PARSE_PROMPT},
             ]}],
         )
-        return resp.content[0].text.strip()
+        txt = resp.content[0].text.strip()
+        txt = re.sub(r"^```(json)?|```$", "", txt, flags=re.MULTILINE).strip()
+        import json as _json
+        data = _json.loads(txt)
+        return data if isinstance(data, dict) else None
     except Exception as e:
-        print(f"[email_apply] не удалось прочитать CV через Claude: {e}")
+        print(f"[email_apply] не удалось разобрать CV через Claude: {e}")
         return None
 
 
-async def summarize_cv(bot: Bot, file_id: str, filename: str) -> str | None:
+async def parse_cv(bot: Bot, file_id: str, filename: str) -> dict | None:
     if not filename.lower().endswith(".pdf"):
         return None
     buf = io.BytesIO()
     await bot.download(file_id, destination=buf)
-    return await asyncio.to_thread(_summarize_cv_sync, buf.getvalue())
+    return await asyncio.to_thread(_parse_cv_sync, buf.getvalue())
+
+
+def _cv_profile(client) -> dict:
+    try:
+        raw = client["cv_profile"]
+    except (IndexError, KeyError):
+        raw = None
+    if not raw:
+        return {}
+    try:
+        import json as _json
+        return _json.loads(raw)
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------- черновики для админа
@@ -988,6 +1095,9 @@ async def send_app(bot: Bot, app_id: int) -> tuple[bool, str]:
     if blocked:
         set_app(app_id, status="failed", error="лимит Gmail")
         return False, blocked
+    if sent_last_24h(client["id"]) >= MAILBOX_DAILY_MAX:
+        set_app(app_id, status="failed", error="суточный лимит ящика")
+        return False, f"лимит ящика {MAILBOX_DAILY_MAX} писем за 24 ч исчерпан — отклик уйдёт позже"
     if sent_today(client["id"]) >= MAIL_DAILY_LIMIT:
         set_app(app_id, status="failed", error="дневной лимит")
         return False, f"дневной лимит {MAIL_DAILY_LIMIT} писем исчерпан"
@@ -1470,9 +1580,11 @@ async def ac_cv(message: Message, state: FSMContext):
     data["cv_filename"] = doc.file_name or "CV.pdf"
     client_id = add_client(data)
     status = await message.answer("Сохранил. Читаю CV для cover letter…")
-    about = await summarize_cv(message.bot, doc.file_id, data["cv_filename"])
-    if about:
-        update_client(client_id, about=about)
+    import json as _json
+    prof = await parse_cv(message.bot, doc.file_id, data["cv_filename"])
+    about = (prof or {}).get("summary") if prof else None
+    if prof:
+        update_client(client_id, about=about or "", cv_profile=_json.dumps(prof, ensure_ascii=False))
         tail = f"Краткая выжимка из CV (по ней пишется cover letter):\n<pre>{html.escape(about)}</pre>\n" \
                f"Поправить: <code>/clientabout {client_id} текст</code>"
     else:
@@ -1618,6 +1730,8 @@ async def cmd_mail_help(message: Message):
         "/mbcheck ID — состояние точечной рассылки: сколько ушло, что не дошло\n"
         "/mbstop ID — остановить точечную рассылку · /mbresume ID — возобновить\n"
         "/bounces — недоставленные адреса точечной рассылки (📭); /bounces ID — проверить ящик сейчас\n"
+        "/replies — ответы работодателей (📬); /replies ID — по конкретному клиенту\n"
+        "/mailcheck — проверить логин во все ящики клиентов прямо сейчас (🩺)\n"
         "/drafts ID — черновики клиента, ждущие отправки\n"
         "/sendall ID — отправить все черновики клиента\n"
         "/applyto VACANCY_ID [CLIENT_ID] — отклик на уже опубликованную вакансию\n"
@@ -1799,9 +1913,11 @@ async def on_client_cv(message: Message, state: FSMContext):
     doc = message.document
     filename = doc.file_name or "CV.pdf"
     update_client(data["client_id"], cv_file_id=doc.file_id, cv_filename=filename)
-    about = await summarize_cv(message.bot, doc.file_id, filename)
-    if about:
-        update_client(data["client_id"], about=about)
+    import json as _json
+    prof = await parse_cv(message.bot, doc.file_id, filename)
+    about = (prof or {}).get("summary") if prof else None
+    if prof:
+        update_client(data["client_id"], about=about or "", cv_profile=_json.dumps(prof, ensure_ascii=False))
     await message.answer("✅ CV обновлён" + (f"\n<pre>{html.escape(about)}</pre>" if about else ""),
                          reply_markup=back_kb(data["client_id"]))
 
@@ -2844,7 +2960,7 @@ async def _mailbase_send_one(bot: Bot, client) -> str:
     client_id = client["id"]
     if (client["mailbase_sent_today"] or 0) >= MAILBASE_DAILY_MAX:
         return "stop"
-    if sent_today(client_id, include_mailbase=True) >= MAILBOX_DAILY_MAX:
+    if sent_last_24h(client_id) >= MAILBOX_DAILY_MAX:
         return "stop"
     target = _pick_target(client_id)
     if not target:
@@ -3046,18 +3162,23 @@ def _bounce_recipients(msg, sent_to: set[str], own: str) -> tuple[set[str], str]
     return found, (reason or "письмо не доставлено (возврат от почтового сервера)")[:200]
 
 
-def _scan_bounces_sync(client) -> list[tuple[str, str]]:
+def _scan_bounces_sync(client) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     password = decrypt(client["enc_password"])
     if not password:
         return []
     sent_to = {r["e"] for r in _q("SELECT DISTINCT lower(email) e FROM mail_base_targets WHERE client_id = ? "
                                   "AND status IN ('sent', 'bounced')", (client["id"],))}
-    if not sent_to:
-        return []
+    # все адреса, которым клиент писал (база + отклики по вакансиям) — для поиска живых ответов
+    replied_from = set(sent_to) | {
+        r["e"] for r in _q("SELECT DISTINCT lower(to_email) e FROM mail_applications "
+                           "WHERE client_id = ? AND status = 'sent'", (client["id"],))}
+    if not sent_to and not replied_from:
+        return [], []
     since = max(datetime.now() - timedelta(days=BOUNCE_LOOKBACK_DAYS),
                 datetime.fromisoformat(MAILBASE_BOUNCES_SINCE))
     since_str = f"{since.day:02d}-{_MONTHS[since.month - 1]}-{since.year}"
     out: list[tuple[str, str]] = []
+    replies: list[tuple[str, str]] = []  # (from_email, subject)
     imap = imaplib.IMAP4_SSL(_imap_host(client), 993, timeout=40)
     try:
         imap.login(client["email"], password)
@@ -3087,8 +3208,22 @@ def _scan_bounces_sync(client) -> list[tuple[str, str]]:
                     continue
                 h = _email_lib.message_from_bytes(hdr[0][1])
                 frm = str(h.get("From", "")).lower()
-                subj = str(_email_header.make_header(_email_header.decode_header(h.get("Subject", "")))).lower()
-                if not (any(k in frm for k in _BOUNCE_FROM) or any(k in subj for k in _BOUNCE_SUBJ)):
+                subj_raw = str(_email_header.make_header(_email_header.decode_header(h.get("Subject", ""))))
+                subj = subj_raw.lower()
+                is_bounce = any(k in frm for k in _BOUNCE_FROM) or any(k in subj for k in _BOUNCE_SUBJ)
+                if not is_bounce:
+                    # живой ответ от работодателя, которому клиент писал?
+                    if folder == "INBOX" and replied_from:
+                        from_addr = parseaddr(frm)[1].lower()
+                        if from_addr and from_addr in replied_from:
+                            rkey = f"{client['id']}:reply:{h.get('Message-ID') or (folder + ':' + num.decode())}"
+                            if not _q("SELECT 1 FROM mail_replies WHERE msg_key = ?", (rkey,), one=True):
+                                _q("INSERT OR IGNORE INTO mail_replies "
+                                   "(client_id, from_email, subject, received_at, msg_key) "
+                                   "VALUES (?, ?, ?, ?, ?)",
+                                   (client["id"], from_addr, subj_raw[:200],
+                                    datetime.now().isoformat(), rkey), commit=True)
+                                replies.append((from_addr, subj_raw[:120]))
                     continue
                 key = f"{client['id']}:{h.get('Message-ID') or (folder + ':' + num.decode())}"
                 if _q("SELECT 1 FROM mail_bounce_seen WHERE msg_key = ?", (key,), one=True):
@@ -3105,19 +3240,20 @@ def _scan_bounces_sync(client) -> list[tuple[str, str]]:
             imap.logout()
         except Exception:
             pass
-    return out
+    return out, replies
 
 
 async def check_bounces_once(bot: Bot, only_client_id: int | None = None) -> int:
     clients = [get_client(only_client_id)] if only_client_id else _q(
-        "SELECT * FROM mail_clients WHERE id IN (SELECT DISTINCT client_id FROM mail_base_targets "
-        "WHERE status IN ('sent', 'bounced'))")
+        "SELECT * FROM mail_clients WHERE id IN ("
+        "  SELECT DISTINCT client_id FROM mail_base_targets WHERE status IN ('sent', 'bounced') "
+        "  UNION SELECT DISTINCT client_id FROM mail_applications WHERE status = 'sent')")
     total = 0
     for client in clients:
         if not client:
             continue
         try:
-            found = await asyncio.to_thread(_scan_bounces_sync, client)
+            found, replies = await asyncio.to_thread(_scan_bounces_sync, client)
         except Exception as e:
             print(f"[bounce_worker] {client['email']}: {type(e).__name__}: {e}")
             continue
@@ -3134,6 +3270,12 @@ async def check_bounces_once(bot: Bot, only_client_id: int | None = None) -> int
                                       f"{len(new)} адрес(ов) из точечной рассылки. В точечных рассылках на них больше не шлём "
                                       f"(отклики на вакансии это не затрагивает).\n\n"
                                       f"{sample}{more}")
+        if replies:
+            rsample = "\n".join(f"• {html.escape(a)} — {html.escape(s)}" for a, s in replies[:15])
+            rmore = f"\n…и ещё {len(replies) - 15}" if len(replies) > 15 else ""
+            await _notify_admins(bot, f"📬 <b>Ответ работодателя</b> — {html.escape(client['full_name'])}: "
+                                      f"{len(replies)} нов. ответ(ов) на письма клиента.\n\n{rsample}{rmore}\n\n"
+                                      f"Все ответы: /replies {client['id']}")
     return total
 
 
@@ -3147,6 +3289,90 @@ async def bounce_worker(bot: Bot):
         except Exception as e:
             print(f"[bounce_worker] ошибка: {e}")
         await asyncio.sleep(BOUNCE_CHECK_MINUTES * 60)
+
+
+# ---------------------------------------------------------------- здоровье ящиков
+
+def _mailbox_health_sync(client) -> tuple[bool, str]:
+    """Проверяет, что с ящиком клиента всё в порядке (SMTP-логин проходит).
+    Возвращает (ok, человекочитаемая причина)."""
+    password = decrypt(client["enc_password"])
+    if not password:
+        return False, "пароль не расшифровывается — задайте заново через /clientpass"
+    try:
+        _smtp_check(client["smtp_host"], client["smtp_port"], client["email"], password)
+    except Exception as e:
+        return False, _friendly_smtp_error(e)
+    return True, "ок"
+
+
+def client_status_line(client) -> str:
+    """Короткая строка о клиенте для /health — лимит за 24 ч, пауза, 📭/📬 счётчики."""
+    cid = client["id"]
+    name = client["full_name"]
+    sent24 = sent_last_24h(cid)
+    paused = gmail_blocked(client)
+    bounces = _q("SELECT COUNT(*) c FROM mail_bounces WHERE client_id = ?", (cid,), one=True)["c"]
+    replies = _q("SELECT COUNT(*) c FROM mail_replies WHERE client_id = ?", (cid,), one=True)["c"]
+    mb = _q("SELECT COUNT(*) c FROM mail_base_targets WHERE client_id = ? AND status = 'pending'",
+            (cid,), one=True)["c"]
+    flag = "⏸" if paused else "✅"
+    parts = [f"{flag} <b>{html.escape(name)}</b> (id {cid})",
+             f"за 24ч: {sent24}/{MAILBOX_DAILY_MAX}"]
+    if mb:
+        parts.append(f"в очереди базы: {mb}")
+    if bounces:
+        parts.append(f"📭 {bounces}")
+    if replies:
+        parts.append(f"📬 {replies}")
+    line = " · ".join(parts)
+    if paused:
+        line += f"\n   ⏸ {html.escape(paused)}"
+    return line
+
+
+async def mailbox_health_once(bot: Bot, notify_ok: bool = False) -> list[str]:
+    """Проверяет все ящики, при проблемах сообщает админам. Возвращает список строк отчёта."""
+    report = []
+    broken = []
+    for client in list_clients():
+        ok, detail = await asyncio.to_thread(_mailbox_health_sync, client)
+        mark = "✅" if ok else "❌"
+        report.append(f"{mark} {html.escape(client['full_name'])} (id {client['id']})"
+                      + ("" if ok else f" — {html.escape(detail)}"))
+        if not ok:
+            broken.append((client, detail))
+    if broken:
+        lines = "\n".join(f"• <b>{html.escape(c['full_name'])}</b> (id {c['id']}): {html.escape(d)}"
+                          for c, d in broken)
+        await _notify_admins(bot, f"🩺 <b>Проверка почт клиентов</b>\n\n"
+                                  f"С этими ящиками проблема — письма с них не уйдут, пока не починить:\n\n{lines}")
+    elif notify_ok:
+        await _notify_admins(bot, "🩺 Проверка почт: все ящики клиентов в порядке ✅")
+    return report
+
+
+async def mailbox_health_worker(bot: Bot):
+    """Раз в сутки проверяет логин во все ящики клиентов и предупреждает админов о сломанных."""
+    await asyncio.sleep(300)
+    while True:
+        try:
+            await mailbox_health_once(bot)
+        except Exception as e:
+            print(f"[mailbox_health_worker] ошибка: {e}")
+        await asyncio.sleep(24 * 3600)
+
+
+@router.message(Command("mailcheck"))
+async def cmd_mailcheck(message: Message):
+    """/mailcheck — проверить логин во все ящики клиентов прямо сейчас."""
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("🩺 Проверяю почты клиентов…")
+    report = await mailbox_health_once(message.bot, notify_ok=False)
+    if not report:
+        return await message.answer("Клиентов пока нет.")
+    await message.answer("🩺 <b>Состояние ящиков</b>\n\n" + "\n".join(report))
 
 
 @router.message(Command("bounces"))
@@ -3173,6 +3399,33 @@ async def cmd_bounces(message: Message, command: CommandObject):
               f"({(r['detected_at'] or '')[5:16].replace('T', ' ')}, {html.escape(r['full_name'] or '?')})"
               for r in rows]
     lines.append("\nПроверить ящик клиента сейчас: /bounces ID")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("replies"))
+async def cmd_replies(message: Message, command: CommandObject):
+    """/replies — последние ответы работодателей; /replies ID — ответы по конкретному клиенту."""
+    if not is_admin(message.from_user.id):
+        return
+    arg = (command.args or "").strip()
+    if arg.isdigit():
+        rows = _q("SELECT r.from_email, r.subject, r.received_at, c.full_name "
+                  "FROM mail_replies r LEFT JOIN mail_clients c ON c.id = r.client_id "
+                  "WHERE r.client_id = ? ORDER BY r.received_at DESC LIMIT 30", (int(arg),))
+    else:
+        rows = _q("SELECT r.from_email, r.subject, r.received_at, c.full_name "
+                  "FROM mail_replies r LEFT JOIN mail_clients c ON c.id = r.client_id "
+                  "ORDER BY r.received_at DESC LIMIT 30")
+    total = _q("SELECT COUNT(*) c FROM mail_replies", one=True)["c"]
+    if not rows:
+        return await message.answer("📬 Ответов работодателей пока не зафиксировано.\n"
+                                    "Бот проверяет ящики клиентов и отмечает входящие письма от адресов, "
+                                    "которым клиент писал (отклики и рассылка).")
+    lines = [f"📬 <b>Ответы работодателей</b> — всего {total}\n"]
+    lines += [f"• {html.escape(r['from_email'])} — {html.escape((r['subject'] or '')[:70])} "
+              f"({(r['received_at'] or '')[5:16].replace('T', ' ')}, {html.escape(r['full_name'] or '?')})"
+              for r in rows]
+    lines.append("\nПо конкретному клиенту: /replies ID")
     await message.answer("\n".join(lines))
 
 

@@ -3122,6 +3122,16 @@ async def cmd_health(message: Message):
     if paused:
         lines.append("⛔️ Ящики на паузе (лимит почты): " + ", ".join(
             f"{html.escape(p['full_name'])} до {p['gmail_blocked_until'][11:16]}" for p in paused))
+    # по каждому клиенту: лимит за 24 ч, очередь базы, 📭 возвраты, 📬 ответы
+    try:
+        clients = email_apply.list_clients()
+        if clients:
+            lines.append("\n👤 <b>Клиенты</b> (за 24ч / очередь / 📭 / 📬):")
+            for c in clients:
+                lines.append(email_apply.client_status_line(c))
+            lines.append("\nПочты проверить сейчас: /mailcheck · ответы: /replies")
+    except Exception as e:
+        print(f"[cmd_health] client lines: {e}")
     await message.answer("\n".join(lines))
 
 
@@ -3216,6 +3226,7 @@ async def main():
     asyncio.create_task(scheduled_ads_worker(bot))
     asyncio.create_task(email_apply.mail_base_worker(bot))
     asyncio.create_task(email_apply.bounce_worker(bot))  # ловит письма «не доставлено» и исключает такие адреса
+    asyncio.create_task(email_apply.mailbox_health_worker(bot))  # раз в сутки проверяет логин во все ящики клиентов
     asyncio.create_task(backup_worker(bot))
     asyncio.create_task(features.docs_reminder_worker(bot))   # напоминания об окончании документов
     asyncio.create_task(features.news_worker(bot))            # сбор новостей офшора
