@@ -922,13 +922,14 @@ def remove_scheduled_ad(ad_id: int) -> bool:
 
 
 def get_due_scheduled_ads(now_hhmm: str, today: str):
-    """Реклама, чьё время совпадает с текущим (час:минута) и которая ещё не
-    отправлялась СЕГОДНЯ (last_sent_date != today) — чтобы не слать один и
-    тот же пост повторно в течение той же минуты/при частых проверках."""
+    """Реклама, чьё время УЖЕ наступило сегодня (time_hhmm <= сейчас) и которая ещё
+    не отправлялась СЕГОДНЯ. Берём <=, а не строгое равенство: воркер проверяет раз в
+    минуту, и из-за дрейфа на >60 сек нужная минута иногда пропускается — тогда пост
+    уходит на следующем тике (всё равно один раз в день, защита по last_sent_date)."""
     conn = get_conn()
     rows = conn.execute(
         """SELECT * FROM scheduled_ads
-           WHERE time_hhmm = ? AND (last_sent_date IS NULL OR last_sent_date != ?)""",
+           WHERE time_hhmm <= ? AND (last_sent_date IS NULL OR last_sent_date != ?)""",
         (now_hhmm, today),
     ).fetchall()
     conn.close()
@@ -1213,10 +1214,14 @@ LEGACY_TAG_MIGRATION = {
     "FourthEngineer": "JuniorEngineer",
     "EngineCadet": "EngineCadet",
     "ETO": "ETO",
-    "Electrician": "ETO",
+    # ВАЖНО: "Electrician" и "OS" — ДЕЙСТВУЮЩИЕ теги в новой таксономии
+    # (их можно выбрать в боте). Поэтому НЕ переносим их в ETO/AB, иначе при
+    # каждом рестарте бота у выбравших их людей подписка молча переписывалась
+    # бы на чужую должность. Оставляем как есть (само-маппинг → пропускается).
+    "Electrician": "Electrician",
     "Bosun": "Bosun",
     "AB": "AB",
-    "OS": "AB",
+    "OS": "OS",
     "Motorman": "Motorman",
     "Oiler": "Oiler",
     "Fitter": "FitterWelder",

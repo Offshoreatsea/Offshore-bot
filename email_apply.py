@@ -49,6 +49,11 @@ router = Router()
 
 MAIL_DAILY_LIMIT = int(os.getenv("MAIL_DAILY_LIMIT", "500"))          # писем в день с одного клиента
 MAIL_SEND_INTERVAL = int(os.getenv("MAIL_SEND_INTERVAL", "120"))     # сек. между письмами по умолчанию; у клиента можно 1-4 мин
+# тихие часы: ночью авто-отклики не уходят, а откладываются до утра (лучше открываемость,
+# меньше шанс попасть в спам). Точечная рассылка и так идёт только в своём окне.
+MAIL_QUIET_START = os.getenv("MAIL_QUIET_START", "21:00")            # начало тишины (местное время, MAIL_BASE_TZ_OFFSET)
+MAIL_QUIET_END = os.getenv("MAIL_QUIET_END", "08:00")               # конец тишины утром
+MAIL_QUIET_WEEKENDS = os.getenv("MAIL_QUIET_WEEKENDS", "0") == "1"   # 1 — не слать авто-отклики и в выходные
 SEND_INTERVAL_CHOICES = [1, 2, 3, 4]                                 # минуты — кнопки в карточке клиента
 MAIL_VARY_LETTER = os.getenv("MAIL_VARY_LETTER", "on") == "on"       # слегка перефразировать cover letter каждый раз
 MAIL_BACKFILL_DAYS = int(os.getenv("MAIL_BACKFILL_DAYS", "4"))        # за сколько дней откликаться при заведении клиента
@@ -376,6 +381,21 @@ def _mailbase_now():
     """Локальное время кампании — сервер обычно в UTC, MAIL_BASE_TZ_OFFSET сдвигает
     на нужный часовой пояс, чтобы выбранное окно времени было настоящим утром/вечером."""
     return datetime.utcnow() + timedelta(hours=MAIL_BASE_TZ_OFFSET)
+
+
+def _in_quiet_hours(now=None) -> bool:
+    """Сейчас «тихие часы» (ночь)? Авто-отклики в это время откладываются до утра.
+    Окно может переходить через полночь (например 21:00–08:00)."""
+    now = now or _mailbase_now()
+    if MAIL_QUIET_WEEKENDS and now.weekday() >= 5:
+        return True
+    hm = now.strftime("%H:%M")
+    start, end = MAIL_QUIET_START, MAIL_QUIET_END
+    if start == end:
+        return False
+    if start < end:
+        return start <= hm < end            # окно внутри одних суток
+    return hm >= start or hm < end          # окно через полночь (ночь)
 
 
 def _q(sql, params=(), one=False, commit=False):
@@ -1030,7 +1050,7 @@ async def propose_for_vacancy(bot: Bot, vacancy_id: int, only_client_id: int | N
     """Создаёт черновики писем для всех подходящих клиентов. Возвращает их число."""
     row = db.get_vacancy(vacancy_id)
     if not row:
-        return 0
+        return []
     fields = dict(row)
     m = EMAIL_RE.search(fields.get("contact") or "")
     if not m:
@@ -1060,6 +1080,17 @@ async def propose_for_vacancy(bot: Bot, vacancy_id: int, only_client_id: int | N
 
 
 async def _auto_send_and_notify(bot: Bot, app_id: int, quiet: bool = False):
+    # тихие часы: ночью не шлём, оставляем черновик — дошлёт deferred_apply_worker утром
+    if _in_quiet_hours():
+        app = get_app(app_id)
+        if app and app["status"] == "draft":
+            set_app(app_id, error="отложено на тихие часы (уйдёт утром)")
+        if not quiet:
+            client = get_client(app["client_id"]) if app else None
+            if client:
+                await _notify_admins(bot, draft_text(app, client)
+                                     + f"\n\n🌙 Тихие часы — письмо уйдёт утром (после {MAIL_QUIET_END}).")
+        return
     ok, err = await send_app(bot, app_id)
     app = get_app(app_id)
     client = get_client(app["client_id"]) if app else None
@@ -1095,9 +1126,11 @@ async def send_app(bot: Bot, app_id: int) -> tuple[bool, str]:
     if blocked:
         set_app(app_id, status="failed", error="лимит Gmail")
         return False, blocked
-    if sent_last_24h(client["id"]) >= MAILBOX_DAILY_MAX:
+    cap = mailbox_cap(client)
+    if sent_last_24h(client["id"]) >= cap:
         set_app(app_id, status="failed", error="суточный лимит ящика")
-        return False, f"лимит ящика {MAILBOX_DAILY_MAX} писем за 24 ч исчерпан — отклик уйдёт позже"
+        warm = " (ящик на прогреве)" if in_warmup(client) else ""
+        return False, f"лимит ящика {cap} писем за 24 ч исчерпан{warm} — отклик уйдёт позже"
     if sent_today(client["id"]) >= MAIL_DAILY_LIMIT:
         set_app(app_id, status="failed", error="дневной лимит")
         return False, f"дневной лимит {MAIL_DAILY_LIMIT} писем исчерпан"
@@ -2597,7 +2630,13 @@ async def mb_time_custom(message: Message, state: FSMContext):
     m = re.fullmatch(r"(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})", message.text.strip())
     if not m:
         return await message.answer("Формат: <code>09:00-18:00</code> (24-часовой). Пришлите ещё раз, или /cancel.")
-    start, end = m.group(1), m.group(2)
+    try:
+        # приводим к виду HH:MM с ведущим нулём — иначе «9:00» лексически больше «18:00»
+        # и окно рассылки никогда не совпадает с текущим временем (кампания молча стоит)
+        start = datetime.strptime(m.group(1), "%H:%M").strftime("%H:%M")
+        end = datetime.strptime(m.group(2), "%H:%M").strftime("%H:%M")
+    except ValueError:
+        return await message.answer("Неверное время. Пример: <code>09:00-18:00</code>. Пришлите ещё раз, или /cancel.")
     if start >= end:
         return await message.answer("Начало должно быть раньше конца. Пришлите ещё раз, или /cancel.")
     data = await state.get_data()
@@ -2812,6 +2851,45 @@ MAILBASE_MAX_ATTEMPTS = int(os.getenv("MAILBASE_MAX_ATTEMPTS", "3"))  # попы
 # закрывает обычный ящик примерно после 500 писем в сутки — держимся ниже
 MAILBASE_DAILY_MAX = int(os.getenv("MAILBASE_DAILY_MAX", "350"))
 MAILBOX_DAILY_MAX = int(os.getenv("MAILBOX_DAILY_MAX", "450"))
+# прогрев нового ящика: первые дни шлём мало, постепенно наращиваем до полного лимита —
+# так провайдер не принимает свежий ящик за спам-рассыльщик и не блокирует его
+MAILBOX_WARMUP_DAYS = int(os.getenv("MAILBOX_WARMUP_DAYS", "14"))   # за сколько дней выходим на полный лимит
+MAILBOX_WARMUP_START = int(os.getenv("MAILBOX_WARMUP_START", "25"))  # потолок ящика в первый день
+
+
+def _client_age_days(client):
+    try:
+        created = client["created_at"]
+    except (IndexError, KeyError):
+        created = None
+    if not created:
+        return None
+    try:
+        d = datetime.fromisoformat(created)
+    except Exception:
+        return None
+    return max(0, (datetime.now() - d).days)
+
+
+def warmup_cap(client) -> int:
+    """Потолок ящика с учётом прогрева: линейно от MAILBOX_WARMUP_START в первый день
+    до MAILBOX_DAILY_MAX через MAILBOX_WARMUP_DAYS дней."""
+    age = _client_age_days(client)
+    if age is None or MAILBOX_WARMUP_DAYS <= 0 or age >= MAILBOX_WARMUP_DAYS:
+        return MAILBOX_DAILY_MAX
+    frac = age / MAILBOX_WARMUP_DAYS
+    cap = MAILBOX_WARMUP_START + (MAILBOX_DAILY_MAX - MAILBOX_WARMUP_START) * frac
+    return max(1, min(MAILBOX_DAILY_MAX, int(round(cap))))
+
+
+def mailbox_cap(client) -> int:
+    """Эффективный суточный потолок ящика (прогрев учтён)."""
+    return min(MAILBOX_DAILY_MAX, warmup_cap(client))
+
+
+def in_warmup(client) -> bool:
+    age = _client_age_days(client)
+    return age is not None and MAILBOX_WARMUP_DAYS > 0 and age < MAILBOX_WARMUP_DAYS
 MAILBASE_PAUSE_MIN = int(os.getenv("MAILBASE_PAUSE_MIN", "60"))      # пауза кампании при сбоях ящика
 MAILBASE_FAIL_STREAK = int(os.getenv("MAILBASE_FAIL_STREAK", "5"))   # столько ошибок подряд → пауза
 # крупные почтовики — на них можно слать подряд; на корпоративный домен — не чаще 1 письма в N минут
@@ -2906,9 +2984,9 @@ def _window_seconds(client) -> float:
 
 
 def _mailbase_day_cap(client) -> int:
-    """Сколько писем кампании реально уйдёт за день с учётом окна, интервала и потолков."""
+    """Сколько писем кампании реально уйдёт за день с учётом окна, интервала и потолков (с прогревом)."""
     interval = client["mailbase_interval_sec"] or MAIL_SEND_INTERVAL
-    return max(1, min(int(_window_seconds(client) // interval), MAILBASE_DAILY_MAX))
+    return max(1, min(int(_window_seconds(client) // interval), MAILBASE_DAILY_MAX, mailbox_cap(client)))
 
 
 def _effective_interval(client) -> float:
@@ -2958,9 +3036,12 @@ async def _mailbase_send_one(bot: Bot, client) -> str:
     "skip"  — адрес пропущен (возврат/мусор/уже писали) — слот не потрачен, берём следующий;
     "stop"  — на этом тике для клиента больше не шлём (нет адресов / ящик встал на паузу / кончились потолки)."""
     client_id = client["id"]
-    if (client["mailbase_sent_today"] or 0) >= MAILBASE_DAILY_MAX:
+    # счётчик за день читаем из БД свежим — внутри одного тика может уйти несколько
+    # писем, и исходный client (sqlite3.Row) содержит значение на начало тика
+    sent_today_mb = (get_client(client_id)["mailbase_sent_today"] or 0)
+    if sent_today_mb >= min(MAILBASE_DAILY_MAX, mailbox_cap(client)):
         return "stop"
-    if sent_last_24h(client_id) >= MAILBOX_DAILY_MAX:
+    if sent_last_24h(client_id) >= mailbox_cap(client):
         return "stop"
     target = _pick_target(client_id)
     if not target:
@@ -2987,10 +3068,11 @@ async def _mailbase_send_one(bot: Bot, client) -> str:
         _mailbase_stall_warned.pop(client_id, None)
         _q("UPDATE mail_base_targets SET status = 'sent', sent_at = ?, last_error = NULL WHERE id = ?",
            (datetime.now().isoformat(), target["id"]), commit=True)
-        # перечитываем счётчик из БД — не затираем параллельные отклики на вакансии
+        # перечитываем счётчик из БД — не затираем параллельные отклики на вакансии.
+        # (НЕ присваиваем client["..."] — client это sqlite3.Row, он неизменяем;
+        #  следующий вызов _mailbase_send_one всё равно читает счётчик из БД свежим)
         cur = get_client(client_id)
         update_client(client_id, mailbase_sent_today=(cur["mailbase_sent_today"] or 0) + 1)
-        client["mailbase_sent_today"] = (cur["mailbase_sent_today"] or 0) + 1
         return "sent"
     kind = _send_error_kind(err)
     if kind == "mailbox":
@@ -3165,7 +3247,7 @@ def _bounce_recipients(msg, sent_to: set[str], own: str) -> tuple[set[str], str]
 def _scan_bounces_sync(client) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     password = decrypt(client["enc_password"])
     if not password:
-        return []
+        return [], []
     sent_to = {r["e"] for r in _q("SELECT DISTINCT lower(email) e FROM mail_base_targets WHERE client_id = ? "
                                   "AND status IN ('sent', 'bounced')", (client["id"],))}
     # все адреса, которым клиент писал (база + отклики по вакансиям) — для поиска живых ответов
@@ -3317,8 +3399,13 @@ def client_status_line(client) -> str:
     mb = _q("SELECT COUNT(*) c FROM mail_base_targets WHERE client_id = ? AND status = 'pending'",
             (cid,), one=True)["c"]
     flag = "⏸" if paused else "✅"
+    cap = mailbox_cap(client)
+    warm = ""
+    if in_warmup(client):
+        age = _client_age_days(client)
+        warm = f" 🌱прогрев {age}/{MAILBOX_WARMUP_DAYS}д"
     parts = [f"{flag} <b>{html.escape(name)}</b> (id {cid})",
-             f"за 24ч: {sent24}/{MAILBOX_DAILY_MAX}"]
+             f"за 24ч: {sent24}/{cap}{warm}"]
     if mb:
         parts.append(f"в очереди базы: {mb}")
     if bounces:
@@ -3361,6 +3448,45 @@ async def mailbox_health_worker(bot: Bot):
         except Exception as e:
             print(f"[mailbox_health_worker] ошибка: {e}")
         await asyncio.sleep(24 * 3600)
+
+
+# ---------------------------------------------------------------- отложенные авто-отклики
+
+DEFERRED_CHECK_MIN = int(os.getenv("DEFERRED_CHECK_MIN", "5"))   # как часто досылать отложенное
+DEFERRED_BATCH = int(os.getenv("DEFERRED_BATCH", "15"))          # сколько писем за цикл на клиента
+
+
+def _deferred_apps(client_id: int, limit: int):
+    """Авто-отклики клиента, которые ещё не ушли: отложены на ночь или не уместились
+    в дневной лимит. Админские черновики (ручной режим) сюда НЕ попадают."""
+    return _q(
+        """SELECT id FROM mail_applications
+           WHERE client_id = ? AND vacancy_id IS NOT NULL
+             AND (status = 'draft'
+                  OR (status = 'failed' AND (error LIKE '%лимит%' OR error LIKE '%отлож%'
+                                             OR error LIKE '%позже%' OR error LIKE '%пауз%')))
+           ORDER BY id LIMIT ?""",
+        (client_id, limit))
+
+
+async def deferred_apply_worker(bot: Bot):
+    """Досылает отложенные авто-отклики, когда закончились тихие часы и освободился лимит.
+    Работает только для клиентов в режиме авто-отправки — ручные черновики не трогает."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            if not _in_quiet_hours() and not sending_locked():
+                clients = _q("SELECT * FROM mail_clients WHERE active = 1 AND auto_send = 1")
+                for client in clients:
+                    if gmail_blocked(client) or sent_last_24h(client["id"]) >= mailbox_cap(client):
+                        continue
+                    for row in _deferred_apps(client["id"], DEFERRED_BATCH):
+                        ok, err = await send_app(bot, row["id"])
+                        if not ok and ("лимит" in err or "пауз" in err or "позже" in err):
+                            break  # потолок/пауза — остальным этого клиента тоже не уйти сейчас
+        except Exception as e:
+            print(f"[deferred_apply_worker] ошибка: {e}")
+        await asyncio.sleep(DEFERRED_CHECK_MIN * 60)
 
 
 @router.message(Command("mailcheck"))

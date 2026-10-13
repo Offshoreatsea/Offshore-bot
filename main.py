@@ -36,6 +36,7 @@ from dotenv import load_dotenv
 import db
 import email_apply
 import features
+import ingest
 import ranks
 import webapp
 
@@ -966,10 +967,26 @@ async def do_publish(bot: Bot, vacancy_id: int) -> bool:
                 # подпись к фото ограничена 1024 символами — короткая версия на
                 # баннере, полный текст с кнопками вторым сообщением следом
                 sent = await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=_caption_from(text))
-                await bot.send_message(
-                    chat_id=CHANNEL_ID, text=text,
-                    reply_markup=channel_keyboard(vacancy_id),
-                )
+                try:
+                    await bot.send_message(
+                        chat_id=CHANNEL_ID, text=text,
+                        reply_markup=channel_keyboard(vacancy_id),
+                    )
+                except Exception as e2:
+                    # баннер уже в канале — НЕ откатываем статус (иначе повторная
+                    # публикация продублирует фото). Помечаем опубликованной и
+                    # просим админа дослать полный текст вручную.
+                    print(f"[do_publish] фото ушло, но текст #{vacancy_id} не отправился: {type(e2).__name__}: {e2}")
+                    db.set_status(vacancy_id, "published", sent.message_id)
+                    await _ingest_notify(
+                        bot,
+                        f"⚠️ Вакансия #{vacancy_id}: баннер в канал ушёл, а полный текст — нет "
+                        f"({html.escape(str(e2))[:200]}). Фото НЕ дублируем. Текст для ручной публикации:\n\n{text}",
+                    )
+                    if not _banner_file_id and getattr(sent, "photo", None):
+                        _banner_file_id = sent.photo[-1].file_id
+                    asyncio.create_task(_after_publish(bot, vacancy_id, fields))
+                    return True
         except Exception as e:
             if sent is not None:
                 raise  # фото уже ушло — не дублируем пост текстом
@@ -2198,6 +2215,46 @@ async def process_vacancy_text(message: Message, raw: str):
     await status_msg.delete()
 
 
+async def ingest_vacancy(bot: Bot, raw: str, source: str = ""):
+    """Пайплайн для вакансии, пришедшей из канала-источника (ingest.py).
+    Тот же разбор + дедуп + публикация, что и для присланной админом вручную,
+    но карточка уходит админам с пометкой источника. Дубликаты — всегда на
+    ручное подтверждение; остальное — по текущему режиму (авто/модерация)."""
+    src = f" · источник: {html.escape(source)}" if source else ""
+    produced = 0
+    for fields in await asyncio.to_thread(ai_parse_batch, raw):
+        produced += 1
+        key = dedup_key_for(fields)
+        dup = db.find_recent_duplicate(key)
+        vacancy_id = db.insert_vacancy(fields, key, raw_text=raw)
+        text = render_template(fields)
+        if dup:
+            # та же вакансия уже была (в т.ч. из другого источника) — не постим повторно
+            warn = (f"⚠️ Дубликат: такое уже публиковалось {dup['created_at'][:10]} "
+                    f"(id {dup['id']}){src}.\n\n{text}")
+            await _ingest_notify(bot, warn, duplicate_keyboard(vacancy_id))
+            continue
+        if is_auto_publish():
+            try:
+                await do_publish(bot, vacancy_id)
+                await _ingest_notify(bot, f"🤖 Из канала{src}\n\n{text}\n\n✅ Опубликовано автоматически")
+            except Exception as e:
+                await _ingest_notify(bot, f"🤖 Из канала{src}\n\n❌ Не опубликовалось: {html.escape(str(e))}\n\n{text}",
+                                     draft_keyboard(vacancy_id))
+        else:
+            await _ingest_notify(bot, f"🤖 Из канала{src}\n\n{text}\n\n<i>Опубликовать?</i>",
+                                 draft_keyboard(vacancy_id))
+    return produced
+
+
+async def _ingest_notify(bot: Bot, text: str, markup=None):
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=markup)
+        except TelegramAPIError:
+            pass
+
+
 @router.message(Command("ad"))
 async def cmd_ad(message: Message):
     if not admin_only(message.from_user.id):
@@ -3193,7 +3250,9 @@ async def scheduled_ads_worker(bot: Bot):
             due = db.get_due_scheduled_ads(now_hhmm, today)
             for ad in due:
                 try:
-                    await bot.send_message(chat_id=CHANNEL_ID, text=ad["text"])
+                    # parse_mode=None — текст рекламы обычный, а не HTML; иначе символы
+                    # < & в тексте ломали бы отправку и пост не уходил бы вообще
+                    await bot.send_message(chat_id=CHANNEL_ID, text=ad["text"], parse_mode=None)
                     db.mark_scheduled_ad_sent(ad["id"], today)
                 except TelegramAPIError as e:
                     print(f"[scheduled_ads_worker] Не удалось опубликовать рекламу #{ad['id']}: {e}")
@@ -3227,10 +3286,14 @@ async def main():
     asyncio.create_task(email_apply.mail_base_worker(bot))
     asyncio.create_task(email_apply.bounce_worker(bot))  # ловит письма «не доставлено» и исключает такие адреса
     asyncio.create_task(email_apply.mailbox_health_worker(bot))  # раз в сутки проверяет логин во все ящики клиентов
+    asyncio.create_task(email_apply.deferred_apply_worker(bot))  # досылает отложенные ночью авто-отклики утром
     asyncio.create_task(backup_worker(bot))
     asyncio.create_task(features.docs_reminder_worker(bot))   # напоминания об окончании документов
     asyncio.create_task(features.news_worker(bot))            # сбор новостей офшора
     asyncio.create_task(features.news_digest_worker(bot))     # ежедневная сводка новостей тем, кто включил
+    if ingest.enabled():                                      # авто-парсинг вакансий из каналов-источников
+        asyncio.create_task(ingest.run_ingest(lambda raw, src: ingest_vacancy(bot, raw, src)))
+        print(f"[main] авто-парсинг каналов включён: {len(ingest.SOURCE_CHANNELS)} источник(ов)")
     # текст, видимый в ПУСТОМ чате до первого нажатия Start — ставится через
     # Bot API, не хранится нигде в БД, просто применяется заново при каждом
     # старте, чтобы не зависеть от ручной настройки через BotFather
