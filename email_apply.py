@@ -2852,9 +2852,11 @@ MAILBASE_MAX_ATTEMPTS = int(os.getenv("MAILBASE_MAX_ATTEMPTS", "3"))  # попы
 MAILBASE_DAILY_MAX = int(os.getenv("MAILBASE_DAILY_MAX", "350"))
 MAILBOX_DAILY_MAX = int(os.getenv("MAILBOX_DAILY_MAX", "450"))
 # прогрев нового ящика: первые дни шлём мало, постепенно наращиваем до полного лимита —
-# так провайдер не принимает свежий ящик за спам-рассыльщик и не блокирует его
-MAILBOX_WARMUP_DAYS = int(os.getenv("MAILBOX_WARMUP_DAYS", "14"))   # за сколько дней выходим на полный лимит
-MAILBOX_WARMUP_START = int(os.getenv("MAILBOX_WARMUP_START", "25"))  # потолок ящика в первый день
+# так провайдер не принимает свежий ящик за спам-рассыльщик и не блокирует его.
+# ПО УМОЛЧАНИЮ ВЫКЛЮЧЕН (0): прогрев нужен только для реально нового почтового ящика.
+# Иначе он резал уже раскачанные кампании (запись клиента свежая, а почта давно шлёт).
+MAILBOX_WARMUP_DAYS = int(os.getenv("MAILBOX_WARMUP_DAYS", "0"))    # 0 = выключен; N = за сколько дней выйти на полный лимит
+MAILBOX_WARMUP_START = int(os.getenv("MAILBOX_WARMUP_START", "25"))  # потолок ящика в первый день (когда прогрев включён)
 
 
 def _client_age_days(client):
@@ -2871,12 +2873,23 @@ def _client_age_days(client):
     return max(0, (datetime.now() - d).days)
 
 
+def _ever_sent(client_id: int) -> int:
+    """Сколько всего писем когда-либо ушло с ящика клиента (отклики + рассылка)."""
+    row = _q("SELECT COUNT(*) AS n FROM mail_applications WHERE client_id = ? AND status = 'sent'",
+             (client_id,), one=True)
+    return row["n"] if row else 0
+
+
 def warmup_cap(client) -> int:
     """Потолок ящика с учётом прогрева: линейно от MAILBOX_WARMUP_START в первый день
-    до MAILBOX_DAILY_MAX через MAILBOX_WARMUP_DAYS дней."""
+    до MAILBOX_DAILY_MAX через MAILBOX_WARMUP_DAYS дней. Прогрев применяется ТОЛЬКО к
+    реально новому ящику: если с него уже уходило заметное число писем, он считается
+    раскачанным и не режется (иначе тормозили бы уже работающие кампании)."""
     age = _client_age_days(client)
     if age is None or MAILBOX_WARMUP_DAYS <= 0 or age >= MAILBOX_WARMUP_DAYS:
         return MAILBOX_DAILY_MAX
+    if _ever_sent(client["id"]) >= MAILBOX_WARMUP_START:
+        return MAILBOX_DAILY_MAX  # ящик уже проверенно шлёт больше — не тормозим
     frac = age / MAILBOX_WARMUP_DAYS
     cap = MAILBOX_WARMUP_START + (MAILBOX_DAILY_MAX - MAILBOX_WARMUP_START) * frac
     return max(1, min(MAILBOX_DAILY_MAX, int(round(cap))))
@@ -3040,9 +3053,9 @@ async def _mailbase_send_one(bot: Bot, client) -> str:
     # писем, и исходный client (sqlite3.Row) содержит значение на начало тика
     sent_today_mb = (get_client(client_id)["mailbase_sent_today"] or 0)
     if sent_today_mb >= min(MAILBASE_DAILY_MAX, mailbox_cap(client)):
-        return "stop"
+        return "cap"  # дневная квота исчерпана — это штатно, не «затык»
     if sent_last_24h(client_id) >= mailbox_cap(client):
-        return "stop"
+        return "cap"
     target = _pick_target(client_id)
     if not target:
         return "stop"
@@ -3161,6 +3174,11 @@ async def _mail_base_tick_client(bot: Bot, client, now, today_str: str, now_hm: 
             _mailbase_last_tick[client_id] = time.monotonic()
         elif res == "skip":
             scans += 1  # пропуск тик не тратит — ищем следующий живой адрес
+        elif res == "cap":
+            # дневная квота выбрана — это норма, а не затык: сбрасываем счётчик
+            # «молчания», чтобы сторож не слал ложное предупреждение
+            _mailbase_last_ok[client_id] = time.monotonic()
+            break
         else:  # stop
             break
     if sent_now == 0 and scans == 0:
