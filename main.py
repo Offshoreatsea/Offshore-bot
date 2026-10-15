@@ -50,6 +50,9 @@ CHANNEL_ID = f"@{CHANNEL_USERNAME}"
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 APPLY_BOT_LINK = os.getenv("APPLY_BOT_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 CONSULT_LINK = os.getenv("CONSULT_LINK", "https://t.me/Offshore_atsea")
+# куда ведут ссылка внизу вакансии и кнопка «Get More Job Offers» (можно поменять в Railway)
+OFFERS_BOT_LINK = os.getenv("OFFERS_BOT_LINK", "https://t.me/EasyWayAtSea_bot")
+WEBSITE_URL = os.getenv("WEBSITE_URL", "https://www.wayatsea.com")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 WEBAPP_URL = os.getenv("WEBAPP_URL")  # публичный https-адрес мини-приложения, см. README
 STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK")  # готовая ссылка из Stripe Dashboard, напр. https://buy.stripe.com/...
@@ -794,7 +797,9 @@ def render_template(fields: dict, hide_contact: bool = False, lang: str | None =
         parts.append(val("hashtags"))
 
     parts.append("")
-    parts.append(f"🔗 {CHANNEL_LINK}")
+    # ссылка внизу ведёт на бота (а не на группу) — воронка в @EasyWayAtSea_bot
+    _bot_handle = OFFERS_BOT_LINK.rstrip("/").split("/")[-1]
+    parts.append(f'🔗 <a href="{OFFERS_BOT_LINK}">@{_bot_handle}</a>')
 
     # схлопываем случайные двойные пустые строки (когда почти все поля пустые
     # и подряд идёт несколько условных блоков с "" в начале)
@@ -832,9 +837,7 @@ def apply_button_url(vacancy_id: int) -> str:
 
 def channel_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="🎯 Get More Offers", url=f"https://t.me/{BOT_USERNAME}?start=join"
-        )
+        InlineKeyboardButton(text="🎯 Get More Job Offers", url=WEBSITE_URL)
     ]])
 
 
