@@ -1303,3 +1303,28 @@ def li_get_many(ids: list[int]):
     ).fetchall()
     conn.close()
     return rows
+
+
+def cv_match_search(tags: list[str], keywords: list[str], days: int = 30, limit: int = 20):
+    """Подбор вакансий под резюме: по тегу должности или словам в названии.
+    Берём опубликованные и ожидающие проверки, самые свежие сверху."""
+    tags = [t for t in tags if t]
+    keywords = [k.strip() for k in keywords if k and k.strip()]
+    if not tags and not keywords:
+        return []
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    cond, params = [], []
+    if tags:
+        cond.append("position_tag IN (%s)" % ",".join("?" * len(tags)))
+        params += tags
+    for k in keywords:
+        cond.append("position LIKE ?")
+        params.append(f"%{k}%")
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM vacancies WHERE status IN ('published', 'pending_review') "
+        "AND created_at > ? AND (" + " OR ".join(cond) + ") ORDER BY created_at DESC LIMIT ?",
+        [cutoff] + params + [limit],
+    ).fetchall()
+    conn.close()
+    return rows

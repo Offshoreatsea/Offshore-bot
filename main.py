@@ -31,6 +31,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 import db
+import email_apply
 import html as htmllib
 import linkedin
 import webapp
@@ -469,6 +470,7 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # admin_id -> vacancy_id, чья вакансия сейчас ожидает исправленный текст от админа
 pending_corrections: dict[int, int] = {}
 pending_li_delete: dict[int, bool] = {}
+pending_cv_match: dict[int, bool] = {}
 # admin_id -> True, если админ сейчас в процессе публикации рекламного поста
 pending_ads: dict[int, bool] = {}
 # временное хранилище черновиков рекламы: ad_id -> текст
@@ -1082,6 +1084,12 @@ async def do_publish(bot: Bot, vacancy_id: int):
     except Exception as e:
         print(f"[do_publish] Рассылка подписчикам не удалась (публикация в канал прошла успешно): {e}")
 
+    # черновики откликов для клиентов-моряков с подходящей должностью (если в вакансии есть email)
+    try:
+        await email_apply.propose_for_vacancy(bot, vacancy_id)
+    except Exception as e:
+        print(f"[do_publish] Отклики клиентов не созданы (публикация прошла успешно): {type(e).__name__}: {e}")
+
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
@@ -1131,7 +1139,7 @@ async def cmd_start(message: Message, command: CommandObject):
             "/contacts — список email/агентств из сохранённых вакансий\n"
             "/testchannel — проверить доступ бота к каналу\n"
             "/ad — опубликовать рекламный пост с кнопкой «Консультация»\n"
-            "/linkedin — раздел «Вакансии из LinkedIn» (сводка, список, модерация)\n"
+            "/cvmatch — подбор вакансий по резюме\n/linkedin — раздел «Вакансии из LinkedIn» (сводка, список, модерация)\n"
             "/search — открыть поиск вакансий с фильтрами (мини-приложение)\n"
             "/applications — последние отклики через мини-приложение\n"
             "/subscribe — команда для кандидатов: подписка на вакансии по должности "
@@ -1394,6 +1402,9 @@ async def cmd_upload_cv(message: Message):
 @router.message(F.document)
 async def handle_cv_document(message: Message):
     tg_id = message.from_user.id
+    if admin_only(tg_id) and pending_cv_match.pop(tg_id, False):
+        await cv_match_document(message)
+        return
     if admin_only(tg_id) or db.is_blocked(tg_id):
         return  # у админа документы — это его рабочие дела, не резюме кандидата
     lang = db.get_subscriber_language(tg_id)
@@ -1993,6 +2004,11 @@ async def handle_vacancy_text(message: Message):
     # режим «Удалить по номерам» в разделе LinkedIn
     if pending_li_delete.pop(user_id, False):
         await li_delete_by_numbers(message)
+        return
+
+    # режим «Подбор по резюме»: резюме вставлено текстом
+    if pending_cv_match.pop(user_id, False):
+        await cv_match_run(message, message.text or "")
         return
 
     # режим исправления — админ прислал текст с правильными полями
@@ -2800,7 +2816,7 @@ async def cb_fix(callback: CallbackQuery):
 
 # ======================= Вакансии из LinkedIn =======================
 
-BOT_VERSION = "2026-11-20 v31-linkedin"
+BOT_VERSION = "2026-11-20 v32-clients"
 _li_lock = asyncio.Lock()
 _li_phrase_cursor = 0
 
@@ -2900,6 +2916,92 @@ async def li_show_list(callback: CallbackQuery, page: int):
         text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
         disable_web_page_preview=True,
     )
+
+
+CV_MATCH_PROMPT = (
+    "You read a seafarer's CV. Return ONLY JSON: "
+    '{{"tags": [...], "keywords": [...]}}. '
+    "tags: up to 4 best-matching codes from this list for the CV owner's current/target rank "
+    "(and the next rank up if the CV suggests promotion): {tags}. "
+    "keywords: up to 4 short English job-title words/phrases for LIKE search (e.g. 'chief officer', "
+    "'2nd engineer', 'electrician'). Ignore vessel type. No other text.\n\nCV:\n{cv}"
+)
+
+
+def cv_extract_text(data: bytes, filename: str) -> str:
+    name = (filename or "").lower()
+    if name.endswith(".pdf"):
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join((p.extract_text() or "") for p in reader.pages[:6])
+    if name.endswith(".docx"):
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            xml = z.read("word/document.xml").decode("utf-8", "ignore")
+        xml = re.sub(r"</w:p>", "\n", xml)
+        return htmllib.unescape(re.sub(r"<[^>]+>", "", xml))
+    return data.decode("utf-8", "ignore")
+
+
+def cv_match_ai(cv_text: str) -> tuple[list[str], list[str]]:
+    resp = claude.messages.create(
+        model="claude-haiku-4-5-20251001", max_tokens=300,
+        messages=[{"role": "user", "content": CV_MATCH_PROMPT.format(
+            tags=", ".join(sorted(ALL_VALID_POSITION_TAGS)), cv=cv_text[:6000])}],
+    )
+    raw = re.sub(r"^```(json)?|```$", "", resp.content[0].text.strip(), flags=re.MULTILINE).strip()
+    data = json.loads(raw)
+    tags = [t for t in data.get("tags", []) if t in ALL_VALID_POSITION_TAGS]
+    return tags, [str(k) for k in data.get("keywords", [])][:4]
+
+
+async def cv_match_run(message: Message, cv_text: str):
+    if len(cv_text.strip()) < 40:
+        await message.answer("Не смог прочитать текст резюме. Пришлите PDF/DOCX с текстом или вставьте текст.")
+        return
+    wait = await message.answer("🔎 Читаю резюме и ищу вакансии…")
+    try:
+        tags, keywords = await asyncio.to_thread(cv_match_ai, cv_text)
+    except Exception as e:
+        await wait.edit_text(f"Не удалось определить должность: {type(e).__name__}")
+        return
+    rows = await asyncio.to_thread(db.cv_match_search, tags, keywords, 30, 20)
+    head = (f"🎯 Должности: {esc(', '.join(tags) or '—')}\n"
+            f"🔤 Слова: {esc(', '.join(keywords) or '—')}\n"
+            f"Найдено за 30 дней: {len(rows)}\n")
+    if not rows:
+        await wait.edit_text(head + "\nПодходящих вакансий пока нет.")
+        return
+    lines = []
+    for r in rows:
+        mark = "✅" if r["status"] == "published" else "🕓"
+        lines.append(f"{mark} #{r['id']} <b>{esc(r['position'])}</b>"
+                     + (f" · {esc(r['vessel'])}" if r["vessel"] else "")
+                     + (f" · {esc(r['region'])}" if r["region"] else "")
+                     + f"\n   📩 {esc(r['contact'] or '—')}")
+    text = head + "\n" + "\n".join(lines) + "\n\n✅ опубликовано · 🕓 ждёт проверки"
+    await wait.edit_text(text[:4000], disable_web_page_preview=True)
+
+
+async def cv_match_document(message: Message):
+    doc = message.document
+    try:
+        buf = io.BytesIO()
+        await message.bot.download(doc, destination=buf)
+        text = await asyncio.to_thread(cv_extract_text, buf.getvalue(), doc.file_name or "")
+    except Exception as e:
+        await message.answer(f"Не смог открыть файл ({type(e).__name__}). Пришлите PDF, DOCX или текст.")
+        return
+    await cv_match_run(message, text)
+
+
+@router.message(Command("cvmatch"))
+async def cmd_cvmatch(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    pending_cv_match[message.from_user.id] = True
+    await message.answer("📄 Пришлите резюме моряка (PDF, DOCX или текстом). "
+                         "Подберу вакансии из базы по должности, тип судна не важен. Ничего никуда не отправляется.")
 
 
 @router.message(Command("linkedin"))
@@ -3088,6 +3190,11 @@ async def li_process_post(bot: Bot, post: dict, stats: dict):
         if fields.get("vessel_tag") in MERCHANT_VESSEL_TAGS:
             stats["ai_dropped"] += 1
             continue
+        title = fields.get("position") or ""
+        if linkedin.shore_reason(title, combined, fields.get("vessel")) or not await asyncio.to_thread(
+                linkedin.ai_sea_check, claude, title, combined):
+            stats["shore"] += 1
+            continue
         # контакт — только корпоративный email из поста; ссылки из полей убираем
         ai_emails = linkedin.corporate_emails(fields.get("contact") or "")
         fields["contact"] = ai_emails[0] if ai_emails else emails[0]
@@ -3155,7 +3262,7 @@ async def run_linkedin_collect(bot: Bot, manual: bool = False) -> str:
         posts = await linkedin.apify_search(batch)
         stats = {
             "fetched": len(posts), "seen": 0, "with_image": 0, "duplicates": 0,
-            "ai_dropped": 0, "published": 0, "pending": 0,
+            "ai_dropped": 0, "shore": 0, "published": 0, "pending": 0,
             "rejected": {"seeker": 0, "news": 0, "not_offshore": 0, "weak": 0, "no_email": 0},
         }
         for post in posts:
@@ -3177,6 +3284,7 @@ async def run_linkedin_collect(bot: Bot, manual: bool = False) -> str:
             f"• мало признаков вакансии: {r['weak']}\n"
             f"• нет корпоративной почты (ссылки, gmail и т.п.): {r['no_email']}\n"
             f"• ИИ: не оффшорное судно: {stats['ai_dropped']}\n"
+            f"• Береговые/офисные роли: {stats['shore']}\n"
             f"• дубликаты: {stats['duplicates']}\n\n"
             f"🕓 Отправлено вам на проверку: {stats['pending']}\n"
             f"✅ Опубликовано сразу: {stats['published']}"
@@ -3248,7 +3356,16 @@ async def main():
     db.init_db()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
+    # отклик по email с почты клиентов-моряков (/addclient, /clients, /mail):
+    # его роутер подключаем первым, чтобы шаги диалога имели приоритет над общими хендлерами
+    email_apply.init_tables()
+    email_apply.setup(ADMIN_IDS, claude, ALL_VALID_POSITION_TAGS, TAG_LABELS)
+    dp.include_router(email_apply.router)
     dp.include_router(router)
+    asyncio.create_task(email_apply.bounce_worker(bot))
+    asyncio.create_task(email_apply.mailbox_health_worker(bot))
+    asyncio.create_task(email_apply.deferred_apply_worker(bot))
+    asyncio.create_task(email_apply.mail_base_worker(bot))
     asyncio.create_task(digest_worker(bot))
     asyncio.create_task(subscription_reminder_worker(bot))
     asyncio.create_task(scheduled_ads_worker(bot))

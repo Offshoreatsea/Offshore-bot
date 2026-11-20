@@ -325,3 +325,53 @@ async def read_vacancy_image(claude_client, image_urls: list[str]) -> str | None
         except Exception as e:
             print(f"[linkedin] чтение картинки не удалось: {type(e).__name__}: {e}")
     return None
+
+
+# --- Фильтр береговых (не морских) вакансий ---------------------------------
+SHORE_TITLE_RE = re.compile(
+    r"\b(storekeeper|store\s*keeper|warehouse|database|software|developer|it\s+support|"
+    r"administrator|admin\b|general\s+services|training\s*(?:&|and)\s*development|"
+    r"expedit(?:er|or)|procurement|buyer|logistics\s+(?:officer|coordinator)|"
+    r"accountant|finance|payroll|hr\b|human\s+resources|recruit|talent|"
+    r"marketing|sales|business\s+development|bid\s+manager|estimator|planner|"
+    r"document\s+controller|secretary|receptionist|driver|cleaner|"
+    r"quality\s+control\s+coordinator|hse\s+coordinator|qa/?qc\s+coordinator|"
+    r"interpreter|translator|lawyer|legal|compliance\s+officer)\b", re.I)
+SEA_TITLE_RE = re.compile(
+    r"\b(vessel|offshore|rig|platform|fpso|rov|subsea|diver|diving|marine|"
+    r"master|captain|mate|engineer\s+on\s+board|sov|csv|psv|ahts|dp\b)", re.I)
+ONSHORE_RE = re.compile(r"\bonshore\b|\bbase\s+office\b|\boffice[- ]based\b|\bhead\s+office\b", re.I)
+
+
+def shore_reason(title: str, text: str, vessel=None) -> str | None:
+    """Быстрый словарный отсев береговых ролей. Возвращает причину или None."""
+    title = title or ""
+    if SHORE_TITLE_RE.search(title) and not SEA_TITLE_RE.search(title) and not vessel:
+        return "shore_title"
+    if ONSHORE_RE.search(text or "") and not re.search(r"\boffshore\b", text or "", re.I):
+        return "onshore_text"
+    return None
+
+
+SEA_CHECK_PROMPT = (
+    "Job post for a maritime/offshore crew board. Decide if the worker's PLACE OF WORK is "
+    "on a vessel, rig, platform, wind farm or other offshore site (including offshore "
+    "surveyors/technicians who mobilise to vessels or platforms).\n"
+    "Answer NO if the role is office, warehouse, base, onshore/shore-side, IT, admin, "
+    "HR, procurement, HSE/QC coordination at an onshore base, or wind turbine work on land.\n"
+    "Answer exactly YES or NO.\n\nTitle: {title}\n\nPost:\n{text}"
+)
+
+
+def ai_sea_check(claude_client, title: str, text: str) -> bool:
+    """True, если работа на борту/оффшорной площадке. При сбое ИИ — True (не теряем вакансии)."""
+    try:
+        resp = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=5,
+            messages=[{"role": "user", "content": SEA_CHECK_PROMPT.format(
+                title=title[:150], text=(text or "")[:2500])}],
+        )
+        return not resp.content[0].text.strip().upper().startswith("NO")
+    except Exception as e:
+        print(f"[linkedin] ai_sea_check: {type(e).__name__}: {e}")
+        return True
