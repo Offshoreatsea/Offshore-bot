@@ -7,9 +7,7 @@
 import hashlib
 import hmac
 import json
-import asyncio
 import os
-import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -26,28 +24,7 @@ if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
 STATIC_DIR = Path(__file__).parent / "static"
-INIT_DATA_MAX_AGE = int(os.getenv("INIT_DATA_MAX_AGE", str(24 * 3600)))
-API_RATE_PER_MIN = int(os.getenv("API_RATE_PER_MIN", "60"))  # запросов к /api в минуту с одного IP
-_api_hits: dict[str, list[float]] = {}
-
-
-@web.middleware
-async def api_rate_limit(request, handler):
-    """Не даёт выкачивать API мини-приложения скриптом и заваливать бота запросами."""
-    if request.path.startswith("/api/"):
-        ip = request.headers.get("X-Forwarded-For", request.remote or "?").split(",")[0].strip()
-        now = time.monotonic()
-        hits = [t for t in _api_hits.get(ip, []) if now - t < 60]
-        if len(hits) >= API_RATE_PER_MIN:
-            return web.json_response({"error": "rate_limited"}, status=429)
-        hits.append(now)
-        _api_hits[ip] = hits
-        if len(_api_hits) > 50000:
-            _api_hits.clear()
-    response = await handler(request)
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("Referrer-Policy", "no-referrer")
-    return response
+ASSETS_DIR = Path(__file__).parent / "assets"
 
 
 def validate_init_data(init_data: str, bot_token: str) -> dict | None:
@@ -61,13 +38,6 @@ def validate_init_data(init_data: str, bot_token: str) -> dict | None:
         return None
     received_hash = parsed.pop("hash", None)
     if not received_hash:
-        return None
-    # подпись старше суток не принимаем — иначе однажды перехваченный initData
-    # можно было бы использовать бесконечно
-    try:
-        if time.time() - int(parsed.get("auth_date", "0")) > INIT_DATA_MAX_AGE:
-            return None
-    except ValueError:
         return None
     data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
     secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
@@ -95,10 +65,7 @@ def vacancy_to_dict(row) -> dict:
         "salary": row["salary"],
         "documents": as_list(row["documents"]),
         "requirements": as_list(row["requirements"]),
-        # контакт (email работодателя) в публичный API НЕ отдаём: /api/vacancies
-        # открыт без авторизации, и любой мог выгрузить всю базу email — то, что
-        # бот продаёт как платный дайджест. Мини-приложение контакт не показывает.
-        "contact": None,
+        "contact": row["contact"],
         "hashtags": row["hashtags"],
     }
 
@@ -116,9 +83,8 @@ async def handle_vacancies(request: web.Request) -> web.Response:
 
 def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_payment=None,
                on_stripe_renewal=None, on_stripe_upcoming=None,
-               on_stripe_unmatched_payment=None) -> web.Application:
-    app = web.Application(middlewares=[api_rate_limit], client_max_size=256 * 1024)
-    _last_apply: dict[int, float] = {}
+               on_stripe_unmatched_payment=None, on_stripe_autoapply_payment=None) -> web.Application:
+    app = web.Application()
 
     def get_authenticated_tg_id(init_data: str) -> int | None:
         """Проверяет подпись initData и достаёт id пользователя. Используется
@@ -151,18 +117,7 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
         event_type = event["type"]
         obj = event["data"]["object"]
 
-        # обрабатываем ДО ответа: если бот перезапустится посреди обработки, Stripe
-        # не получит 200 и пришлёт событие ещё раз — оплата не потеряется.
-        # Повторы одной и той же оплаты отсекаются по charge_id (payment_exists)
-        await _process_stripe_event(event_type, obj)
-        return web.Response(status=200, text="ok")
-
-    async def _process_stripe_event(event_type: str, obj) -> None:
-        if event_type == "checkout.session.completed" and obj.get("payment_status") == "unpaid":
-            # отложенные способы оплаты: деньги ещё не пришли — ждём
-            # checkout.session.async_payment_succeeded
-            return
-        if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
+        if event_type == "checkout.session.completed":
             # ПЕРВАЯ оплата подписки/дайджеста — Stripe создаёт checkout-сессию
             # только один раз, при следующих продлениях этого события больше
             # не будет (см. invoice.paid ниже)
@@ -180,6 +135,14 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
                         await on_stripe_digest_payment(bot, tg_id, amount, currency, charge_id)
                     except Exception as e:
                         print(f"[stripe webhook] Ошибка доставки дайджеста для tg_id={tg_id}: {e}")
+            elif ref.startswith("autoapply_") and on_stripe_autoapply_payment:
+                tg_id_raw = ref.replace("autoapply_", "", 1)
+                if tg_id_raw.isdigit():
+                    tg_id = int(tg_id_raw)
+                    try:
+                        await on_stripe_autoapply_payment(bot, tg_id, amount, currency, charge_id)
+                    except Exception as e:
+                        print(f"[stripe webhook] Ошибка активации автоотклика для tg_id={tg_id}: {e}")
             elif ref.isdigit() and on_stripe_payment:
                 tg_id = int(ref)
                 try:
@@ -228,6 +191,8 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
                     await on_stripe_upcoming(bot, customer_id, amount, currency)
                 except Exception as e:
                     print(f"[stripe webhook] Ошибка обработки напоминания для customer={customer_id}: {e}")
+
+        return web.Response(status=200, text="ok")
 
     async def handle_get_profile(request: web.Request) -> web.Response:
         init_data = request.query.get("initData", "")
@@ -299,19 +264,13 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
         except json.JSONDecodeError:
             tg_user = {}
 
-        vacancy_id = str(body.get("vacancy_id") or "")
-        contact = (body.get("contact") or "").strip()[:200]
-        message = (body.get("message") or "").strip()[:2000]
-        name = (body.get("name") or tg_user.get("first_name") or "").strip()[:100]
+        vacancy_id = body.get("vacancy_id")
+        contact = (body.get("contact") or "").strip()
+        message = (body.get("message") or "").strip()
+        name = (body.get("name") or tg_user.get("first_name") or "").strip()
 
-        if not vacancy_id.isdigit() or not contact or not db.get_vacancy(int(vacancy_id)):
+        if not vacancy_id or not contact:
             return web.json_response({"error": "missing_fields"}, status=400)
-        # не больше одного отклика в 20 секунд от одного человека — защита от спама админам
-        uid = tg_user.get("id") or 0
-        now = time.monotonic()
-        if now - _last_apply.get(uid, 0) < 20:
-            return web.json_response({"error": "too_fast"}, status=429)
-        _last_apply[uid] = now
 
         db.insert_application(
             vacancy_id=int(vacancy_id),
@@ -326,13 +285,11 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
         position = vacancy["position"] if vacancy else "вакансия"
         admin_ids = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-        esc = lambda v: str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        notify_lines = [f"📥 Новый отклик на «{esc(position)}»", "", f"Имя: {esc(name or '—')}",
-                        f"Контакт: {esc(contact)}"]
+        notify_lines = [f"📥 Новый отклик на «{position}»", "", f"Имя: {name or '—'}", f"Контакт: {contact}"]
         if tg_user.get("username"):
-            notify_lines.append(f"Telegram: @{esc(tg_user['username'])}")
+            notify_lines.append(f"Telegram: @{tg_user['username']}")
         if message:
-            notify_lines.append(f"\nСообщение: {esc(message)}")
+            notify_lines.append(f"\nСообщение: {message}")
         notify_text = "\n".join(notify_lines)
 
         for admin_id in admin_ids:
@@ -349,6 +306,11 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
         # index.html для корневого пути
         return web.FileResponse(STATIC_DIR / "index.html")
 
+    async def handle_banner(request: web.Request) -> web.Response:
+        # публичная ссылка на баннер — нужна Instagram Graph API, туда нельзя
+        # передать файл напрямую, только доступный извне image_url
+        return web.FileResponse(ASSETS_DIR / "promo_banner.jpg")
+
     app.router.add_get("/api/filters", handle_filters)
     app.router.add_get("/api/vacancies", handle_vacancies)
     app.router.add_post("/api/apply", handle_apply)
@@ -356,6 +318,7 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
     app.router.add_post("/api/profile", handle_post_profile)
     app.router.add_get("/api/applications", handle_my_applications)
     app.router.add_post("/stripe/webhook", handle_stripe_webhook)
+    app.router.add_get("/assets/banner.jpg", handle_banner)
     app.router.add_get("/", handle_index)
     app.router.add_static("/", STATIC_DIR, show_index=False)
     return app
@@ -363,9 +326,10 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
 
 async def run_web_server(bot, bot_token: str, port: int, on_stripe_payment=None, on_stripe_digest_payment=None,
                           on_stripe_renewal=None, on_stripe_upcoming=None,
-                          on_stripe_unmatched_payment=None):
+                          on_stripe_unmatched_payment=None, on_stripe_autoapply_payment=None):
     app = create_app(bot, bot_token, on_stripe_payment, on_stripe_digest_payment,
-                      on_stripe_renewal, on_stripe_upcoming, on_stripe_unmatched_payment)
+                      on_stripe_renewal, on_stripe_upcoming, on_stripe_unmatched_payment,
+                      on_stripe_autoapply_payment)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=port)

@@ -1,22 +1,20 @@
 import asyncio
-import html
 import io
 import random
 import json
 import os
 import re
 import time
-from types import SimpleNamespace
 from datetime import datetime, timedelta
 
 import anthropic
+import httpx
 import stripe
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
-from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
@@ -25,7 +23,6 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
-    LinkPreviewOptions,
     MenuButtonWebApp,
     Message,
     PreCheckoutQuery,
@@ -34,10 +31,8 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 import db
-import email_apply
-import features
-import ingest
-import ranks
+import html as htmllib
+import linkedin
 import webapp
 
 load_dotenv()
@@ -50,23 +45,32 @@ CHANNEL_ID = f"@{CHANNEL_USERNAME}"
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 APPLY_BOT_LINK = os.getenv("APPLY_BOT_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 CONSULT_LINK = os.getenv("CONSULT_LINK", "https://t.me/Offshore_atsea")
-# куда ведут ссылка внизу вакансии и кнопка «Get More Job Offers» (можно поменять в Railway)
-OFFERS_BOT_LINK = os.getenv("OFFERS_BOT_LINK", "https://t.me/EasyWayAtSea_bot")
-WEBSITE_URL = os.getenv("WEBSITE_URL", "https://www.wayatsea.com")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 WEBAPP_URL = os.getenv("WEBAPP_URL")  # публичный https-адрес мини-приложения, см. README
 STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK")  # готовая ссылка из Stripe Dashboard, напр. https://buy.stripe.com/...
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
+# --- Автоотклик (платная надстройка) ---
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", SMTP_USERNAME)
+STRIPE_AUTOAPPLY_PAYMENT_LINK = os.getenv("STRIPE_AUTOAPPLY_PAYMENT_LINK")
+AUTO_APPLY_DAYS = 30
+
+# --- Кросс-постинг вакансий в Instagram (в дополнение к каналу) ---
+INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN")  # long-lived Page/IG token
+INSTAGRAM_BUSINESS_ACCOUNT_ID = os.getenv("INSTAGRAM_BUSINESS_ACCOUNT_ID")  # id IG Business-аккаунта, привязанного к FB Page
 STRIPE_DIGEST_PAYMENT_LINK = os.getenv("STRIPE_DIGEST_PAYMENT_LINK")  # отдельная ссылка на разовую покупку email-дайджеста ($5)
 BANNER_PATH = os.path.join(os.path.dirname(__file__), "assets", "promo_banner.jpg")
 _banner_file_id: str | None = None  # заполняется после первой отправки — дальше шлём по file_id, не перезаливая файл
 PORT = int(os.getenv("PORT", "8080"))
-SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "800"))  # legacy, Stars больше не показываем
-SUBSCRIPTION_PRICE_EUR = os.getenv("SUBSCRIPTION_PRICE_EUR", "1")  # цена подписки картой (отображение; реальная сумма — в Stripe)
+SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "800"))
 SUBSCRIPTION_DAYS = 30
 MAX_POSITIONS = 2
 REFERRAL_BONUS_DAYS = 3
-TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "30"))
+TRIAL_DAYS = 3
 TRIAL_BACKFILL_DAYS = 4  # чтобы не сливать всю базу разом при первом выборе должности
 EMAIL_DIGEST_PRICE_STARS = int(os.getenv("EMAIL_DIGEST_PRICE_STARS", "165"))  # оставлено для обратной совместимости с уже существующим Stars-инвойсом, если понадобится вернуть
 EMAIL_DIGEST_PRICE_USD = int(os.getenv("EMAIL_DIGEST_PRICE_USD", "5"))
@@ -203,7 +207,7 @@ TR = {
                   "What I can do:\n"
                   "📋 Instant alerts for up to 2 positions you pick\n"
                   "📧 Weekly list of recruiter emails from the channel\n"
-                  "🎁 30 days free to try, no card needed\n🧰 Tools: contract check, documents + expiry reminders, offshore news\n"
+                  "🎁 3 days free to try, no card needed\n"
                   "🔁 See your subscription status and renew anytime\n\n"
                   "⚠️ OffshoreAtSea is a vacancy aggregator only — we are not "
                   "the employer and are not responsible for working conditions "
@@ -223,12 +227,15 @@ TR = {
         "no_selection": "You haven't picked any position yet — tap one above.",
         "subscribed_summary": "Your alerts are set up for: {tags}",
         "contact_admin": "🆘 Contact admin",
-        "pay_intro": "Your free trial has ended. Subscription is €{price}/month — instant alerts "
-                     "for the positions you pick, plus all tools (contract check, documents, news).",
+        "pay_intro": "Your free trial has ended. {price} Stars gets you 30 more days "
+                     "of instant notifications for the positions you choose.",
+        "pay_button": "⭐ Pay {price} Stars for 30 days",
         "pay_button_card": "💳 Pay by card",
-        "pay_button_sub": "💳 Subscribe €{price}/mo by card",
+        "pay_contact_admin": "💬 Can't pay with Stars? Message admin",
         "trial_started": "🎉 You get {days} days free — no card needed. Choose your positions:",
         "referral_bonus": "🎁 A friend you invited just paid — you got +{days} days, now active until {until}!",
+        "invite_friend": "🎁 Invite a friend, get 3 free days",
+        "referral_share_text": "Get job alerts by position on OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Your job alerts subscription ends in less than 24 hours. Renew to keep getting instant notifications:",
         "revoked_notice": "Your job alerts subscription has been cancelled by the admin.",
         "bonus_extension": "🎁 We're giving you {days} days of access as a gift! Now active until {until}.",
@@ -243,8 +250,19 @@ TR = {
         "renew_button": "🔁 Renew subscription",
         "contact_locked": "📩 Contact: 🔒 hidden — subscribe to unlock recruiter contacts instantly: /managesubscription",
         "my_id_button": "🆔 My ID",
-        "back_button": "⬅️ Menu",
         "my_id_text": "Your Telegram ID: {id}",
+        "upload_cv_prompt": "📄 Send me your CV as a file (PDF or Word) — I'll save it and use it for Auto-Apply.",
+        "cv_saved": "✅ Got it — saved \"{filename}\" as your CV.",
+        "upload_cv_button": "📄 Upload CV",
+        "auto_apply_buy_button": "⚡ Buy Auto-Apply — 30 days",
+        "cv_yes": "CV uploaded ✅",
+        "cv_no": "No CV uploaded yet ⚠️",
+        "auto_apply_intro": "⚡ Auto-Apply: when a matching vacancy has a recruiter email, I'll send your CV automatically — no need to do it yourself. Paid add-on on top of your subscription.",
+        "auto_apply_active": "⚡ Auto-Apply is active. {cv_status}",
+        "auto_apply_activated": "✅ Auto-Apply activated until {until}. I'll send your CV automatically for matching vacancies with an email contact.",
+        "auto_apply_activated_no_cv": "✅ Auto-Apply activated until {until} — but I don't have your CV yet. Send it as a file so I can actually apply for you.",
+        "auto_apply_sent": "⚡ Auto-Apply: your CV was sent automatically to {email}.",
+        "auto_apply_failed": "⚠️ Auto-Apply: couldn't send your CV to {email} automatically this time. You can apply manually using the contact above.",
         "digest_count_button": "🔢 How many emails available?",
         "digest_count_text": "📊 {count} recruiter emails available right now.",
         "digest_demo_button": "👀 Free demo — 5 random emails",
@@ -252,6 +270,7 @@ TR = {
         "digest_demo_uses_left": "Free demo tries left: {left}",
         "digest_demo_exhausted": "You've used both free demo tries. Buy the full list to see all emails.",
         "digest_intro": "📧 Get all the recruiter emails from vacancies posted in the channel this week — ${price}, one-time purchase.",
+        "digest_pay_button": "⭐ Pay {price} Stars",
         "digest_menu_button": "📧 Get recruiter emails from this week",
         "digest_delivered": "✅ Here are {count} emails from the last 7 days:",
         "digest_empty": "No vacancies with contact emails were posted in the last 7 days.",
@@ -273,7 +292,7 @@ TR = {
                  "Что я умею:\n"
                  "📋 Мгновенные уведомления по 2 выбранным должностям\n"
                  "📧 Список email рекрутёров за неделю из канала\n"
-                 "🎁 30 дней бесплатно, карта не нужна\n🧰 Инструменты: проверка контракта, документы с напоминаниями, новости офшора\n"
+                 "🎁 3 дня бесплатно, карта не нужна\n"
                  "🔁 Всегда видно статус подписки, продление в один клик\n\n"
                  "⚠️ OffshoreAtSea — только агрегатор вакансий, мы не являемся "
                  "работодателем и не несём ответственности за условия труда "
@@ -293,12 +312,15 @@ TR = {
         "no_selection": "Вы ещё не выбрали ни одной должности — нажмите на любую выше.",
         "subscribed_summary": "Ваши подписки: {tags}",
         "contact_admin": "🆘 Написать администратору",
-        "pay_intro": "Пробный период закончился. Подписка €{price}/месяц — мгновенные уведомления "
-                     "по выбранным должностям и все инструменты (контракт, документы, новости).",
+        "pay_intro": "Ваш бесплатный период закончился. {price} ⭐ дают ещё 30 дней "
+                     "мгновенных уведомлений по выбранным должностям.",
+        "pay_button": "⭐ Оплатить {price} Stars за 30 дней",
         "pay_button_card": "💳 Оплатить картой",
-        "pay_button_sub": "💳 Подписка €{price}/мес картой",
-        "trial_started": "🎉 Вам доступно {days} дней бесплатно — без карты. Выберите должности:",
+        "pay_contact_admin": "💬 Не можете оплатить Stars? Написать администратору",
+        "trial_started": "🎉 Вам доступны {days} дня бесплатно — без карты. Выберите должности:",
         "referral_bonus": "🎁 Приглашённый вами друг оплатил — вам +{days} дня, теперь активно до {until}!",
+        "invite_friend": "🎁 Пригласить друга, получить 3 дня бесплатно",
+        "referral_share_text": "Уведомления о вакансиях по должности в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша подписка на уведомления заканчивается меньше чем через 24 часа. Продлите, чтобы не пропускать вакансии:",
         "revoked_notice": "Ваша подписка на уведомления отменена администратором.",
         "bonus_extension": "Даём доступ на {days} дня в подарок 🎁\nТеперь активно до {until}.",
@@ -313,8 +335,19 @@ TR = {
         "renew_button": "🔁 Продлить подписку",
         "contact_locked": "📩 Контакт: 🔒 скрыт — оформите подписку, чтобы сразу видеть контакты рекрутёров: /managesubscription",
         "my_id_button": "🆔 Мой ID",
-        "back_button": "⬅️ Меню",
         "my_id_text": "Ваш Telegram ID: {id}",
+        "upload_cv_prompt": "📄 Пришлите резюме файлом (PDF или Word) — сохраню и буду использовать для автоотклика.",
+        "cv_saved": "✅ Принял — сохранил \"{filename}\" как ваше резюме.",
+        "upload_cv_button": "📄 Загрузить резюме",
+        "auto_apply_buy_button": "⚡ Купить автоотклик — 30 дней",
+        "cv_yes": "Резюме загружено ✅",
+        "cv_no": "Резюме ещё не загружено ⚠️",
+        "auto_apply_intro": "⚡ Автоотклик: когда подходящая вакансия содержит email рекрутёра, я сам отправлю ваше резюме — не нужно делать это вручную. Платная надстройка поверх основной подписки.",
+        "auto_apply_active": "⚡ Автоотклик активен. {cv_status}",
+        "auto_apply_activated": "✅ Автоотклик активирован до {until}. Буду сам отправлять ваше резюме на подходящие вакансии с email.",
+        "auto_apply_activated_no_cv": "✅ Автоотклик активирован до {until} — но у меня пока нет вашего резюме. Пришлите файлом, чтобы я реально мог откликаться за вас.",
+        "auto_apply_sent": "⚡ Автоотклик: ваше резюме автоматически отправлено на {email}.",
+        "auto_apply_failed": "⚠️ Автоотклик: не удалось автоматически отправить резюме на {email} в этот раз. Можете откликнуться вручную по контакту выше.",
         "digest_count_button": "🔢 Сколько email доступно?",
         "digest_count_text": "📊 Сейчас доступно {count} email рекрутёров.",
         "digest_demo_button": "👀 Бесплатное демо — 5 случайных email",
@@ -322,6 +355,7 @@ TR = {
         "digest_demo_uses_left": "Осталось бесплатных попыток: {left}",
         "digest_demo_exhausted": "Вы уже использовали обе бесплатные попытки. Оформите подписку, чтобы увидеть полный список.",
         "digest_intro": "📧 Все email рекрутёров из вакансий, опубликованных в канале за эту неделю — ${price}, разовая покупка.",
+        "digest_pay_button": "⭐ Оплатить {price} Stars",
         "digest_menu_button": "📧 Получить email рекрутёров за неделю",
         "digest_delivered": "✅ Вот {count} email за последние 7 дней:",
         "digest_empty": "За последние 7 дней не было вакансий с контактным email.",
@@ -343,7 +377,7 @@ TR = {
                  "Що я вмію:\n"
                  "📋 Миттєві сповіщення за 2 обраними посадами\n"
                  "📧 Список email рекрутерів за тиждень з каналу\n"
-                 "🎁 30 днів безкоштовно, картка не потрібна\n🧰 Інструменти: перевірка контракту, документи з нагадуваннями, новини офшору\n"
+                 "🎁 3 дні безкоштовно, картка не потрібна\n"
                  "🔁 Завжди видно статус підписки, продовження в один клік\n\n"
                  "⚠️ OffshoreAtSea — лише агрегатор вакансій, ми не є "
                  "роботодавцем і не несемо відповідальності за умови праці "
@@ -363,12 +397,15 @@ TR = {
         "no_selection": "Ви ще не обрали жодної посади — натисніть на будь-яку вище.",
         "subscribed_summary": "Ваші підписки: {tags}",
         "contact_admin": "🆘 Написати адміністратору",
-        "pay_intro": "Пробний період закінчився. Підписка €{price}/місяць — миттєві сповіщення "
-                     "за обраними посадами та всі інструменти (контракт, документи, новини).",
+        "pay_intro": "Ваш безкоштовний період закінчився. {price} ⭐ дають ще 30 днів "
+                     "миттєвих сповіщень за обраними посадами.",
+        "pay_button": "⭐ Оплатити {price} Stars за 30 днів",
         "pay_button_card": "💳 Оплатити карткою",
-        "pay_button_sub": "💳 Підписка €{price}/міс карткою",
-        "trial_started": "🎉 Вам доступно {days} днів безкоштовно — без картки. Оберіть посади:",
+        "pay_contact_admin": "💬 Не можете оплатити Stars? Напишіть адміністратору",
+        "trial_started": "🎉 Вам доступні {days} дні безкоштовно — без картки. Оберіть посади:",
         "referral_bonus": "🎁 Запрошений вами друг оплатив — вам +{days} дні, тепер активно до {until}!",
+        "invite_friend": "🎁 Запросити друга, отримати 3 дні безкоштовно",
+        "referral_share_text": "Сповіщення про вакансії за посадою в OffshoreAtSea 👇",
         "expiry_reminder": "⏳ Ваша підписка на сповіщення закінчується менш ніж за 24 години. Продовжте, щоб не пропускати вакансії:",
         "revoked_notice": "Вашу підписку на сповіщення скасовано адміністратором.",
         "bonus_extension": "Даруємо доступ на {days} дні у подарунок 🎁\nТепер активно до {until}.",
@@ -383,8 +420,19 @@ TR = {
         "renew_button": "🔁 Продовжити підписку",
         "contact_locked": "📩 Контакт: 🔒 приховано — оформіть підписку, щоб одразу бачити контакти рекрутерів: /managesubscription",
         "my_id_button": "🆔 Мій ID",
-        "back_button": "⬅️ Меню",
         "my_id_text": "Ваш Telegram ID: {id}",
+        "upload_cv_prompt": "📄 Надішліть резюме файлом (PDF або Word) — збережу і використаю для автовідгуку.",
+        "cv_saved": "✅ Прийняв — зберіг \"{filename}\" як ваше резюме.",
+        "upload_cv_button": "📄 Завантажити резюме",
+        "auto_apply_buy_button": "⚡ Купити автовідгук — 30 днів",
+        "cv_yes": "Резюме завантажено ✅",
+        "cv_no": "Резюме ще не завантажено ⚠️",
+        "auto_apply_intro": "⚡ Автовідгук: коли підходяща вакансія містить email рекрутера, я сам надішлю ваше резюме — не потрібно робити це вручну. Платна надбудова понад основну підписку.",
+        "auto_apply_active": "⚡ Автовідгук активний. {cv_status}",
+        "auto_apply_activated": "✅ Автовідгук активовано до {until}. Надсилатиму ваше резюме на підходящі вакансії з email.",
+        "auto_apply_activated_no_cv": "✅ Автовідгук активовано до {until} — але у мене ще немає вашого резюме. Надішліть файлом, щоб я реально міг відгукуватись за вас.",
+        "auto_apply_sent": "⚡ Автовідгук: ваше резюме автоматично надіслано на {email}.",
+        "auto_apply_failed": "⚠️ Автовідгук: не вдалося автоматично надіслати резюме на {email} цього разу. Можете відгукнутись вручну за контактом вище.",
         "digest_count_button": "🔢 Скільки email доступно?",
         "digest_count_text": "📊 Зараз доступно {count} email рекрутерів.",
         "digest_demo_button": "👀 Безкоштовне демо — 5 випадкових email",
@@ -392,6 +440,7 @@ TR = {
         "digest_demo_uses_left": "Залишилось безкоштовних спроб: {left}",
         "digest_demo_exhausted": "Ви вже використали обидві безкоштовні спроби. Оформіть підписку, щоб побачити повний список.",
         "digest_intro": "📧 Усі email рекрутерів з вакансій, опублікованих у каналі цього тижня — ${price}, разова покупка.",
+        "digest_pay_button": "⭐ Оплатити {price} Stars",
         "digest_menu_button": "📧 Отримати email рекрутерів за тиждень",
         "digest_delivered": "✅ Ось {count} email за останні 7 днів:",
         "digest_empty": "За останні 7 днів не було вакансій із контактним email.",
@@ -419,6 +468,7 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # admin_id -> vacancy_id, чья вакансия сейчас ожидает исправленный текст от админа
 pending_corrections: dict[int, int] = {}
+pending_li_delete: dict[int, bool] = {}
 # admin_id -> True, если админ сейчас в процессе публикации рекламного поста
 pending_ads: dict[int, bool] = {}
 # временное хранилище черновиков рекламы: ad_id -> текст
@@ -516,7 +566,6 @@ For each vacancy, extract:
     "C/E", "Chief Engineer" -> ChiefEngineer
     "2/E", "Second Engineer", "First Assistant Engineer" -> SecondEngineer
     "3/E", "Third Engineer", "EOOW" -> ThirdEngineer
-    a bare "Engineer", "Marine Engineer", "Engineer Officer" with no rank number -> ThirdEngineer
     "4/E", "Fourth Engineer", "Junior Engineer" -> JuniorEngineer
     "Deck Engineer", "Deck Mechanic" -> ThirdEngineer (junior-sounding phrasing, explicit
     "junior"/"trainee" wording -> JuniorEngineer instead)
@@ -549,8 +598,10 @@ For each vacancy, extract:
     "Diver", "Saturation Diver" -> Diver
     "Scaffolder" -> Scaffolder
     "Winch Operator" -> WinchOperator
-    "OOW" (Officer of the Watch), "Mate" or "2nd Mate" with no other rank number -> SecondOfficer
-    (the channel owner's rule: Mate / OOW = 2nd Officer); "3rd Mate" -> ThirdOfficer.
+    "OOW" (Officer of the Watch) or a bare "Mate" with no rank number given is ambiguous
+    between SecondOfficer and ThirdOfficer — infer from context (years of experience
+    required, COC class, whether it's described as senior/junior watch); if there is truly
+    no way to tell, default to SecondOfficer rather than Other.
   If truly nothing in the list or the guidance above fits, use "Other".
 - vessel: vessel/rig type or name, as written/implied in the source, or null
 - vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list:
@@ -737,19 +788,16 @@ def ai_parse_batch(raw: str) -> list[dict]:
 
 
 def render_template(fields: dict, hide_contact: bool = False, lang: str | None = None) -> str:
-    # все значения экранируем: бот шлёт сообщения в режиме HTML, и любой «<»
-    # или «&» из текста вакансии («<hr@x.com>», «Salary <$500») раньше ломал
-    # публикацию целиком ошибкой Telegram «can't parse entities»
     def val(key):
         v = fields.get(key)
-        return html.escape(str(v), quote=False) if v else None
+        return v if v else None
 
     def as_list(key):
         v = fields.get(key)
         if isinstance(v, list):
-            return [html.escape(str(x), quote=False) for x in v if x]
+            return v
         if isinstance(v, str) and v.strip():
-            return [html.escape(l, quote=False) for l in v.split("\n") if l.strip()]
+            return [l for l in v.split("\n") if l.strip()]
         return []
 
     date_val = val("date") or val("dates")
@@ -783,7 +831,7 @@ def render_template(fields: dict, hide_contact: bool = False, lang: str | None =
 
     if fields.get("notes"):
         parts.append("")
-        parts.append(f"ℹ️ {val('notes')}")
+        parts.append(f"ℹ️ {fields['notes']}")
 
     if val("contact"):
         parts.append("")
@@ -794,12 +842,10 @@ def render_template(fields: dict, hide_contact: bool = False, lang: str | None =
 
     if fields.get("hashtags"):
         parts.append("")
-        parts.append(val("hashtags"))
+        parts.append(fields["hashtags"])
 
     parts.append("")
-    # ссылка внизу ведёт на бота (а не на группу) — воронка в @EasyWayAtSea_bot
-    _bot_handle = OFFERS_BOT_LINK.rstrip("/").split("/")[-1]
-    parts.append(f'🔗 <a href="{OFFERS_BOT_LINK}">@{_bot_handle}</a>')
+    parts.append(f"🔗 {CHANNEL_LINK}")
 
     # схлопываем случайные двойные пустые строки (когда почти все поля пустые
     # и подряд идёт несколько условных блоков с "" в начале)
@@ -835,9 +881,43 @@ def apply_button_url(vacancy_id: int) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=apply_{vacancy_id}"
 
 
+def _send_email_sync(to_email: str, subject: str, body: str, attachment_bytes: bytes, attachment_filename: str):
+    # блокирующая часть (smtplib синхронный) — вызывается только через
+    # asyncio.to_thread, никогда напрямую из async-кода
+    import smtplib
+    from email.mime.application import MIMEApplication
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_FROM_EMAIL
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    part = MIMEApplication(attachment_bytes, Name=attachment_filename)
+    part["Content-Disposition"] = f'attachment; filename="{attachment_filename}"'
+    msg.attach(part)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(msg)
+
+
+async def send_cv_email(to_email: str, subject: str, body: str, attachment_bytes: bytes, attachment_filename: str):
+    if not (SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD):
+        raise RuntimeError("SMTP не настроен — нужны SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD в Variables")
+    await asyncio.to_thread(
+        _send_email_sync, to_email, subject, body, attachment_bytes, attachment_filename
+    )
+
+
 def channel_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🎯 Get More Job Offers", url=WEBSITE_URL)
+        InlineKeyboardButton(
+            text="🎯 Get More Offers", url=f"https://t.me/{BOT_USERNAME}?start=join"
+        )
     ]])
 
 
@@ -878,25 +958,6 @@ def duplicate_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
-async def send_long(bot: Bot, chat_id: int, header: str, lines: list[str], filename: str = "list.txt"):
-    """Длинный список (email-дайджест и т.п.): если влезает в одно сообщение —
-    текстом, иначе — текстом первые строки + полный список файлом. Раньше при
-    >4096 символов Telegram отклонял сообщение, и купивший дайджест не получал ничего."""
-    text = header + "\n\n" + "\n".join(lines)
-    if len(text) <= 3900:
-        await bot.send_message(chat_id, text, parse_mode=None)
-        return
-    await bot.send_message(chat_id, header + "\n\n📎 Full list in the file below.", parse_mode=None)
-    await bot.send_document(chat_id, BufferedInputFile("\n".join(lines).encode("utf-8"), filename=filename))
-
-
-def weekly_emails() -> list[str]:
-    """Уникальные email из вакансий за 7 дней — одна функция и для счётчика,
-    и для демо, и для платной выдачи (раньше счётчик считал «контакты», а не
-    email, и цифра не совпадала с тем, что человек получал)."""
-    return sorted({e.lower() for e in (extract_email(c) for c in db.list_contacts_since(7)) if e})
-
-
 def admin_only(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -932,429 +993,99 @@ def next_digest_slot() -> datetime:
     return (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
 
 
-def _caption_from(text: str, limit: int = 1000) -> str:
-    """Подпись к фото ≤1024 символов, обрезанная ПО ЦЕЛЫМ СТРОКАМ — раньше
-    резали посередине, могли разрезать HTML-тег <b>…</b> или &amp;, и Telegram
-    отказывался публиковать длинную вакансию вообще."""
-    out, size = [], 0
-    for line in text.split("\n"):
-        if size + len(line) + 1 > limit:
-            break
-        out.append(line)
-        size += len(line) + 1
-    return "\n".join(out).rstrip() + "\n…\n\n👇 Full details below"
+async def publish_to_instagram(caption: str):
+    """Публикует фото (баннер) с подписью через Instagram Graph API —
+    двухшаговый процесс: сначала создаём media-контейнер (по публичной
+    ссылке на картинку, см. webapp.py:/assets/banner.jpg), потом публикуем
+    его. Instagram обрезает подпись примерно на 2200 символах — режем сами,
+    чтобы не получить ошибку API вместо понятного обрезания."""
+    if not (INSTAGRAM_ACCESS_TOKEN and INSTAGRAM_BUSINESS_ACCOUNT_ID and WEBAPP_URL):
+        return
+    image_url = f"{WEBAPP_URL.rstrip('/')}/assets/banner.jpg"
+    caption = caption[:2190] + ("…" if len(caption) > 2190 else "")
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        create_resp = await client.post(
+            f"https://graph.facebook.com/v19.0/{INSTAGRAM_BUSINESS_ACCOUNT_ID}/media",
+            params={
+                "image_url": image_url,
+                "caption": caption,
+                "access_token": INSTAGRAM_ACCESS_TOKEN,
+            },
+        )
+        create_data = create_resp.json()
+        creation_id = create_data.get("id")
+        if not creation_id:
+            raise RuntimeError(f"Instagram: не удалось создать media-контейнер: {create_data}")
+
+        publish_resp = await client.post(
+            f"https://graph.facebook.com/v19.0/{INSTAGRAM_BUSINESS_ACCOUNT_ID}/media_publish",
+            params={"creation_id": creation_id, "access_token": INSTAGRAM_ACCESS_TOKEN},
+        )
+        publish_data = publish_resp.json()
+        if not publish_data.get("id"):
+            raise RuntimeError(f"Instagram: не удалось опубликовать: {publish_data}")
 
 
-async def do_publish(bot: Bot, vacancy_id: int) -> bool:
-    """Публикует вакансию в канал. Возвращает False, если она уже опубликована
-    (или публикуется прямо сейчас) — двойной тап по кнопке или кнопка из старого
-    сообщения больше не дают дубль поста в канале."""
-    global _banner_file_id
-    prev_status = db.claim_for_publish(vacancy_id)
-    if prev_status is None:
-        return False
+async def cross_post_vacancy(bot: Bot, text: str):
+    """Дублирует уже опубликованную в Telegram вакансию в Instagram — сбой
+    не должен выглядеть как сбой основной публикации."""
     try:
-        row = db.get_vacancy(vacancy_id)
-        fields = dict(row)
-        text = render_template(fields)
-        CAPTION_LIMIT = 1024
-        sent = None
-        try:
-            photo = _banner_file_id or FSInputFile(BANNER_PATH)
-            if len(text) <= CAPTION_LIMIT:
-                sent = await bot.send_photo(
-                    chat_id=CHANNEL_ID, photo=photo, caption=text,
-                    reply_markup=channel_keyboard(vacancy_id),
-                )
-            else:
-                # подпись к фото ограничена 1024 символами — короткая версия на
-                # баннере, полный текст с кнопками вторым сообщением следом
-                sent = await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=_caption_from(text))
-                try:
-                    await bot.send_message(
-                        chat_id=CHANNEL_ID, text=text,
-                        reply_markup=channel_keyboard(vacancy_id),
-                    )
-                except Exception as e2:
-                    # баннер уже в канале — НЕ откатываем статус (иначе повторная
-                    # публикация продублирует фото). Помечаем опубликованной и
-                    # просим админа дослать полный текст вручную.
-                    print(f"[do_publish] фото ушло, но текст #{vacancy_id} не отправился: {type(e2).__name__}: {e2}")
-                    db.set_status(vacancy_id, "published", sent.message_id)
-                    await _ingest_notify(
-                        bot,
-                        f"⚠️ Вакансия #{vacancy_id}: баннер в канал ушёл, а полный текст — нет "
-                        f"({html.escape(str(e2))[:200]}). Фото НЕ дублируем. Текст для ручной публикации:\n\n{text}",
-                    )
-                    if not _banner_file_id and getattr(sent, "photo", None):
-                        _banner_file_id = sent.photo[-1].file_id
-                    asyncio.create_task(_after_publish(bot, vacancy_id, fields))
-                    return True
-        except Exception as e:
-            if sent is not None:
-                raise  # фото уже ушло — не дублируем пост текстом
-            # баннер не отправился (нет файла, сбой загрузки) — публикуем без картинки,
-            # чтобы вакансия всё равно вышла
-            print(f"[do_publish] баннер не отправился, публикую текстом: {type(e).__name__}: {e}")
-            sent = await bot.send_message(chat_id=CHANNEL_ID, text=text,
-                                          reply_markup=channel_keyboard(vacancy_id))
+        await publish_to_instagram(text)
+    except Exception as e:
+        print(f"[cross_post_vacancy] Instagram: {e}")
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, f"⚠️ Не удалось опубликовать вакансию в Instagram: {e}")
+            except TelegramAPIError:
+                pass
+
+
+async def do_publish(bot: Bot, vacancy_id: int):
+    global _banner_file_id
+    row = db.get_vacancy(vacancy_id)
+    fields = dict(row)
+    text = render_template(fields)
+
+    photo = _banner_file_id or FSInputFile(BANNER_PATH)
+    CAPTION_LIMIT = 1024
+    if len(text) <= CAPTION_LIMIT:
+        sent = await bot.send_photo(
+            chat_id=CHANNEL_ID, photo=photo, caption=text,
+            reply_markup=channel_keyboard(vacancy_id),
+        )
         db.set_status(vacancy_id, "published", sent.message_id)
-    except Exception:
-        db.set_status(vacancy_id, prev_status)  # вернуть как было — можно нажать ещё раз
-        raise
-    if not _banner_file_id and getattr(sent, "photo", None):
+    else:
+        # подпись к фото у Telegram ограничена 1024 символами — обрезаем её
+        # с пометкой, а полный текст со всеми деталями шлём вторым обычным
+        # сообщением сразу следом, туда же переносим кнопки
+        caption = text[:1000].rstrip() + "…\n\n👇 Full details below"
+        sent = await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=caption)
+        await bot.send_message(
+            chat_id=CHANNEL_ID, text=text,
+            reply_markup=channel_keyboard(vacancy_id),
+        )
+        db.set_status(vacancy_id, "published", sent.message_id)
+    if not _banner_file_id and sent.photo:
         _banner_file_id = sent.photo[-1].file_id  # кэшируем на все следующие публикации в этом процессе
 
-    # пост в канале уже вышел — рассылка подписчикам и email-отклики идут в фоне
-    asyncio.create_task(_after_publish(bot, vacancy_id, fields))
-    return True
+    # дублируем в Instagram — та же изоляция через try/except внутри
+    # cross_post_vacancy, публикация в Telegram уже состоялась и не зависит
+    # от результата этого шага
+    await cross_post_vacancy(bot, text)
 
-
-async def _after_publish(bot: Bot, vacancy_id: int, fields: dict):
+    # публикация в канал уже состоялась и подтверждена выше — рассылка
+    # подписчикам оборачивается отдельно, чтобы её сбой ни в коем случае
+    # не выглядел как ошибка самой публикации
     try:
         await notify_subscribers(bot, vacancy_id, fields)
     except Exception as e:
         print(f"[do_publish] Рассылка подписчикам не удалась (публикация в канал прошла успешно): {e}")
-    try:
-        await email_apply.propose_for_vacancy(bot, vacancy_id)
-    except Exception as e:
-        print(f"[do_publish] Черновики email-откликов не созданы: {e}")
-
-
-# ---------------------------------------------------------------- защита: антифлуд и журнал действий админов
-
-FLOOD_LIMIT = int(os.getenv("FLOOD_LIMIT", "25"))        # действий (сообщений/кнопок) …
-FLOOD_WINDOW = int(os.getenv("FLOOD_WINDOW", "30"))      # … за столько секунд
-FLOOD_MUTE = int(os.getenv("FLOOD_MUTE", "300"))         # игнорировать флудера столько секунд
-_flood_hits: dict[int, list[float]] = {}
-_flood_muted: dict[int, float] = {}
-_flood_strikes: dict[int, list[float]] = {}
-
-
-class AntiFloodMiddleware:
-    """Ограничивает частоту действий НЕ-админов: бот-спамер или человек, жмущий
-    кнопки сотни раз, на время перестаёт получать ответы (бот при этом не
-    тормозит для остальных). Админов не трогает. Повторные флуды — сигнал админу."""
-
-    async def __call__(self, handler, event, data):
-        user = getattr(event, "from_user", None)
-        if user is None or admin_only(user.id) or getattr(event, "successful_payment", None):
-            return await handler(event, data)  # оплату пропускаем всегда, даже флудеру
-        uid, now = user.id, time.monotonic()
-        if _flood_muted.get(uid, 0) > now:
-            if isinstance(event, CallbackQuery):
-                try:
-                    await event.answer()
-                except Exception:
-                    pass
-            return None
-        hits = [t for t in _flood_hits.get(uid, []) if now - t < FLOOD_WINDOW]
-        hits.append(now)
-        _flood_hits[uid] = hits
-        if len(hits) > FLOOD_LIMIT:
-            _flood_muted[uid] = now + FLOOD_MUTE
-            _flood_hits[uid] = []
-            strikes = [t for t in _flood_strikes.get(uid, []) if now - t < 3600] + [now]
-            _flood_strikes[uid] = strikes
-            bot = data.get("bot")
-            try:
-                if isinstance(event, Message):
-                    await event.answer("⏳ Too many requests. Please wait a few minutes.")
-                if bot and len(strikes) >= 3:
-                    handle = f"@{user.username}" if user.username else f"id{uid}"
-                    for admin_id in ADMIN_IDS:
-                        await bot.send_message(admin_id, f"🛡 Подозрительная активность: {handle} флудит боту "
-                                                         f"({len(strikes)} раза за час). Заблокировать: /blockuser {handle}")
-            except Exception:
-                pass
-            return None
-        if len(_flood_hits) > 20000:  # чистка памяти
-            for k in [k for k, v in _flood_hits.items() if not v or now - v[-1] > FLOOD_WINDOW]:
-                _flood_hits.pop(k, None)
-        return await handler(event, data)
-
-
-# команды, о которых сообщаем ВСЕМ админам: если чей-то аккаунт админа угонят,
-# вы сразу увидите, что от его имени раздают доступ или делают рассылку
-SENSITIVE_ADMIN_COMMANDS = ("/grant", "/revoke", "/refund", "/extendall", "/unlockall", "/revokeallpositions",
-                            "/broadcast", "/blockuser", "/unblockuser", "/autopublish", "/backup", "/removead",
-                            "/lockdown")
-
-
-class AdminAuditMiddleware:
-    async def __call__(self, handler, event, data):
-        text = getattr(event, "text", None) or ""
-        user = getattr(event, "from_user", None)
-        if user and text.startswith("/") and admin_only(user.id):
-            cmd = text.split()[0].split("@")[0].lower()
-            if cmd in SENSITIVE_ADMIN_COMMANDS:
-                try:
-                    db.log_admin_action(user.id, text[:300])
-                    bot = data.get("bot")
-                    who = f"@{user.username}" if user.username else f"id{user.id}"
-                    for admin_id in ADMIN_IDS:
-                        if admin_id != user.id and bot:
-                            await bot.send_message(admin_id, f"🛡 Админ {html.escape(who)} выполнил: "
-                                                             f"<code>{html.escape(text[:200])}</code>")
-                except Exception as e:
-                    print(f"[audit] {e}")
-        return await handler(event, data)
-
-
-@router.message(Command("lockdown"))
-async def cmd_lockdown(message: Message, command: CommandObject):
-    """Аварийный стоп-кран отправки писем. /lockdown on — остановить все письма
-    (отклики и точечные рассылки), /lockdown off — снять. Пост в канал и оплаты
-    это не трогает. На случай, если что-то пошло не так или угнали аккаунт."""
-    if not admin_only(message.from_user.id):
-        return
-    arg = (command.args or "").strip().lower()
-    if arg not in ("on", "off"):
-        cur = db.get_setting("email_lockdown", "off")
-        state = "🔴 ОСТАНОВЛЕНА" if cur == "on" else "🟢 работает"
-        await message.answer(
-            f"Сейчас отправка писем: <b>{state}</b>.\n\n"
-            "/lockdown on — аварийно остановить все письма\n"
-            "/lockdown off — снять блокировку"
-        )
-        return
-    db.set_setting("email_lockdown", arg)
-    if arg == "on":
-        await message.answer("🔴 Отправка всех писем ОСТАНОВЛЕНА. Отклики и точечные рассылки не уходят. "
-                             "Запланированные адреса не теряются. Снять: /lockdown off")
-    else:
-        await message.answer("🟢 Отправка писем возобновлена.")
-
-
-@router.message(Command("adminlog"))
-async def cmd_admin_log(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    rows = db.get_admin_log(30)
-    if not rows:
-        await message.answer("Журнал действий админов пуст.")
-        return
-    lines = ["🛡 <b>Последние важные действия админов</b>\n"]
-    lines += [f"{r['created_at'][5:16].replace('T', ' ')} · id{r['admin_id']}: "
-              f"<code>{html.escape(r['action'][:120])}</code>" for r in rows]
-    await message.answer("\n".join(lines))
-
-
-@router.my_chat_member()
-async def on_bot_added_somewhere(event):
-    """Бота добавили в чужую группу — сразу выходим (защита от спама через группы
-    и от того, чтобы кто-то использовал бота у себя)."""
-    try:
-        chat = event.chat
-        new_status = event.new_chat_member.status
-        if chat.type in ("group", "supergroup") and new_status in ("member", "administrator"):
-            adder = event.from_user.id if event.from_user else None
-            if not (adder and admin_only(adder)):
-                await event.bot.leave_chat(chat.id)
-                print(f"[security] вышел из чужой группы {chat.id} ({chat.title})")
-    except Exception as e:
-        print(f"[security] my_chat_member: {e}")
-
-
-# ---------------------------------------------------------------- инструкция для админов (по кнопкам)
-# Видна ТОЛЬКО админам: команда /admin, кнопка в /start админа. Обычные
-# пользователи ни команду, ни кнопки не видят (admin_only на каждом шаге).
-
-ADMIN_HELP = {
-    "pub": ("📢 Публикация вакансий",
-        "<b>Как выложить вакансию</b>\n"
-        "1. Пришлите боту текст вакансии в любом формате. Можно несколько сразу через <code>---</code>, "
-        "скриншот с подписью или пересланный пост.\n"
-        "2. Бот разберёт текст и покажет черновик с кнопками:\n"
-        "• <b>Опубликовать сейчас</b> — пост уходит в канал;\n"
-        "• <b>В очередь</b> — выберите задержку 1–8 ч, пост выйдет сам;\n"
-        "• <b>✏️ Исправить</b> — пришлите исправленный текст с теми же метками (🚢 Vessel:, 🌍 Region: …), "
-        "бот запомнит и в следующий раз разберёт точнее;\n"
-        "• <b>Отмена</b> — черновик удаляется.\n"
-        "3. Если похожая вакансия уже была, бот предупредит: «Всё равно опубликовать».\n\n"
-        "<b>Что происходит после публикации</b>\n"
-        "• вакансия уходит в личку подписчикам этой должности;\n"
-        "• если в ней есть email — клиентам с подходящей должностью готовятся отклики (раздел «Отклики»).\n\n"
-        "<b>Команды</b>\n"
-        "/autopublish on|off — публиковать без подтверждения\n"
-        "/stats — сводка за сегодня, /stats 7 — за 7 дней\n"
-        "/testchannel — проверить, может ли бот писать в канал\n"
-        "/contacts — все email/агентства из вакансий"),
-    "subs": ("👥 Подписчики и оплаты",
-        "<b>Как это устроено</b>\n"
-        "Кандидат жмёт «Get More Offers» → выбирает язык → получает 30 дней бесплатно → выбирает до 2 должностей. "
-        "После «Готово» выбор фиксируется до следующей оплаты. Дальше — оплата картой (Stripe).\n\n"
-        "<b>Смотреть</b>\n"
-        "/subscribers — сколько подписчиков и по каким должностям\n"
-        "/subscriberslist — полный список: ник, должности, до какого числа оплачено\n"
-        "/revenue [дней] — доход за период\n\n"
-        "<b>Управлять доступом</b>\n"
-        "/grant @ник 30 — выдать доступ вручную (оплатил не через бота)\n"
-        "/extendall 3 — подарить всем подписчикам 3 дня\n"
-        "/revoke @ник — снять доступ сразу\n"
-        "/refund @ник — вернуть оплату звёздами (карту — в Stripe Dashboard, затем /revoke)\n\n"
-        "<b>Должности подписчика</b>\n"
-        "/unlockpositions @ник — дать человеку перевыбрать должности\n"
-        "/lockpositions @ник — зафиксировать снова\n"
-        "/unlockall — разблокировать выбор всем\n"
-        "/testmatch — проверить, кому уйдёт вакансия по тегу\n\n"
-        "<b>Порядок</b>\n"
-        "/blockuser @ник · /unblockuser @ник — бот перестаёт/начинает отвечать человеку\n\n"
-        "Человек может сам: /mysubscription (сколько дней осталось), /managesubscription (отменить карту)."),
-    "mail": ("📧 Отклики клиентов (CV по email)",
-        "<b>Что это</b>\n"
-        "Ваши клиенты-моряки: бот отправляет их CV с их же почты на email из вакансий канала по их должности.\n\n"
-        "<b>Добавить клиента</b> — /mail → ➕ Добавить клиента:\n"
-        "имя → почта → <b>пароль приложения</b> (для Gmail: 16 символов, нужна двухэтапная проверка) → должности → "
-        "телефон → CV (PDF) → тема → письмо → режим.\n\n"
-        "<b>Режимы</b>\n"
-        "🤖 автоматически — письмо уходит само, вам приходит уведомление;\n"
-        "✋ через кнопку — приходит черновик, отправка по ✅ Send.\n\n"
-        "<b>Карточка клиента</b> (/mail → нажать на имя)\n"
-        "• 🚀 Разослать по базе (1–5 дн.) — CV всем HR из вакансий за последние дни, любые должности;\n"
-        "• 🎯 Разослать точечно — рассылка по вашему файлу с адресами (отдельный раздел);\n"
-        "• 👔 Должности, 📌 Тема, 📄 Письмо, 📎 CV, 🔑 Пароль почты — изменить данные;\n"
-        "• 👁 Как выглядит письмо, 🧪 Тестовое письмо — проверить перед запуском;\n"
-        "• ▶️/⏸ — включить/поставить клиента на паузу; 📜 История — последние письма.\n\n"
-        "<b>Правила</b>: одному HR — не чаще раза в 24 ч, дневной лимит откликов, пауза между письмами, "
-        "письмо каждый раз слегка перефразируется. Ответы работодателей приходят клиенту на почту, "
-        "копия каждого письма — в его «Отправленные»."),
-    "mb": ("🎯 Точечная рассылка по базе",
-        "<b>Запуск</b>\n"
-        "1. /mail → клиент → 🎯 Разослать точечно → пришлите файл .csv или .xlsx с адресами "
-        "(любая раскладка, бот сам найдёт все email и уберёт мусор и дубли).\n"
-        "2. Проверьте первые адреса в ответе бота → выберите дату старта в календаре.\n"
-        "3. Выберите окно времени (например 09:00–18:00) — шлём только в будни.\n"
-        "4. Выберите интервал между письмами — рядом показано, за сколько дней уйдёт вся база.\n\n"
-        "<b>Как бот шлёт</b>\n"
-        "• адреса в случайном порядке, интервал каждый раз ±15%;\n"
-        "• до 350 писем кампании в день и 450 с ящика всего — письма распределяются по окну равномерно;\n"
-        "• на один корпоративный домен — не чаще раза в 20 мин;\n"
-        "• домены без почтового сервера и мусорные адреса пропускаются;\n"
-        "• после окончания окна — «Итог дня»: сколько ушло и сколько осталось.\n\n"
-        "<b>Если что-то пошло не так</b>\n"
-        "• почта не принимает пароль или идут ошибки подряд → кампания на паузе 1 ч, потом продолжит сама;\n"
-        "• почта упёрлась в дневной лимит → ящик на паузе 24 ч, письма не теряются;\n"
-        "• «такого адреса нет» / возврат «не доставлено» → адрес помечается 📭, в точечных рассылках "
-        "на него больше не шлём (отклики на вакансии это не трогает).\n\n"
-        "<b>Команды</b>\n"
-        "/mbcheck ID — сколько ушло, что не дошло, темп и прогноз\n"
-        "/mbstop ID — остановить · /mbresume ID — возобновить с теми же настройками\n"
-        "/bounces — недоставленные адреса · /bounces ID — проверить ящик клиента прямо сейчас\n\n"
-        "ID клиента — в /mail, в карточке клиента."),
-    "tg": ("📣 Реклама и сообщения в Telegram",
-        "<b>Реклама в канале</b>\n"
-        "/ad — следующий ваш текст выйдет в канал рекламным постом с кнопкой «Консультация» "
-        "(сначала покажу превью)\n"
-        "/addad 18:00 Текст — ставить рекламу каждый день в это время\n"
-        "/listads — список · /removead ID — удалить\n\n"
-        "<b>Сообщения пользователям бота</b>\n"
-        "/broadcast Текст — всем, кто пользовался ботом\n"
-        "/broadcast @ник Текст — одному человеку\n"
-        "Перед отправкой всегда показываю превью с кнопками «Отправить / Отмена».\n\n"
-        "<b>Платный email-дайджест</b>\n"
-        "/getemails — так его видят пользователи (покупка картой). Вам при /start приходит список email за неделю бесплатно."),
-    "srv": ("🛠 Обслуживание",
-        "/health — состояние бота одной командой: база на Volume или нет, очередь, рассылки, ящики на паузе\n"
-        "/backup — копия базы файлом прямо сейчас (ночной автобэкап выключен; включить — BACKUP_HOUR)\n"
-        "/testchannel — доступ бота к каналу\n"
-        "/search — мини-приложение с поиском вакансий · /applications — отклики из мини-приложения\n"
-        "/adminlog — журнал важных действий админов (выдача доступа, возвраты, рассылки)\n"
-        "/lockdown on|off — аварийно остановить/возобновить ВСЕ письма\n\n"
-        "<b>Защита</b>: кто шлёт боту слишком много запросов — бот на 5 мин перестаёт ему отвечать, "
-        "при повторах вам придёт предупреждение. В чужие группы бот не заходит. О важных командах "
-        "одного админа (/grant, /refund, /broadcast…) сразу узнают остальные.\n\n"
-        "<b>Если бот «молчит» после обновления</b>\n"
-        "1. Railway → сервис → Deployments: последний деплой зелёный?\n"
-        "2. /health — строка «База»: должно быть «✅ на Volume».\n"
-        "3. /testchannel — у бота есть право публиковать в канале?"),
-}
-NO_PREVIEW_OPTS = LinkPreviewOptions(is_disabled=True)
-ADMIN_HELP_ORDER = ["pub", "subs", "mail", "mb", "tg", "srv"]
-
-
-def admin_menu_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    for i in range(0, len(ADMIN_HELP_ORDER), 2):
-        rows.append([InlineKeyboardButton(text=ADMIN_HELP[k][0], callback_data=f"ahelp:{k}")
-                     for k in ADMIN_HELP_ORDER[i:i + 2]])
-    rows.append([InlineKeyboardButton(text="🩺 Состояние", callback_data="aquick:health"),
-                 InlineKeyboardButton(text="📊 Статистика", callback_data="aquick:stats"),
-                 InlineKeyboardButton(text="📧 Клиенты", callback_data="aquick:mail")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-ADMIN_MENU_TEXT = ("📖 <b>Меню администратора</b>\n\n"
-                   "Чтобы выложить вакансию — просто пришлите её текст боту.\n"
-                   "Ниже — инструкция по каждому разделу и быстрые кнопки. Это меню видят только админы.")
-
-
-@router.message(Command("admin", "help"))
-async def cmd_admin_menu(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    await message.answer(ADMIN_MENU_TEXT, reply_markup=admin_menu_keyboard())
-
-
-@router.callback_query(F.data.startswith("ahelp:"))
-async def cb_admin_help(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        await callback.answer()
-        return
-    key = callback.data.split(":", 1)[1]
-    if key == "home" or key not in ADMIN_HELP:
-        text, kb = ADMIN_MENU_TEXT, admin_menu_keyboard()
-    else:
-        title, body = ADMIN_HELP[key]
-        text = f"<b>{title}</b>\n\n{body}"
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="ahelp:home")]])
-    try:
-        await callback.message.edit_text(text, reply_markup=kb, link_preview_options=NO_PREVIEW_OPTS)
-    except TelegramAPIError:
-        await callback.message.answer(text, reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("aquick:"))
-async def cb_admin_quick(callback: CallbackQuery, state: FSMContext):
-    if not admin_only(callback.from_user.id):
-        await callback.answer()
-        return
-    action = callback.data.split(":", 1)[1]
-    await callback.answer()
-    msg = callback.message
-    if action == "health":
-        fake = _AdminMsgProxy(msg, callback.from_user)
-        await cmd_health(fake)
-    elif action == "stats":
-        fake = _AdminMsgProxy(msg, callback.from_user)
-        await cmd_stats(fake, SimpleNamespace(args=None))
-    elif action == "mail":
-        await state.clear()
-        text, kb = email_apply.home_view()
-        await msg.answer(text, reply_markup=kb)
-
-
-class _AdminMsgProxy:
-    """Позволяет вызвать обработчик команды (/health, /stats) из кнопки:
-    подставляет того, кто нажал, вместо автора исходного сообщения бота."""
-
-    def __init__(self, msg: Message, user):
-        self._msg = msg
-        self.from_user = user
-        self.chat = msg.chat
-        self.bot = msg.bot
-
-    async def answer(self, *args, **kwargs):
-        return await self._msg.answer(*args, **kwargs)
-
-    def __getattr__(self, item):
-        return getattr(self._msg, item)
 
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
-    if command.args and command.args.startswith("apply_") and command.args[6:].isdigit():
+    if command.args and command.args.startswith("apply_"):
         vacancy_id = int(command.args.replace("apply_", ""))
         db.increment_clicks(vacancy_id)
         row = db.get_vacancy(vacancy_id)
@@ -1394,17 +1125,52 @@ async def cmd_start(message: Message, command: CommandObject):
     if admin_only(message.from_user.id):
         mode = "включена" if is_auto_publish() else "выключена"
         await message.answer(
-            ADMIN_MENU_TEXT + f"\n\nАвтопубликация сейчас: <b>{mode}</b> (/autopublish on|off).",
-            reply_markup=admin_menu_keyboard(),
+            "Пришлите текст вакансии в любом формате (или пачку через ---).\n"
+            "Команды:\n"
+            "/stats — сводка за сегодня (/stats 7 — за 7 дней)\n"
+            "/contacts — список email/агентств из сохранённых вакансий\n"
+            "/testchannel — проверить доступ бота к каналу\n"
+            "/ad — опубликовать рекламный пост с кнопкой «Консультация»\n"
+            "/linkedin — раздел «Вакансии из LinkedIn» (сводка, список, модерация)\n"
+            "/search — открыть поиск вакансий с фильтрами (мини-приложение)\n"
+            "/applications — последние отклики через мини-приложение\n"
+            "/subscribe — команда для кандидатов: подписка на вакансии по должности "
+            "(доступна любому, не только вам)\n"
+            "/subscribers — сколько людей подписалось и разбивка по должностям\n"
+            "/subscriberslist — полный список подписчиков (ник, должности, статус оплаты)\n"
+            "/getemails — платный email-дайджест за неделю (доступна любому, не только вам)\n"
+            "/uploadcv — загрузить резюме (доступна любому)\n"
+            "/autoapply — статус/покупка автоотклика (доступна любому)\n"
+
+            "/managesubscription — управление/отмена подписки картой (доступна любому)\n"
+            "/mysubscription — сколько дней осталось + кнопка продлить (доступна любому)\n"
+            "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не через Stars\n"
+            "/extendall [дней] — продлить подписку ВСЕМ подписчикам бесплатно (акция)\n"
+            "/broadcast [текст] — всем, кто пользовался ботом; /broadcast @ник [текст] — только ему\n"
+            "/addad ЧЧ:ММ [текст] — запланировать рекламный пост в канал каждый день в это время\n"
+            "/listads — список запланированной рекламы\n"
+            "/removead [id] — удалить рекламу из расписания\n"
+            "/unlockpositions [@ник или id] — разблокировать должности без продления подписки\n"
+            "/lockpositions [@ник или id] — принудительно зафиксировать выбранные должности\n"
+            "/unlockall — разблокировать должности СРАЗУ ВСЕМ подписчикам\n"
+            "/revokeallpositions — снять должности у ВСЕХ (нужно подтверждение: /revokeallpositions confirm)\n"
+            "/revoke [@ник или id] — отписать вручную, доступ прекращается немедленно\n"
+            "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
+            "/revenue [дней] — доход в Stars за период (по умолчанию 7 дней)\n"
+            "/blockuser [@ник или id] — заблокировать (бот перестанет отвечать)\n"
+            "/unblockuser [@ник или id] — снять блокировку\n"
+            f"/autopublish on|off — автопубликация без подтверждения (сейчас {mode})"
         )
         # email-дайджест за неделю — только тебе, никто другой это не увидит.
         # Обёрнуто в try/except: если тут что-то сломается, это не должно
         # выглядеть как "бот вообще не ответил" — основной текст выше уже ушёл
         try:
-            emails = weekly_emails()
+            contacts = db.list_contacts_since(7)
+            emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
             if emails:
-                await send_long(message.bot, message.chat.id, f"📧 Email за последние 7 дней ({len(emails)}):",
-                                emails, filename="emails_7_days.txt")
+                await message.answer(
+                    f"📧 Email за последние 7 дней ({len(emails)}):\n\n" + "\n".join(emails)
+                )
         except Exception as e:
             await message.answer(f"⚠️ Не удалось собрать email-дайджест: {e}")
         return
@@ -1448,10 +1214,10 @@ def payment_keyboard(lang: str | None = None, tg_id: int | None = None) -> Inlin
         # client_reference_id — единственный способ Stripe сообщить вебхуком,
         # какому именно tg_id принадлежит платёж
         stripe_url = f"{STRIPE_PAYMENT_LINK}?client_reference_id={tg_id}"
-        rows.append([InlineKeyboardButton(text=t(lang, "pay_button_sub", price=SUBSCRIPTION_PRICE_EUR), url=stripe_url)])
+        rows.append([InlineKeyboardButton(text=t(lang, "pay_button_card"), url=stripe_url)])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
-    rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
+    rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1472,7 +1238,7 @@ async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit:
         else:
             # триал уже был использован (или истекла платная подписка) —
             # теперь показываем настоящий экран оплаты
-            text = t(lang, "pay_intro", price=SUBSCRIPTION_PRICE_EUR)
+            text = t(lang, "pay_intro", price=SUBSCRIPTION_PRICE_STARS)
             markup = payment_keyboard(lang, tg_id)
     elif db.is_positions_locked(tg_id):
         selected = db.get_subscriber_positions(tg_id)
@@ -1487,6 +1253,30 @@ async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit:
         await target.edit_text(text, reply_markup=markup)
     else:
         await target.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("pay_sub:"))
+async def cb_pay_subscription(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
+    if db.is_blocked(tg_id):
+        await callback.answer()
+        return
+    _, days_str, price_str = callback.data.split(":")
+    days, price = int(days_str), int(price_str)
+    await callback.bot.send_invoice(
+        chat_id=tg_id,
+        title=f"OffshoreAtSea — Job Alerts ({days} days)",
+        description=f"Instant vacancy alerts for the positions you choose, "
+                     f"{days} days of access.",
+        payload=f"subscription_{tg_id}_{days}_{price}",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"Job Alerts — {days} days", amount=price)],
+        provider_token="",  # для Stars (XTR) provider_token не нужен
+    )
+    await callback.answer()
 
 
 async def send_manage_subscription_link(bot: Bot, tg_id: int, lang: str | None):
@@ -1551,8 +1341,7 @@ def subscription_status_keyboard(lang: str | None, tg_id: int, has_stripe_custom
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
     rows.append([InlineKeyboardButton(text=t(lang, "my_id_button"), callback_data="show_myid")])
-    rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
-    rows.append([InlineKeyboardButton(text=t(lang, "back_button"), callback_data="cand:home")])
+    rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1569,7 +1358,7 @@ async def send_my_subscription(bot: Bot, tg_id: int, lang: str | None):
     else:
         # подписки нет вообще (или истекла) — обычный экран оплаты, там уже
         # есть кнопка Stripe
-        text = t(lang, "pay_intro", price=SUBSCRIPTION_PRICE_EUR)
+        text = t(lang, "pay_intro", price=SUBSCRIPTION_PRICE_STARS)
         await bot.send_message(tg_id, text, reply_markup=payment_keyboard(lang, tg_id))
 
 
@@ -1593,19 +1382,60 @@ async def cb_my_subscription(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data == "cand:home")
-async def cb_candidate_home(callback: CallbackQuery):
-    """Кнопка «⬅️ Меню» у подписчика — возвращает в его главный экран
-    (выбор должностей / сводка подписки / экран оплаты, смотря по статусу)."""
-    tg_id = callback.from_user.id
-    if throttled(tg_id):
-        await callback.answer()
+@router.message(Command("uploadcv"))
+async def cmd_upload_cv(message: Message):
+    tg_id = message.from_user.id
+    if db.is_blocked(tg_id):
         return
     lang = db.get_subscriber_language(tg_id)
-    await show_department_or_paywall(callback.message, tg_id, lang, edit=True)
+    await message.answer(t(lang, "upload_cv_prompt"))
+
+
+@router.message(F.document)
+async def handle_cv_document(message: Message):
+    tg_id = message.from_user.id
+    if admin_only(tg_id) or db.is_blocked(tg_id):
+        return  # у админа документы — это его рабочие дела, не резюме кандидата
+    lang = db.get_subscriber_language(tg_id)
+    doc = message.document
+    db.set_cv(tg_id, doc.file_id, doc.file_name or "CV")
+    await message.answer(t(lang, "cv_saved", filename=doc.file_name or "CV"))
+
+
+@router.message(Command("autoapply"))
+async def cmd_auto_apply(message: Message):
+    tg_id = message.from_user.id
+    if db.is_blocked(tg_id):
+        return
+    lang = db.get_subscriber_language(tg_id)
+    active = db.is_auto_apply_active(tg_id)
+    has_cv = db.get_cv(tg_id) is not None
+
+    rows = []
+    if STRIPE_AUTOAPPLY_PAYMENT_LINK:
+        stripe_url = f"{STRIPE_AUTOAPPLY_PAYMENT_LINK}?client_reference_id=autoapply_{tg_id}"
+        rows.append([InlineKeyboardButton(text=t(lang, "auto_apply_buy_button"), url=stripe_url)])
+    if not has_cv:
+        rows.append([InlineKeyboardButton(text=t(lang, "upload_cv_button"), callback_data="prompt_cv")])
+    rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
+
+    if active:
+        text = t(lang, "auto_apply_active", cv_status=t(lang, "cv_yes" if has_cv else "cv_no"))
+    else:
+        text = t(lang, "auto_apply_intro")
+
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data == "prompt_cv")
+async def cb_prompt_cv(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    lang = db.get_subscriber_language(tg_id)
+    await callback.message.answer(t(lang, "upload_cv_prompt"))
     await callback.answer()
 
 
+@router.message(Command("getemails"))
 def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=t(lang, "digest_count_button"), callback_data="digest_count")],
@@ -1616,10 +1446,9 @@ def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> Inline
         # отличает разовую покупку дайджеста от продления подписки
         stripe_url = f"{STRIPE_DIGEST_PAYMENT_LINK}?client_reference_id=digest_{tg_id}"
         rows.append([InlineKeyboardButton(text=t(lang, "pay_button_card"), url=stripe_url)])
-    rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
+    rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
     if tg_id:
         rows.append([InlineKeyboardButton(text=t(lang, "my_subscription_button"), callback_data="show_mysub")])
-    rows.append([InlineKeyboardButton(text=t(lang, "back_button"), callback_data="cand:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1627,7 +1456,7 @@ def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> Inline
 async def cb_digest_count(callback: CallbackQuery):
     tg_id = callback.from_user.id
     lang = db.get_subscriber_language(tg_id)
-    count = len(weekly_emails())
+    count = len(db.list_contacts_since(7))
     await callback.answer(t(lang, "digest_count_text", count=count), show_alert=True)
 
 
@@ -1645,7 +1474,8 @@ async def cb_digest_demo(callback: CallbackQuery):
     if used >= DIGEST_DEMO_FREE_USES:
         await callback.answer(t(lang, "digest_demo_exhausted"), show_alert=True)
         return
-    emails = weekly_emails()
+    contacts = db.list_contacts_since(7)
+    emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
     if not emails:
         await callback.answer(t(lang, "digest_empty"), show_alert=True)
         return
@@ -1659,7 +1489,6 @@ async def cb_digest_demo(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.message(Command("getemails"))
 async def cmd_get_emails(message: Message):
     # доступно всем, не только тебе — это платный продукт для кандидатов/
     # других крюингов, отдельный от основной подписки на вакансии
@@ -1690,30 +1519,42 @@ async def cb_show_digest(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "pay_digest")
+async def cb_pay_digest(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    if throttled(tg_id):
+        await callback.answer()
+        return
+    if db.is_blocked(tg_id):
+        await callback.answer()
+        return
+    await callback.bot.send_invoice(
+        chat_id=tg_id,
+        title="OffshoreAtSea — Weekly Email Digest",
+        description="All contact emails from vacancies posted in the channel over the last 7 days.",
+        payload=f"digest_{tg_id}",
+        currency="XTR",
+        prices=[LabeledPrice(label="Weekly Email Digest", amount=EMAIL_DIGEST_PRICE_STARS)],
+        provider_token="",
+    )
+    await callback.answer()
+
+
 async def deliver_email_digest(bot: Bot, tg_id: int, charge_id: str,
                                 amount=None, currency: str = "XTR", provider: str = "stars"):
     """Общая точка доставки купленного дайджеста — используется и для оплаты
     звёздами, и для Stripe."""
     amount = amount if amount is not None else EMAIL_DIGEST_PRICE_STARS
-    if charge_id and db.payment_exists(charge_id):
-        print(f"[deliver_email_digest] платёж {charge_id} уже обработан — повтор от Stripe/Telegram пропущен")
-        return
     db.insert_payment(tg_id, amount, 0, charge_id, provider=provider, currency=currency)
     lang = db.get_subscriber_language(tg_id)
-    emails = weekly_emails()
-    try:
-        if emails:
-            await send_long(bot, tg_id, t(lang, "digest_delivered", count=len(emails)), emails,
-                            filename="emails_last_7_days.txt")
-        else:
-            await bot.send_message(tg_id, t(lang, "digest_empty"))
-    except TelegramAPIError as e:
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, f"⚠️ Дайджест оплачен, но не доставлен id{tg_id}: "
-                                                 f"{html.escape(str(e))}. Отправьте вручную.")
-            except TelegramAPIError:
-                pass
+    contacts = db.list_contacts_since(7)
+    emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
+    if emails:
+        await bot.send_message(
+            tg_id, t(lang, "digest_delivered", count=len(emails)) + "\n\n" + "\n".join(emails)
+        )
+    else:
+        await bot.send_message(tg_id, t(lang, "digest_empty"))
 
     username_row = db.find_subscriber_by_handle(str(tg_id))
     handle = f"@{username_row['username']}" if username_row and username_row["username"] else f"id{tg_id}"
@@ -1741,11 +1582,6 @@ async def finalize_subscription_payment(bot: Bot, tg_id: int, days: int, amount,
     реферальный бонус, уведомление админу. Должности НЕ разблокируются —
     выбор постоянный, продление лишь продлевает доступ по уже выбранным
     должностям (см. permanent lock, cb_subscribe_done)."""
-    if charge_id and db.payment_exists(charge_id):
-        # Stripe повторяет вебхук, если ответ задержался, — без этой проверки
-        # одна оплата продлевала подписку дважды (и дважды давала реф. бонус)
-        print(f"[finalize_subscription_payment] платёж {charge_id} уже обработан — повтор пропущен")
-        return
     is_first_payment = db.count_payments(tg_id) == 0
     db.insert_payment(tg_id, amount, days, charge_id, provider=provider, currency=currency)
     new_until = db.extend_subscription(tg_id, days)
@@ -1809,12 +1645,6 @@ async def process_successful_payment(message: Message):
         days, price = int(days_str), int(price_str)
     except (ValueError, AttributeError):
         days, price = SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS
-    # сверяем с реально оплаченной суммой: дни выдаём пропорционально оплате,
-    # не больше, чем по текущему тарифу
-    paid = sp.total_amount or 0
-    fair_days = SUBSCRIPTION_DAYS * paid // max(SUBSCRIPTION_PRICE_STARS, 1)
-    days = max(1, min(days, fair_days))
-    price = paid
 
     await finalize_subscription_payment(
         message.bot, tg_id, days, price, "XTR", sp.telegram_payment_charge_id,
@@ -1889,6 +1719,24 @@ async def handle_stripe_unmatched_payment(bot: Bot, ref: str, amount: float, cur
             )
         except TelegramAPIError:
             pass
+
+
+async def handle_stripe_autoapply_paid(bot: Bot, tg_id: int, amount: float, currency: str, charge_id: str):
+    """Оплата надстройки "Автоотклик" — продлеваем/включаем, записываем
+    платёж, сообщаем кандидату (напоминаем загрузить резюме, если ещё не
+    загрузил — без него автоотклик не сработает)."""
+    db.insert_payment(tg_id, amount, AUTO_APPLY_DAYS, charge_id, provider="stripe", currency=currency)
+    new_until = db.extend_auto_apply(tg_id, AUTO_APPLY_DAYS)
+    lang = db.get_subscriber_language(tg_id)
+    until_str = datetime.fromisoformat(new_until).strftime("%d.%m.%Y")
+    has_cv = db.get_cv(tg_id) is not None
+    try:
+        if has_cv:
+            await bot.send_message(tg_id, t(lang, "auto_apply_activated", until=until_str))
+        else:
+            await bot.send_message(tg_id, t(lang, "auto_apply_activated_no_cv", until=until_str))
+    except TelegramAPIError:
+        pass
 
 
 async def handle_stripe_digest_paid(bot: Bot, tg_id: int, amount: float, currency: str, charge_id: str):
@@ -2116,9 +1964,10 @@ def after_subscribe_keyboard(lang: str | None = None, tg_id: int | None = None) 
     # должности зафиксированы после "Готово" — кнопки на их смену больше нет,
     # это осознанное решение (см. cb_subscribe_done); язык менять можно всегда
     rows = []
-    rows.append([InlineKeyboardButton(text=features.L(lang, "btn_contract"), callback_data="feat:contract"),
-                 InlineKeyboardButton(text=features.L(lang, "btn_docs"), callback_data="feat:docs")])
-    rows.append([InlineKeyboardButton(text=features.L(lang, "btn_news"), callback_data="feat:news")])
+    if tg_id:
+        ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{tg_id}"
+        share_url = f"https://t.me/share/url?url={ref_link}&text=" + t(lang, "referral_share_text")
+        rows.append([InlineKeyboardButton(text=t(lang, "invite_friend"), url=share_url)])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
@@ -2138,28 +1987,21 @@ def consult_keyboard() -> InlineKeyboardMarkup:
 async def handle_vacancy_text(message: Message):
     if not admin_only(message.from_user.id):
         return
-    await process_vacancy_text(message, message.text)
 
-
-# вакансия, присланная КАРТИНКОЙ с подписью (или пересланный пост с фото) —
-# раньше бот такие сообщения молча игнорировал
-@router.message(F.caption & ~F.caption.startswith("/") & (F.photo | F.forward_origin))
-async def handle_vacancy_caption(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    await process_vacancy_text(message, message.caption)
-
-
-async def process_vacancy_text(message: Message, raw: str):
     user_id = message.from_user.id
+
+    # режим «Удалить по номерам» в разделе LinkedIn
+    if pending_li_delete.pop(user_id, False):
+        await li_delete_by_numbers(message)
+        return
 
     # режим исправления — админ прислал текст с правильными полями
     # взамен того, что бот разобрал неверно
     if user_id in pending_corrections:
         vacancy_id = pending_corrections.pop(user_id)
         row = db.get_vacancy(vacancy_id)
-        corrected_fields = parse_template_text_to_fields(raw)
-        db.insert_correction((row["raw_text"] if row else "") or "", json.dumps(corrected_fields, ensure_ascii=False))
+        corrected_fields = parse_template_text_to_fields(message.text)
+        db.insert_correction(row["raw_text"] or "", json.dumps(corrected_fields, ensure_ascii=False))
         await message.answer(
             "Спасибо, запомнил. На похожих вакансиях в следующий раз буду разбирать точнее."
         )
@@ -2171,25 +2013,20 @@ async def process_vacancy_text(message: Message, raw: str):
         global _ad_counter
         _ad_counter += 1
         ad_id = _ad_counter
-        # html_text сохраняет форматирование админа и экранирует «<», «&» —
-        # иначе такой символ в рекламе ломал публикацию
-        ad_drafts[ad_id] = message.html_text if message.text else html.escape(raw, quote=False)
+        ad_drafts[ad_id] = message.text
         await message.answer(
-            ad_drafts[ad_id] + "\n\n<i>Опубликовать этот рекламный пост?</i>",
+            message.text + "\n\n<i>Опубликовать этот рекламный пост?</i>",
             reply_markup=ad_keyboard(ad_id),
         )
         return
 
     status_msg = await message.answer("Разбираю...")
     auto = is_auto_publish()
-    # разбор через Claude идёт в отдельном потоке: синхронный вызов API занимал
-    # 10–60 сек и на это время замораживал ВЕСЬ бот (кнопки подписчиков,
-    # очередь, вебхук Stripe, точечные рассылки)
-    for fields in await asyncio.to_thread(ai_parse_batch, raw):
+    for fields in ai_parse_batch(message.text):
         key = dedup_key_for(fields)
         dup = db.find_recent_duplicate(key)
 
-        vacancy_id = db.insert_vacancy(fields, key, raw_text=raw)
+        vacancy_id = db.insert_vacancy(fields, key, raw_text=message.text)
         text = render_template(fields)
 
         if dup:
@@ -2205,9 +2042,9 @@ async def process_vacancy_text(message: Message, raw: str):
             try:
                 await do_publish(message.bot, vacancy_id)
                 await message.answer(text + "\n\n✅ Опубликовано автоматически")
-            except Exception as e:
+            except TelegramAPIError as e:
                 await message.answer(
-                    f"❌ Не удалось опубликовать автоматически: {html.escape(str(e))}\n\n{text}",
+                    f"❌ Не удалось опубликовать автоматически: {e}\n\n{text}",
                     reply_markup=draft_keyboard(vacancy_id),
                 )
         else:
@@ -2216,46 +2053,6 @@ async def process_vacancy_text(message: Message, raw: str):
                 reply_markup=draft_keyboard(vacancy_id),
             )
     await status_msg.delete()
-
-
-async def ingest_vacancy(bot: Bot, raw: str, source: str = ""):
-    """Пайплайн для вакансии, пришедшей из канала-источника (ingest.py).
-    Тот же разбор + дедуп + публикация, что и для присланной админом вручную,
-    но карточка уходит админам с пометкой источника. Дубликаты — всегда на
-    ручное подтверждение; остальное — по текущему режиму (авто/модерация)."""
-    src = f" · источник: {html.escape(source)}" if source else ""
-    produced = 0
-    for fields in await asyncio.to_thread(ai_parse_batch, raw):
-        produced += 1
-        key = dedup_key_for(fields)
-        dup = db.find_recent_duplicate(key)
-        vacancy_id = db.insert_vacancy(fields, key, raw_text=raw)
-        text = render_template(fields)
-        if dup:
-            # та же вакансия уже была (в т.ч. из другого источника) — не постим повторно
-            warn = (f"⚠️ Дубликат: такое уже публиковалось {dup['created_at'][:10]} "
-                    f"(id {dup['id']}){src}.\n\n{text}")
-            await _ingest_notify(bot, warn, duplicate_keyboard(vacancy_id))
-            continue
-        if is_auto_publish():
-            try:
-                await do_publish(bot, vacancy_id)
-                await _ingest_notify(bot, f"🤖 Из канала{src}\n\n{text}\n\n✅ Опубликовано автоматически")
-            except Exception as e:
-                await _ingest_notify(bot, f"🤖 Из канала{src}\n\n❌ Не опубликовалось: {html.escape(str(e))}\n\n{text}",
-                                     draft_keyboard(vacancy_id))
-        else:
-            await _ingest_notify(bot, f"🤖 Из канала{src}\n\n{text}\n\n<i>Опубликовать?</i>",
-                                 draft_keyboard(vacancy_id))
-    return produced
-
-
-async def _ingest_notify(bot: Bot, text: str, markup=None):
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, text, reply_markup=markup)
-        except TelegramAPIError:
-            pass
 
 
 @router.message(Command("ad"))
@@ -2305,9 +2102,6 @@ async def cmd_test_match(message: Message, command: CommandObject):
     with_contact = db.get_subscribers_for_tag(tag)
     lines.append(f"\nПолучат вакансию (все, включая с скрытым контактом): {all_matched}")
     lines.append(f"Из них увидят контакт (активна подписка): {with_contact}")
-    family = sorted(ranks.expand([tag]))
-    fam_matched = sorted({t for ft in family for t in db.get_all_subscribers_for_tag_any_status(ft)})
-    lines.append(f"\nС учётом семьи должностей {family}: получат {fam_matched}")
 
     await message.answer("\n".join(lines))
 
@@ -2457,7 +2251,7 @@ async def cmd_add_ad(message: Message, command: CommandObject):
     if not time_part or not text or ":" not in time_part:
         await message.answer(
             "Использование: /addad ЧЧ:ММ Текст поста\n\n"
-            "Например: /addad 18:00 Попробуй бота — уведомления по твоей должности, 30 дней бесплатно!\n\n"
+            "Например: /addad 18:00 Попробуй бота — уведомления по твоей должности, 3 дня бесплатно!\n\n"
             "Постится в канал каждый день в это время."
         )
         return
@@ -2502,32 +2296,8 @@ async def cmd_remove_ad(message: Message, command: CommandObject):
         await message.answer(f"Не нашёл рекламу #{arg}.")
 
 
-# неподтверждённая рассылка админа: (tg_id получателя или None = всем, текст).
-# Храним в памяти, а не в callback_data — там лимит 64 байта
-_pending_broadcasts: dict[int, tuple[int | None, str, str]] = {}
-
-
-def _bcast_keyboard(label: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=label, callback_data="bcast_confirm"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data="bcast_cancel"),
-    ]])
-
-
-async def _bcast_preview(message: Message, preview: str, label: str):
-    try:
-        await message.answer(preview, reply_markup=_bcast_keyboard(label))
-    except TelegramAPIError as e:
-        _pending_broadcasts.pop(message.from_user.id, None)
-        await message.answer(f"❌ Telegram не принял текст (скорее всего, ошибка в HTML-разметке <b> и т.п.): "
-                             f"{str(e)[:200]}", parse_mode=None)
-
-
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: Message, command: CommandObject):
-    """/broadcast Текст — всем, кто пользовался ботом; /broadcast @ник Текст — одному.
-    Перед отправкой показывает превью с кнопками «Отправить / Отмена», чтобы
-    опечатка не улетела мгновенно всей базе."""
     if not admin_only(message.from_user.id):
         return
     raw = (command.args or "").strip()
@@ -2536,13 +2306,13 @@ async def cmd_broadcast(message: Message, command: CommandObject):
             "Использование:\n"
             "/broadcast Текст — всем, кто пользовался ботом\n"
             "/broadcast @ник Текст — только этому человеку\n\n"
-            "Можно писать несколько строк — всё после ника уйдёт как есть. "
-            "Перед отправкой покажу превью."
+            "Можно писать несколько строк — всё после ника уйдёт как есть."
         )
         return
 
     # если первое слово похоже на адресата (@ник или числовой id) и реально
-    # находится в базе — это сообщение одному человеку, а не часть текста
+    # находится в базе — считаем это точечной рассылкой одному человеку,
+    # а не частью текста сообщения
     first_word, _, rest = raw.partition(" ")
     target_row = None
     if first_word.startswith("@") or first_word.isdigit():
@@ -2553,55 +2323,31 @@ async def cmd_broadcast(message: Message, command: CommandObject):
         if not text:
             await message.answer(f"Использование: /broadcast {first_word} Текст сообщения")
             return
-        _pending_broadcasts[message.from_user.id] = (target_row["tg_id"], text, first_word)
-        await _bcast_preview(message, f"Превью сообщения для {first_word}:\n\n{text}", "✅ Отправить")
+        tg_id = target_row["tg_id"]
+        try:
+            await message.bot.send_message(tg_id, text)
+            await message.answer(f"✅ Отправлено {first_word}.")
+        except TelegramAPIError as e:
+            await message.answer(f"❌ Не удалось отправить {first_word}: {e}")
         return
 
+    text = raw
     ids = db.get_all_bot_users()
     if not ids:
         await message.answer("Пока никто не пользовался ботом — рассылать некому.")
         return
-    _pending_broadcasts[message.from_user.id] = (None, raw, "")
-    await _bcast_preview(message, f"Превью сообщения для {len(ids)} пользователей:\n\n{raw}",
-                         f"✅ Отправить всем ({len(ids)})")
 
-
-@router.callback_query(F.data == "bcast_cancel")
-async def cb_broadcast_cancel(callback: CallbackQuery):
-    _pending_broadcasts.pop(callback.from_user.id, None)
-    await callback.message.edit_text("Рассылка отменена.")
-    await callback.answer()
-
-
-@router.callback_query(F.data == "bcast_confirm")
-async def cb_broadcast_confirm(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        await callback.answer()
-        return
-    pending = _pending_broadcasts.pop(callback.from_user.id, None)
-    if not pending:
-        await callback.answer("Текст рассылки не найден — отправьте /broadcast заново.", show_alert=True)
-        return
-    target, text, handle = pending
-    await callback.answer()
-    if target is not None:
-        try:
-            await send_with_retry(callback.bot, target, text)
-            await callback.message.edit_text(f"✅ Отправлено {handle}.")
-        except TelegramAPIError as e:
-            await callback.message.edit_text(f"❌ Не удалось отправить {handle}: {e}")
-        return
-    ids = db.get_all_bot_users()
-    await callback.message.edit_text(f"⏳ Рассылаю сообщение {len(ids)} пользователям...")
+    await message.answer(f"⏳ Рассылаю сообщение {len(ids)} пользователям...")
     sent, failed = 0, 0
     for tg_id in ids:
         try:
-            await send_with_retry(callback.bot, tg_id, text)
+            await message.bot.send_message(tg_id, text)
             sent += 1
         except TelegramAPIError:
             failed += 1
         await asyncio.sleep(0.05)  # не спамим Telegram API пачкой без пауз
-    await callback.message.answer(f"✅ Готово. Разослано: {sent}, не доставлено: {failed} (из {len(ids)}).")
+
+    await message.answer(f"✅ Готово. Разослано: {sent}, не доставлено: {failed} (из {len(ids)}).")
 
 
 @router.message(Command("extendall"))
@@ -2705,15 +2451,9 @@ async def cmd_refund(message: Message, command: CommandObject):
     if not row:
         await message.answer(f"Не нашёл {handle} в базе подписчиков.")
         return
-    # вернуть автоматически можно только Stars; оплату картой возвращают в Stripe Dashboard
-    payment = db.get_last_unrefunded_payment(row["tg_id"], provider="stars")
+    payment = db.get_last_unrefunded_payment(row["tg_id"])
     if not payment:
-        other = db.get_last_unrefunded_payment(row["tg_id"])
-        if other and other["provider"] == "stripe":
-            await message.answer(f"Последняя оплата {handle} — картой (Stripe). Возврат делается в Stripe "
-                                 f"Dashboard → Payments → Refund; доступ снять — /revoke {handle}.")
-        else:
-            await message.answer(f"У {handle} нет платежей звёздами, которые можно вернуть.")
+        await message.answer(f"У {handle} нет неоплаченных возвратом платежей.")
         return
     try:
         await message.bot.refund_star_payment(
@@ -2723,9 +2463,7 @@ async def cmd_refund(message: Message, command: CommandObject):
         await message.answer(f"❌ Не удалось вернуть: {e}")
         return
     db.mark_payment_refunded(payment["id"])
-    db.shorten_subscription(row["tg_id"], payment["days"] or 0)  # деньги вернули — оплаченные дни снимаем
-    await message.answer(f"✅ Возвращено {payment['amount_stars']}⭐ пользователю {handle}, "
-                         f"доступ уменьшен на {payment['days'] or 0} дн.")
+    await message.answer(f"✅ Возвращено {payment['amount_stars']}⭐ пользователю {handle}.")
 
 
 @router.message(Command("revenue"))
@@ -2825,9 +2563,7 @@ async def cb_subscribe_position(callback: CallbackQuery):
         return
 
     await callback.answer(t(lang, "subscribed", tag=position_tag))
-    # та же логика подбора, что и для новых вакансий (ranks.py)
-    backfill = [row for row in db.get_recent_published(days=TRIAL_BACKFILL_DAYS)
-                if ranks.matches([position_tag], dict(row))]
+    backfill = db.get_recent_published_by_tag(position_tag, days=TRIAL_BACKFILL_DAYS)
     # не дублируем то, что этому человеку уже когда-то уходило — актуально
     # при повторной подписке/оплате после отписки, когда он заново проходит
     # тот же выбор должности
@@ -2868,17 +2604,31 @@ async def cb_subscribe_done(callback: CallbackQuery):
     await callback.answer()
 
 
-async def send_with_retry(bot: Bot, chat_id, text: str, **kwargs):
-    """send_message с учётом флуд-контроля Telegram: при массовой отправке
-    Telegram иногда отвечает «подождите N секунд» — раньше такой человек
-    просто молча не получал сообщение. Теперь ждём и пробуем ещё раз."""
-    for attempt in range(3):
+async def try_auto_apply(bot: Bot, tg_id: int, lang: str | None, cv: tuple, contact_email: str, fields: dict):
+    file_id, filename = cv
+    try:
+        file = await bot.get_file(file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, destination=buf)
+        cv_bytes = buf.getvalue()
+
+        position = fields.get("position") or "the position"
+        subject = f"Application for {position}"
+        body = (
+            f"Dear Recruiter,\n\nPlease find attached my CV for the {position} position "
+            f"posted on OffshoreAtSea.\n\nBest regards"
+        )
+        await send_cv_email(contact_email, subject, body, cv_bytes, filename)
+        await bot.send_message(tg_id, t(lang, "auto_apply_sent", email=contact_email))
+    except Exception as e:
+        # автоотклик — это бонус поверх обычного уведомления, которое уже
+        # ушло; сбой здесь не должен выглядеть как сбой всей рассылки
+        print(f"[try_auto_apply] Не удалось отправить резюме tg_id={tg_id} на {contact_email}: {e}")
         try:
-            return await bot.send_message(chat_id, text, **kwargs)
-        except TelegramRetryAfter as e:
-            if attempt == 2:
-                raise
-            await asyncio.sleep(getattr(e, "retry_after", 5) + 1)
+            await bot.send_message(tg_id, t(lang, "auto_apply_failed", email=contact_email))
+        except TelegramAPIError:
+            pass
+
 
 
 async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
@@ -2889,28 +2639,29 @@ async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
     Вызывается ПОСЛЕ успешной публикации в канал и полностью изолирована
     try/except-ом на уровне вызова — сбой рассылки никак не должен влиять
     на основную публикацию, которая на этот момент уже прошла."""
-    # подбор по общим правилам ranks.py: семьи должностей (Master = Master/DPO/SDPO и т.п.)
-    # + синонимы в названии (Mate/OOW = 2nd Officer, Engineer/EOOW = 3rd и 2nd Engineer)
-    tags = ranks.vacancy_tags(fields)
-    if not tags:
+    position_tag = fields.get("position_tag")
+    if not position_tag or position_tag == FALLBACK_TAG:
         return
-    recipients: list[int] = []
-    for tag in sorted(tags):
-        for tg_id in db.get_all_subscribers_for_tag_any_status(tag):
-            if tg_id not in recipients:
-                recipients.append(tg_id)
-    for tg_id in recipients:
-        if db.was_notification_sent(tg_id, vacancy_id) or db.is_blocked(tg_id):
-            continue
+    for tg_id in db.get_all_subscribers_for_tag_any_status(position_tag):
         try:
             lang = db.get_subscriber_language(tg_id)
-            hide_contact = not db.is_subscription_active(tg_id)
-            await send_with_retry(
-                bot, tg_id, render_template(fields, hide_contact=hide_contact, lang=lang),
+            subscription_active = db.is_subscription_active(tg_id)
+            hide_contact = not subscription_active
+            await bot.send_message(
+                tg_id, render_template(fields, hide_contact=hide_contact, lang=lang),
                 reply_markup=channel_keyboard(vacancy_id),
             )
             db.mark_notification_sent(tg_id, vacancy_id)
             await asyncio.sleep(0.1)
+
+            # автоотклик — только если видно контакт (значит подписка активна),
+            # отдельно оплачен автоотклик, есть загруженное резюме и контакт
+            # реально похож на email (на Telegram-хендл резюме не отправишь)
+            if subscription_active and db.is_auto_apply_active(tg_id):
+                cv = db.get_cv(tg_id)
+                contact_email = extract_email(fields.get("contact") or "")
+                if cv and contact_email:
+                    await try_auto_apply(bot, tg_id, lang, cv, contact_email, fields)
         except TelegramAPIError:
             pass
 
@@ -2952,9 +2703,6 @@ async def cmd_applications(message: Message):
 
 @router.callback_query(F.data.startswith("adpub:"))
 async def cb_ad_publish(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        await callback.answer()
-        return
     ad_id = int(callback.data.split(":")[1])
     text = ad_drafts.pop(ad_id, None)
     if not text:
@@ -2967,9 +2715,6 @@ async def cb_ad_publish(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("adcancel:"))
 async def cb_ad_cancel(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        await callback.answer()
-        return
     ad_id = int(callback.data.split(":")[1])
     ad_drafts.pop(ad_id, None)
     await callback.message.edit_text("Отменено")
@@ -2999,35 +2744,23 @@ async def cmd_testchannel(message: Message):
 
 @router.callback_query(F.data.startswith("pub:"))
 async def cb_publish(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        await callback.answer()
-        return
     vacancy_id = int(callback.data.split(":")[1])
     try:
-        published = await do_publish(callback.bot, vacancy_id)
-    except Exception as e:
+        await do_publish(callback.bot, vacancy_id)
+    except TelegramAPIError as e:
         await callback.message.answer(
-            f"❌ Не удалось опубликовать: {html.escape(str(e))}\n\n"
+            f"❌ Не удалось опубликовать: {e}\n\n"
             f"Частая причина — бот не админ канала {CHANNEL_ID} "
             f"или у него нет права «Публикация сообщений»."
         )
         await callback.answer("Ошибка публикации")
         return
-    if not published:
-        await callback.answer("Эта вакансия уже опубликована (или отменена) — повтора не будет.", show_alert=True)
-        return
+    await callback.message.edit_text(callback.message.html_text + "\n\n✅ Опубликовано")
     await callback.answer("Опубликовано в канал")
-    try:
-        await callback.message.edit_text(callback.message.html_text + "\n\n✅ Опубликовано")
-    except TelegramAPIError:
-        await callback.message.edit_reply_markup(reply_markup=None)
 
 
 @router.callback_query(F.data.startswith("queue:"))
 async def cb_queue(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        await callback.answer()
-        return
     vacancy_id = int(callback.data.split(":")[1])
     await callback.message.edit_reply_markup(reply_markup=queue_delay_keyboard(vacancy_id))
     await callback.answer()
@@ -3035,15 +2768,8 @@ async def cb_queue(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("queuedelay:"))
 async def cb_queue_delay(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        await callback.answer()
-        return
     _, vacancy_id_str, hours_str = callback.data.split(":")
     vacancy_id, hours = int(vacancy_id_str), int(hours_str)
-    row = db.get_vacancy(vacancy_id)
-    if not row or row["status"] in ("published", "publishing", "cancelled"):
-        await callback.answer("Вакансия уже опубликована или отменена.", show_alert=True)
-        return
     slot = datetime.now() + timedelta(hours=hours)
     db.set_schedule(vacancy_id, slot.isoformat())
     await callback.message.edit_text(
@@ -3054,9 +2780,6 @@ async def cb_queue_delay(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        await callback.answer()
-        return
     vacancy_id = int(callback.data.split(":")[1])
     db.set_status(vacancy_id, "cancelled")
     await callback.message.edit_text("Отменено")
@@ -3065,9 +2788,6 @@ async def cb_cancel(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("fix:"))
 async def cb_fix(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        await callback.answer()
-        return
     vacancy_id = int(callback.data.split(":")[1])
     pending_corrections[callback.from_user.id] = vacancy_id
     await callback.message.answer(
@@ -3077,167 +2797,407 @@ async def cb_fix(callback: CallbackQuery):
     await callback.answer()
 
 
-BACKUP_HOUR = int(os.getenv("BACKUP_HOUR", "-1"))  # час ночного бэкапа базы админу; -1 — выключён (по умолчанию)
+
+# ======================= Вакансии из LinkedIn =======================
+
+BOT_VERSION = "2026-11-20 v31-linkedin"
+_li_lock = asyncio.Lock()
+_li_phrase_cursor = 0
 
 
-def _make_backup_file() -> tuple[bytes, str]:
-    """Консистентная копия SQLite (через backup API — безопасно при работающем боте)."""
-    import sqlite3
-    import tempfile
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    tmp.close()
-    src = db.get_conn()
-    dst = sqlite3.connect(tmp.name)
+def esc(v) -> str:
+    return htmllib.escape(str(v)) if v else ""
+
+
+def ago(iso: str | None) -> str:
     try:
-        src.backup(dst)
-    finally:
-        dst.close()
-        src.close()
-    with open(tmp.name, "rb") as f:
-        data = f.read()
-    os.unlink(tmp.name)
-    return data, f"offshoreatsea_backup_{datetime.now():%Y-%m-%d_%H%M}.db"
+        sec = (datetime.now() - datetime.fromisoformat(iso)).total_seconds()
+    except Exception:
+        return "—"
+    if sec < 3600:
+        return f"{max(1, int(sec // 60))} мин назад"
+    if sec < 86400:
+        return f"{int(sec // 3600)} ч назад"
+    return f"{int(sec // 86400)} дн назад"
 
 
-async def send_backup(bot: Bot, chat_ids: list[int]):
-    data, name = await asyncio.to_thread(_make_backup_file)
-    if len(data) > 49 * 1024 * 1024:
-        for cid in chat_ids:
-            await bot.send_message(cid, f"⚠️ База {len(data) // 1024 // 1024} МБ — больше лимита Telegram "
-                                        f"(50 МБ), бэкап файлом невозможен.")
-        return
-    for cid in chat_ids:
-        try:
-            await bot.send_document(cid, BufferedInputFile(data, filename=name),
-                                    caption="💾 Резервная копия базы бота (подписчики, оплаты, вакансии, клиенты).")
-        except TelegramAPIError as e:
-            print(f"[backup] не удалось отправить {cid}: {e}")
+def li_flag(key: str, default: str) -> bool:
+    return db.get_setting(key, default) == "on"
 
 
-@router.message(Command("backup"))
-async def cmd_backup(message: Message):
+def li_home_text() -> str:
+    s = db.li_stats()
+    return (
+        "💼 <b>Вакансии из LinkedIn</b>\n\n"
+        f"Всего: <b>{s['total']}</b>  ·  за 24 ч: <b>{s['day']}</b>  ·  за 7 дней: <b>{s['week']}</b>\n"
+        f"✅ Опубликовано: <b>{s['published']}</b>\n"
+        f"🕓 Ждут проверки: <b>{s['pending']}</b>\n"
+        f"🗑 Удалено/отклонено: <b>{s['deleted']}</b>\n"
+        f"📨 Моряков откликнулось: <b>{s['applicants']}</b>"
+    )
+
+
+def li_home_keyboard() -> InlineKeyboardMarkup:
+    notify = li_flag("li_notify", "off")
+    review = li_flag("li_review", "on")
+    auto = li_flag("li_auto", "on")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Список вакансий", callback_data="li:list:0")],
+        [InlineKeyboardButton(text="🔄 Собрать сейчас", callback_data="li:collect")],
+        [InlineKeyboardButton(
+            text=f"🔔 Присылать мне каждую новую: {'ВКЛ' if notify else 'выкл'}",
+            callback_data="li:tog:li_notify")],
+        [InlineKeyboardButton(
+            text=f"🕓 Сначала мне на проверку: {'ВКЛ' if review else 'выкл'}",
+            callback_data="li:tog:li_review")],
+        [InlineKeyboardButton(
+            text=f"⏱ Автосбор по расписанию: {'ВКЛ' if auto else 'выкл'}",
+            callback_data="li:tog:li_auto")],
+        [InlineKeyboardButton(text="🗑 Удалить по номерам", callback_data="li:del")],
+    ])
+
+
+STATUS_ICON = {"published": "✅", "pending_review": "🕓", "deleted": "🗑", "rejected": "🗑"}
+
+
+def li_list_item(r) -> str:
+    icon = STATUS_ICON.get(r["status"], "•")
+    contact = r["contact"] or ""
+    email = extract_email(contact)
+    if email:
+        c = f"✉️ {esc(email)}"
+    elif contact and "linkedin.com" not in contact:
+        c = f"💬 {esc(contact[:60])}"
+    else:
+        c = "💬 —"
+    vessel = esc(r["vessel"]) or "—"
+    link = f'<a href="{esc(r["source_url"])}">пост в LinkedIn</a>' if r["source_url"] else ""
+    return (
+        f"{icon} <b>#{r['id']}</b> · {esc(r['position']) or '—'}\n"
+        f"   🚢 {vessel}\n"
+        f"   {c}  ·  📨 {r['apps']}\n"
+        f"   🔗 {link}  ·  🕒 {ago(r['created_at'])}"
+    )
+
+
+async def li_show_list(callback: CallbackQuery, page: int):
+    per = 8
+    rows, total = db.li_list(page * per, per)
+    if not rows and page > 0:
+        page, (rows, total) = 0, db.li_list(0, per)
+    pages = max(1, (total + per - 1) // per)
+    body = "\n\n".join(li_list_item(r) for r in rows) or "Пока нет ни одной вакансии из LinkedIn."
+    text = f"📋 <b>LinkedIn-вакансии</b> — стр. {page + 1}/{pages} (всего {total})\n\n{body}"
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Новее", callback_data=f"li:list:{page - 1}"))
+    if (page + 1) * per < total:
+        nav.append(InlineKeyboardButton(text="Старше ▶️", callback_data=f"li:list:{page + 1}"))
+    kb = [nav] if nav else []
+    kb.append([InlineKeyboardButton(text="🗑 Удалить по номерам", callback_data="li:del")])
+    kb.append([InlineKeyboardButton(text="⬅️ В раздел", callback_data="li:home")])
+    await callback.message.edit_text(
+        text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        disable_web_page_preview=True,
+    )
+
+
+@router.message(Command("linkedin"))
+async def cmd_linkedin(message: Message):
     if not admin_only(message.from_user.id):
         return
-    await send_backup(message.bot, [message.chat.id])
+    await message.answer(li_home_text(), reply_markup=li_home_keyboard())
 
 
-async def backup_worker(bot: Bot):
-    """Раз в сутки присылает админам копию базы — если Volume на Railway
-    когда-нибудь пропадёт или сломается, подписчики и оплаты не потеряются."""
-    last_day = None
+@router.callback_query(F.data.startswith("li:"))
+async def cb_linkedin(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer()
+        return
+    parts = callback.data.split(":")
+    action = parts[1]
+
+    if action == "home":
+        await callback.message.edit_text(li_home_text(), reply_markup=li_home_keyboard())
+    elif action == "list":
+        await li_show_list(callback, int(parts[2]))
+    elif action == "tog":
+        key = parts[2]
+        if key in ("li_notify", "li_review", "li_auto"):
+            default = {"li_notify": "off", "li_review": "on", "li_auto": "on"}[key]
+            db.set_setting(key, "off" if li_flag(key, default) else "on")
+        await callback.message.edit_text(li_home_text(), reply_markup=li_home_keyboard())
+    elif action == "del":
+        pending_li_delete[callback.from_user.id] = True
+        await callback.message.answer(
+            "Пришлите номера вакансий из списка (после #) через пробел или запятую, "
+            "например: <code>12 15 18</code>. Для отмены напишите «отмена»."
+        )
+    elif action == "collect":
+        if _li_lock.locked():
+            await callback.answer("Сбор уже идёт, подождите", show_alert=True)
+            return
+        await callback.answer("Собираю…")
+        wait = await callback.message.answer("🔄 Собираю посты из LinkedIn, это может занять пару минут…")
+        try:
+            report = await run_linkedin_collect(callback.bot, manual=True)
+        except Exception as e:
+            await wait.edit_text(f"❌ Сбор не удался: {esc(e)}")
+            return
+        await wait.edit_text(report, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💼 Раздел LinkedIn", callback_data="li:home")]
+        ]))
+        return
+    elif action in ("pub", "rej", "rm"):
+        await li_moderate(callback, action, int(parts[2]))
+        return
+    await callback.answer()
+
+
+async def li_remove_vacancy(bot: Bot, row) -> None:
+    """Помечает вакансию удалённой и, если она уже в канале, убирает пост."""
+    if row["status"] == "published" and row["channel_message_id"]:
+        try:
+            await bot.delete_message(CHANNEL_ID, row["channel_message_id"])
+        except TelegramAPIError as e:
+            print(f"[linkedin] не удалось удалить пост из канала: {e}")
+    db.set_status(row["id"], "deleted")
+
+
+async def li_moderate(callback: CallbackQuery, action: str, vacancy_id: int):
+    row = db.get_vacancy(vacancy_id)
+    if not row:
+        await callback.answer("Вакансия не найдена")
+        return
+    if action == "pub":
+        if row["status"] != "pending_review":
+            await callback.answer("Уже обработана")
+            return
+        try:
+            await do_publish(callback.bot, vacancy_id)
+        except TelegramAPIError as e:
+            await callback.message.answer(f"❌ Не удалось опубликовать: {esc(e)}")
+            await callback.answer()
+            return
+        await callback.message.edit_text(
+            callback.message.html_text + "\n\n✅ Опубликовано", disable_web_page_preview=True)
+    elif action == "rej":
+        db.set_status(vacancy_id, "rejected")
+        await callback.message.edit_text(
+            callback.message.html_text + "\n\n❌ Отклонено", disable_web_page_preview=True)
+    elif action == "rm":
+        await li_remove_vacancy(callback.bot, row)
+        await callback.message.edit_text(
+            callback.message.html_text + "\n\n🗑 Удалено", disable_web_page_preview=True)
+    await callback.answer()
+
+
+async def li_delete_by_numbers(message: Message):
+    txt = (message.text or "").strip().lower()
+    if txt in ("отмена", "cancel"):
+        await message.answer("Отменено.")
+        return
+    ids = [int(x) for x in re.findall(r"\d+", txt)]
+    if not ids:
+        await message.answer("Не нашёл номеров. Нажмите «Удалить по номерам» и пришлите их ещё раз.")
+        return
+    rows = db.li_get_many(ids)
+    for r in rows:
+        await li_remove_vacancy(message.bot, r)
+    found = {r["id"] for r in rows}
+    missing = [i for i in ids if i not in found]
+    reply = f"🗑 Удалено: {len(rows)}"
+    if missing:
+        reply += f"\nНе найдены среди LinkedIn-вакансий: {', '.join('#' + str(i) for i in missing)}"
+    await message.answer(reply, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💼 Раздел LinkedIn", callback_data="li:home")]
+    ]))
+
+
+def li_admin_keyboard(vacancy_id: int, url: str, review: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if url:
+        rows.append([InlineKeyboardButton(text="🔗 Пост в LinkedIn", url=url)])
+    if review:
+        rows.append([
+            InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"li:pub:{vacancy_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"li:rej:{vacancy_id}"),
+        ])
+    else:
+        rows.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"li:rm:{vacancy_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def li_process_post(bot: Bot, post: dict, stats: dict):
+    url, text = post["url"], post["text"]
+    if db.li_was_seen(url):
+        stats["seen"] += 1
+        return
+    has_image = bool(post["images"])
+    if has_image:
+        stats["with_image"] += 1
+
+    ok, reason, _info = linkedin.evaluate_post(text, has_image)
+    combined = text
+    if not ok and reason == "need_image":
+        img_text = await linkedin.read_vacancy_image(claude, post["images"])
+        if not img_text:
+            db.li_mark_seen(url, "image_empty")
+            stats["rejected"]["not_offshore"] += 1
+            return
+        combined = (text + "\n\n" + img_text).strip()
+        ok, reason, _info = linkedin.evaluate_post(combined, False)
+        if not ok and reason in ("weak", "not_offshore", "need_image"):
+            # картинка прочитана и это вакансия — доверяем уточнённому ИИ-разбору ниже
+            ok = True
+    if not ok:
+        db.li_mark_seen(url, reason)
+        stats["rejected"][reason if reason in stats["rejected"] else "weak"] += 1
+        return
+
+    # нужны только вакансии с корпоративной почтой: без ссылок и без gmail/yahoo и подобных
+    emails = linkedin.corporate_emails(combined)
+    if not emails:
+        db.li_mark_seen(url, "no_email")
+        stats["rejected"]["no_email"] += 1
+        return
+
+    # разбор и итоговая проверка типа судна — ИИ
+    items = await asyncio.to_thread(ai_parse_batch, combined)
+    review = li_flag("li_review", "on")
+    notify = li_flag("li_notify", "off")
+    made = 0
+    for fields in items:
+        if fields.get("vessel_tag") in MERCHANT_VESSEL_TAGS:
+            stats["ai_dropped"] += 1
+            continue
+        # контакт — только корпоративный email из поста; ссылки из полей убираем
+        ai_emails = linkedin.corporate_emails(fields.get("contact") or "")
+        fields["contact"] = ai_emails[0] if ai_emails else emails[0]
+        for k, v in list(fields.items()):
+            if k in ("contact", "position_tag", "vessel_tag", "hashtags"):
+                continue
+            if isinstance(v, (str, list)):
+                fields[k] = linkedin.strip_urls(v)
+        key = dedup_key_for(fields)
+        if db.find_recent_duplicate(key):
+            stats["duplicates"] += 1
+            continue
+        vacancy_id = db.insert_vacancy(fields, key, raw_text=combined)
+        db.set_vacancy_source(vacancy_id, "linkedin", url)
+        made += 1
+        preview = render_template(fields)
+        if review:
+            db.set_status(vacancy_id, "pending_review")
+            stats["pending"] += 1
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id, f"💼 <b>Новая из LinkedIn #{vacancy_id}</b>\n\n{preview}\n\n"
+                                  "<i>Опубликовать для моряков?</i>",
+                        reply_markup=li_admin_keyboard(vacancy_id, url, True),
+                        disable_web_page_preview=True)
+                except TelegramAPIError:
+                    pass
+        else:
+            try:
+                await do_publish(bot, vacancy_id)
+                stats["published"] += 1
+            except TelegramAPIError as e:
+                print(f"[linkedin] публикация не удалась: {e}")
+                continue
+            if notify:
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await bot.send_message(
+                            admin_id, f"💼 <b>Опубликована из LinkedIn #{vacancy_id}</b>\n\n{preview}",
+                            reply_markup=li_admin_keyboard(vacancy_id, url, False),
+                            disable_web_page_preview=True)
+                    except TelegramAPIError:
+                        pass
+    db.li_mark_seen(url, "accepted" if made else "dropped")
+
+
+async def run_linkedin_collect(bot: Bot, manual: bool = False) -> str:
+    """Один проход: берёт очередную порцию поисковых фраз, фильтрует посты и
+    отдаёт вакансии на проверку или сразу публикует. Возвращает текст отчёта."""
+    global _li_phrase_cursor
+    async with _li_lock:
+        phrases = linkedin.ALL_PHRASES
+        n = linkedin.LINKEDIN_PHRASES_PER_RUN
+        batch = [phrases[(_li_phrase_cursor + i) % len(phrases)] for i in range(n)]
+        _li_phrase_cursor = (_li_phrase_cursor + n) % len(phrases)
+
+        posts = await linkedin.apify_search(batch)
+        stats = {
+            "fetched": len(posts), "seen": 0, "with_image": 0, "duplicates": 0,
+            "ai_dropped": 0, "published": 0, "pending": 0,
+            "rejected": {"seeker": 0, "news": 0, "not_offshore": 0, "weak": 0, "no_email": 0},
+        }
+        for post in posts:
+            try:
+                await li_process_post(bot, post, stats)
+            except Exception as e:
+                print(f"[linkedin] ошибка обработки поста {post.get('url')}: {type(e).__name__}: {e}")
+        r = stats["rejected"]
+        return (
+            "✅ <b>Сбор завершён</b>\n\n"
+            f"Фраз в этом проходе: {len(batch)}, постов получено: {stats['fetched']}\n"
+            f"Уже видели раньше: {stats['seen']}\n"
+            f"С картинкой: {stats['with_image']}\n\n"
+            "<b>Отсеяно:</b>\n"
+            f"• моряки «ищу работу»: {r['seeker']}\n"
+            f"• новости/поздравления: {r['news']}\n"
+            f"• не оффшор: {r['not_offshore']}\n"
+            f"• мало признаков вакансии: {r['weak']}\n"
+            f"• нет корпоративной почты (ссылки, gmail и т.п.): {r['no_email']}\n"
+            f"• ИИ: не оффшорное судно: {stats['ai_dropped']}\n"
+            f"• дубликаты: {stats['duplicates']}\n\n"
+            f"🕓 Отправлено вам на проверку: {stats['pending']}\n"
+            f"✅ Опубликовано сразу: {stats['published']}"
+        )
+
+
+async def linkedin_worker(bot: Bot):
+    if not linkedin.APIFY_TOKEN:
+        print("[linkedin] APIFY_TOKEN не задан — автосбор LinkedIn отключён")
+        return
+    await asyncio.sleep(90)
     while True:
         try:
-            now = datetime.now()
-            if BACKUP_HOUR >= 0 and now.hour == BACKUP_HOUR and last_day != now.date():
-                last_day = now.date()
-                await send_backup(bot, ADMIN_IDS[:1])  # только главному админу
+            if li_flag("li_auto", "on"):
+                await run_linkedin_collect(bot)
         except Exception as e:
-            print(f"[backup_worker] {type(e).__name__}: {e}")
-        await asyncio.sleep(600)
-
-
-@router.message(Command("health"))
-async def cmd_health(message: Message):
-    """Одна команда, чтобы понять, всё ли работает."""
-    if not admin_only(message.from_user.id):
-        return
-    conn = db.get_conn()
-    try:
-        q = lambda sql, *a: conn.execute(sql, a).fetchone()[0]
-        today = datetime.now().strftime("%Y-%m-%d")
-        published_today = q("SELECT COUNT(*) FROM vacancies WHERE status='published' AND created_at LIKE ?", today + "%")
-        queued = q("SELECT COUNT(*) FROM vacancies WHERE status='queued'")
-        stuck = q("SELECT COUNT(*) FROM vacancies WHERE status='publishing'")
-        last_pub = q("SELECT MAX(created_at) FROM vacancies WHERE status='published'") or "—"
-        active_subs = q("SELECT COUNT(*) FROM subscribers WHERE subscription_until > ?", datetime.now().isoformat())
-        sent_today = q("SELECT COUNT(*) FROM mail_applications WHERE status='sent' AND sent_at LIKE ?", today + "%")
-        failed_today = q("SELECT COUNT(*) FROM mail_applications WHERE status='failed' AND created_at LIKE ?", today + "%")
-        drafts = q("SELECT COUNT(*) FROM mail_applications WHERE status='draft'")
-        campaigns = conn.execute("SELECT id, full_name FROM mail_clients WHERE mailbase_active = 1").fetchall()
-        paused = conn.execute("SELECT full_name, gmail_blocked_until FROM mail_clients "
-                              "WHERE gmail_blocked_until > ?", (datetime.now().isoformat(),)).fetchall()
-        bounces = q("SELECT COUNT(*) FROM mail_bounces WHERE detected_at >= ?", email_apply.MAILBASE_BOUNCES_SINCE)
-    finally:
-        conn.close()
-    size_mb = os.path.getsize(db.DB_PATH) / 1024 / 1024 if os.path.exists(db.DB_PATH) else 0
-    on_volume = db.DB_PATH.startswith("/data")
-    lines = [
-        "🩺 <b>Состояние бота</b>\n",
-        f"🗄 База: {size_mb:.1f} МБ · {'✅ на Volume' if on_volume else '⚠️ НЕ на Volume — данные сотрутся при деплое (DB_PATH)'}",
-        f"📢 Опубликовано сегодня: {published_today} · в очереди: {queued}"
-        + (f" · ⚠️ зависли в публикации: {stuck}" if stuck else ""),
-        f"🕒 Последняя публикация: {str(last_pub)[:16].replace('T', ' ')}",
-        f"👥 Активных подписок: {active_subs}",
-        f"✉️ Писем клиентов сегодня: {sent_today}" + (f" · ❌ ошибок: {failed_today}" if failed_today else "")
-        + (f" · 📝 ждут подтверждения: {drafts}" if drafts else ""),
-        f"🎯 Точечных рассылок идёт: {len(campaigns)}"
-        + (" (" + ", ".join(html.escape(c['full_name']) for c in campaigns) + ")" if campaigns else ""),
-        f"📭 Недоставляемых адресов (точечная рассылка): {bounces}",
-        ("🔴 <b>Отправка писем ОСТАНОВЛЕНА</b> (/lockdown off — снять)"
-         if db.get_setting("email_lockdown", "off") == "on" else "🟢 Отправка писем работает"),
-        ("🔑 Ключ шифрования паролей: ✅ задан"
-         if os.getenv("MAIL_SECRET_KEY") else
-         "🔑 ⚠️ MAIL_SECRET_KEY не задан — пароли почты шифруются токеном бота (менее надёжно)"),
-    ]
-    if paused:
-        lines.append("⛔️ Ящики на паузе (лимит почты): " + ", ".join(
-            f"{html.escape(p['full_name'])} до {p['gmail_blocked_until'][11:16]}" for p in paused))
-    # по каждому клиенту: лимит за 24 ч, очередь базы, 📭 возвраты, 📬 ответы
-    try:
-        clients = email_apply.list_clients()
-        if clients:
-            lines.append("\n👤 <b>Клиенты</b> (за 24ч / очередь / 📭 / 📬):")
-            for c in clients:
-                lines.append(email_apply.client_status_line(c))
-            lines.append("\nПочты проверить сейчас: /mailcheck · ответы: /replies")
-    except Exception as e:
-        print(f"[cmd_health] client lines: {e}")
-    await message.answer("\n".join(lines))
+            print(f"[linkedin_worker] {type(e).__name__}: {e}")
+        await asyncio.sleep(linkedin.LINKEDIN_INTERVAL_HOURS * 3600)
 
 
 async def digest_worker(bot: Bot):
-    # любая ошибка внутри цикла раньше молча убивала воркер навсегда — и
-    # отложенные посты переставали публиковаться до следующего деплоя
     while True:
-        try:
-            due = db.get_due_queue(datetime.now().isoformat())
-            for row in due:
-                try:
-                    await do_publish(bot, row["id"])
-                except Exception as e:
-                    print(f"[digest_worker] не удалось опубликовать #{row['id']}: {type(e).__name__}: {e}")
-                    # не долбим канал каждую минуту — следующая попытка через 15 мин,
-                    # и сообщаем админу, чтобы отложенная вакансия не пропала молча
-                    db.set_schedule(row["id"], (datetime.now() + timedelta(minutes=15)).isoformat())
-                    for admin_id in ADMIN_IDS:
-                        try:
-                            await bot.send_message(admin_id, f"⚠️ Отложенная вакансия #{row['id']} не опубликовалась: "
-                                                             f"{html.escape(str(e))[:300]}\nПовторю через 15 минут.")
-                        except TelegramAPIError:
-                            pass
-        except Exception as e:
-            print(f"[digest_worker] ошибка: {type(e).__name__}: {e}")
+        due = db.get_due_queue(datetime.now().isoformat())
+        for row in due:
+            try:
+                await do_publish(bot, row["id"])
+            except TelegramAPIError:
+                pass
         await asyncio.sleep(60)
 
 
 async def subscription_reminder_worker(bot: Bot):
     # проверяем раз в час — часто чаще и не нужно, окно напоминания 24ч
     while True:
-        try:
-            expiring = db.get_expiring_subscribers(within_hours=24)
-            for row in expiring:
-                lang = row["language"]
-                try:
-                    await bot.send_message(
-                        row["tg_id"],
-                        t(lang, "expiry_reminder"),
-                        reply_markup=payment_keyboard(lang, row["tg_id"]),
-                    )
-                except TelegramAPIError:
-                    pass  # человек заблокировал бота — повторять каждый час смысла нет
+        expiring = db.get_expiring_subscribers(within_hours=24)
+        for row in expiring:
+            lang = row["language"]
+            try:
+                await bot.send_message(
+                    row["tg_id"],
+                    t(lang, "expiry_reminder"),
+                    reply_markup=payment_keyboard(lang, row["tg_id"]),
+                )
                 db.mark_reminder_sent(row["tg_id"], row["subscription_until"])
-        except Exception as e:
-            print(f"[subscription_reminder_worker] ошибка: {type(e).__name__}: {e}")
+            except TelegramAPIError:
+                pass
         await asyncio.sleep(3600)
 
 
@@ -3246,65 +3206,37 @@ async def scheduled_ads_worker(bot: Bot):
     # ЧЧ:ММ; сама защита от повторной отправки в течение той же минуты —
     # через last_sent_date (проверяется по сегодняшней дате, не по времени)
     while True:
-        try:
-            now = datetime.now()
-            now_hhmm = now.strftime("%H:%M")
-            today = now.strftime("%Y-%m-%d")
-            due = db.get_due_scheduled_ads(now_hhmm, today)
-            for ad in due:
-                try:
-                    # parse_mode=None — текст рекламы обычный, а не HTML; иначе символы
-                    # < & в тексте ломали бы отправку и пост не уходил бы вообще
-                    await bot.send_message(chat_id=CHANNEL_ID, text=ad["text"], parse_mode=None)
-                    db.mark_scheduled_ad_sent(ad["id"], today)
-                except TelegramAPIError as e:
-                    print(f"[scheduled_ads_worker] Не удалось опубликовать рекламу #{ad['id']}: {e}")
-        except Exception as e:
-            print(f"[scheduled_ads_worker] ошибка: {type(e).__name__}: {e}")
+        now = datetime.now()
+        now_hhmm = now.strftime("%H:%M")
+        today = now.strftime("%Y-%m-%d")
+        due = db.get_due_scheduled_ads(now_hhmm, today)
+        for ad in due:
+            try:
+                await bot.send_message(chat_id=CHANNEL_ID, text=ad["text"])
+                db.mark_scheduled_ad_sent(ad["id"], today)
+            except TelegramAPIError as e:
+                print(f"[scheduled_ads_worker] Не удалось опубликовать рекламу #{ad['id']}: {e}")
         await asyncio.sleep(60)
 
 
 async def main():
     db.init_db()
-    db.reset_stuck_publishing()
-    rotated = email_apply.rotate_mail_passwords()
-    if rotated:
-        print(f"[security] пароли почты {rotated} клиентов перешифрованы ключом MAIL_SECRET_KEY")
-    email_apply.init_tables()
-    email_apply.setup(ADMIN_IDS, claude, RANK_TAGS, TAG_LABELS)
-    features.init_tables()
-    features.setup(ADMIN_IDS, claude, CHANNEL_ID)
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
-    # защита: журнал важных команд админов и антифлуд для всех остальных
-    dp.message.outer_middleware(AdminAuditMiddleware())
-    dp.message.outer_middleware(AntiFloodMiddleware())
-    dp.callback_query.outer_middleware(AntiFloodMiddleware())
-    dp.include_router(email_apply.router)  # раньше основного: его пошаговые диалоги должны ловить текст первыми
-    dp.include_router(features.router)     # инструменты подписчика (контракт/документы/новости)
     dp.include_router(router)
     asyncio.create_task(digest_worker(bot))
     asyncio.create_task(subscription_reminder_worker(bot))
     asyncio.create_task(scheduled_ads_worker(bot))
-    asyncio.create_task(email_apply.mail_base_worker(bot))
-    asyncio.create_task(email_apply.bounce_worker(bot))  # ловит письма «не доставлено» и исключает такие адреса
-    asyncio.create_task(email_apply.mailbox_health_worker(bot))  # раз в сутки проверяет логин во все ящики клиентов
-    asyncio.create_task(email_apply.deferred_apply_worker(bot))  # досылает отложенные ночью авто-отклики утром
-    asyncio.create_task(backup_worker(bot))
-    asyncio.create_task(features.docs_reminder_worker(bot))   # напоминания об окончании документов
-    asyncio.create_task(features.news_worker(bot))            # сбор новостей офшора
-    asyncio.create_task(features.news_digest_worker(bot))     # ежедневная сводка новостей тем, кто включил
-    if ingest.enabled():                                      # авто-парсинг вакансий из каналов-источников
-        asyncio.create_task(ingest.run_ingest(lambda raw, src: ingest_vacancy(bot, raw, src)))
-        print(f"[main] авто-парсинг каналов включён: {len(ingest.SOURCE_CHANNELS)} источник(ов)")
+    asyncio.create_task(linkedin_worker(bot))
+
     # текст, видимый в ПУСТОМ чате до первого нажатия Start — ставится через
     # Bot API, не хранится нигде в БД, просто применяется заново при каждом
     # старте, чтобы не зависеть от ручной настройки через BotFather
     try:
         await bot.set_my_description(
-            "🚢 Этот бот присылает офшорные вакансии по вашей должности, плюс "
-            "проверка контракта, напоминания по документам и новости офшора. "
-            "30 дней бесплатно, дальше €1/месяц. Нажмите Start."
+            "🚢 Этот бот присылает вам офшорные вакансии по должности, "
+            "которую вы выберете при подписке. Бесплатно 3 дня, дальше — "
+            "платная подписка. Нажмите Start, чтобы начать."
         )
         await bot.set_my_short_description(
             "Офшорные вакансии по вашей должности — прямо в личные сообщения"
@@ -3315,7 +3247,8 @@ async def main():
     if WEBAPP_URL:
         asyncio.create_task(webapp.run_web_server(
             bot, BOT_TOKEN, PORT, handle_stripe_subscription_activated, handle_stripe_digest_paid,
-            handle_stripe_renewal, handle_stripe_upcoming, handle_stripe_unmatched_payment
+            handle_stripe_renewal, handle_stripe_upcoming, handle_stripe_unmatched_payment,
+            handle_stripe_autoapply_paid
         ))
         try:
             await bot.set_chat_menu_button(
@@ -3325,6 +3258,12 @@ async def main():
             print(f"[main] Не удалось установить кнопку меню мини-приложения: {e}")
     else:
         print("[main] WEBAPP_URL не задан — мини-приложение (поиск вакансий) не запущено")
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, f"🚀 Бот запущен, версия {BOT_VERSION}")
+        except TelegramAPIError:
+            pass
 
     await dp.start_polling(bot)
 
