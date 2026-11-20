@@ -3028,6 +3028,23 @@ def li_admin_keyboard(vacancy_id: int, url: str, review: bool) -> InlineKeyboard
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+async def li_safe_send(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
+    """Отправка админу с паузой (лимит Telegram ~1 сообщение/сек в один чат)
+    и повтором, если Telegram попросил подождать."""
+    from aiogram.exceptions import TelegramRetryAfter
+    for _ in range(3):
+        try:
+            await bot.send_message(chat_id, text, **kwargs)
+            await asyncio.sleep(1.1)
+            return True
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramAPIError as e:
+            print(f"[linkedin] отправка админу не удалась: {e}")
+            return False
+    return False
+
+
 async def li_process_post(bot: Bot, post: dict, stats: dict):
     url, text = post["url"], post["text"]
     if db.li_was_seen(url):
@@ -3091,30 +3108,34 @@ async def li_process_post(bot: Bot, post: dict, stats: dict):
             db.set_status(vacancy_id, "pending_review")
             stats["pending"] += 1
             for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(
-                        admin_id, f"💼 <b>Новая из LinkedIn #{vacancy_id}</b>\n\n{preview}\n\n"
-                                  "<i>Опубликовать для моряков?</i>",
-                        reply_markup=li_admin_keyboard(vacancy_id, url, True),
-                        disable_web_page_preview=True)
-                except TelegramAPIError:
-                    pass
+                await li_safe_send(
+                    bot, admin_id, f"💼 <b>Новая из LinkedIn #{vacancy_id}</b>\n\n{preview}\n\n"
+                                   "<i>Опубликовать для моряков?</i>",
+                    reply_markup=li_admin_keyboard(vacancy_id, url, True),
+                    disable_web_page_preview=True)
         else:
-            try:
-                await do_publish(bot, vacancy_id)
-                stats["published"] += 1
-            except TelegramAPIError as e:
-                print(f"[linkedin] публикация не удалась: {e}")
+            from aiogram.exceptions import TelegramRetryAfter
+            published_ok = False
+            for _attempt in range(3):
+                try:
+                    await do_publish(bot, vacancy_id)
+                    published_ok = True
+                    break
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 1)
+                except TelegramAPIError as e:
+                    print(f"[linkedin] публикация не удалась: {e}")
+                    break
+            if not published_ok:
                 continue
+            stats["published"] += 1
+            await asyncio.sleep(3.5)  # лимит канала ~20 постов в минуту
             if notify:
                 for admin_id in ADMIN_IDS:
-                    try:
-                        await bot.send_message(
-                            admin_id, f"💼 <b>Опубликована из LinkedIn #{vacancy_id}</b>\n\n{preview}",
-                            reply_markup=li_admin_keyboard(vacancy_id, url, False),
-                            disable_web_page_preview=True)
-                    except TelegramAPIError:
-                        pass
+                    await li_safe_send(
+                        bot, admin_id, f"💼 <b>Опубликована из LinkedIn #{vacancy_id}</b>\n\n{preview}",
+                        reply_markup=li_admin_keyboard(vacancy_id, url, False),
+                        disable_web_page_preview=True)
     db.li_mark_seen(url, "accepted" if made else "dropped")
 
 
@@ -3123,10 +3144,13 @@ async def run_linkedin_collect(bot: Bot, manual: bool = False) -> str:
     отдаёт вакансии на проверку или сразу публикует. Возвращает текст отчёта."""
     global _li_phrase_cursor
     async with _li_lock:
-        phrases = linkedin.ALL_PHRASES
-        n = linkedin.LINKEDIN_PHRASES_PER_RUN
-        batch = [phrases[(_li_phrase_cursor + i) % len(phrases)] for i in range(n)]
-        _li_phrase_cursor = (_li_phrase_cursor + n) % len(phrases)
+        if linkedin.APIFY_TASK_ID:
+            batch = []  # запросы хранятся в задаче Apify
+        else:
+            phrases = linkedin.ALL_PHRASES
+            n = linkedin.LINKEDIN_PHRASES_PER_RUN
+            batch = [phrases[(_li_phrase_cursor + i) % len(phrases)] for i in range(n)]
+            _li_phrase_cursor = (_li_phrase_cursor + n) % len(phrases)
 
         posts = await linkedin.apify_search(batch)
         stats = {
@@ -3142,7 +3166,8 @@ async def run_linkedin_collect(bot: Bot, manual: bool = False) -> str:
         r = stats["rejected"]
         return (
             "✅ <b>Сбор завершён</b>\n\n"
-            f"Фраз в этом проходе: {len(batch)}, постов получено: {stats['fetched']}\n"
+            + (f"Фраз в этом проходе: {len(batch)}, " if batch else "Запросы: из задачи Apify, ")
+            + f"постов получено: {stats['fetched']}\n"
             f"Уже видели раньше: {stats['seen']}\n"
             f"С картинкой: {stats['with_image']}\n\n"
             "<b>Отсеяно:</b>\n"

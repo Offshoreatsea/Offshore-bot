@@ -226,27 +226,55 @@ def normalize_post(item: dict) -> dict | None:
     return {"url": url.split("?")[0], "text": text.strip(), "images": images, "author": author_name}
 
 
+APIFY_TASK_ID = os.getenv("APIFY_TASK_ID")  # если задан — бот запускает сохранённую задачу Apify
+LINKEDIN_POSTED_LIMIT = os.getenv("LINKEDIN_POSTED_LIMIT", "24h")
+
+
 async def apify_search(phrases: list[str]) -> list[dict]:
+    """Запускает актор (или сохранённую задачу, если задан APIFY_TASK_ID),
+    ждёт окончания и забирает посты. Без ограничения в 5 минут: запуск
+    асинхронный, статус проверяется раз в 10 секунд до 30 минут."""
+    import asyncio
     if not APIFY_TOKEN:
         raise RuntimeError("APIFY_TOKEN не задан в Variables")
-    payload = {
-        "searchQueries": phrases,
-        "maxPosts": LINKEDIN_POSTS_PER_PHRASE,
-        "postedLimit": "24h",
-    }
-    if APIFY_INPUT_EXTRA:
-        try:
-            payload.update(json.loads(APIFY_INPUT_EXTRA))
-        except json.JSONDecodeError as e:
-            raise RuntimeError(f"APIFY_INPUT_EXTRA — некорректный JSON: {e}")
-    async with httpx.AsyncClient(timeout=300) as client:
-        resp = await client.post(
-            f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items",
-            params={"token": APIFY_TOKEN}, json=payload,
+    if APIFY_TASK_ID:
+        start_url = f"https://api.apify.com/v2/actor-tasks/{APIFY_TASK_ID}/runs"
+        payload = {"postedLimit": LINKEDIN_POSTED_LIMIT}  # остальное берётся из задачи
+    else:
+        start_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/runs"
+        payload = {
+            "searchQueries": phrases,
+            "maxPosts": LINKEDIN_POSTS_PER_PHRASE,
+            "postedLimit": LINKEDIN_POSTED_LIMIT,
+        }
+        if APIFY_INPUT_EXTRA:
+            try:
+                payload.update(json.loads(APIFY_INPUT_EXTRA))
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"APIFY_INPUT_EXTRA — некорректный JSON: {e}")
+    params = {"token": APIFY_TOKEN}
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(start_url, params=params, json=payload)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"Apify вернул {resp.status_code}: {resp.text[:300]}")
+        run = resp.json()["data"]
+        run_id, dataset_id = run["id"], run["defaultDatasetId"]
+        status = run.get("status")
+        for _ in range(180):  # до 30 минут
+            if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
+                break
+            await asyncio.sleep(10)
+            st = await client.get(f"https://api.apify.com/v2/actor-runs/{run_id}", params=params)
+            status = st.json()["data"]["status"]
+        if status != "SUCCEEDED":
+            raise RuntimeError(f"Запуск Apify завершился со статусом {status}")
+        items_resp = await client.get(
+            f"https://api.apify.com/v2/datasets/{dataset_id}/items",
+            params={**params, "clean": "true", "limit": 5000},
         )
-    if resp.status_code >= 300:
-        raise RuntimeError(f"Apify вернул {resp.status_code}: {resp.text[:300]}")
-    items = resp.json()
+    if items_resp.status_code >= 300:
+        raise RuntimeError(f"Не удалось получить результаты: {items_resp.status_code}")
+    items = items_resp.json()
     posts = []
     for it in items if isinstance(items, list) else []:
         p = normalize_post(it)
