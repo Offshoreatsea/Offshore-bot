@@ -233,7 +233,6 @@ async def apify_search(phrases: list[str]) -> list[dict]:
         "searchQueries": phrases,
         "maxPosts": LINKEDIN_POSTS_PER_PHRASE,
         "postedLimit": "24h",
-        "sortBy": "date",
     }
     if APIFY_INPUT_EXTRA:
         try:
