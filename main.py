@@ -44,6 +44,9 @@ ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "offshoreatsea")
 CHANNEL_ID = f"@{CHANNEL_USERNAME}"
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", f"https://t.me/{CHANNEL_USERNAME}")
+# куда ведут ссылка внизу вакансии и кнопка «Get More Job Offers» (можно поменять в Railway)
+OFFERS_BOT_LINK = os.getenv("OFFERS_BOT_LINK", "https://t.me/EasyWayAtSea_bot")
+WEBSITE_URL = os.getenv("WEBSITE_URL", "https://www.wayatsea.com")
 APPLY_BOT_LINK = os.getenv("APPLY_BOT_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 CONSULT_LINK = os.getenv("CONSULT_LINK", "https://t.me/Offshore_atsea")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -471,6 +474,7 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 pending_corrections: dict[int, int] = {}
 pending_li_delete: dict[int, bool] = {}
 pending_cv_match: dict[int, bool] = {}
+pending_cv_search: dict[int, bool] = {}
 # admin_id -> True, если админ сейчас в процессе публикации рекламного поста
 pending_ads: dict[int, bool] = {}
 # временное хранилище черновиков рекламы: ad_id -> текст
@@ -847,7 +851,9 @@ def render_template(fields: dict, hide_contact: bool = False, lang: str | None =
         parts.append(fields["hashtags"])
 
     parts.append("")
-    parts.append(f"🔗 {CHANNEL_LINK}")
+    # ссылка внизу ведёт на бота (а не на группу) — воронка в @EasyWayAtSea_bot
+    _bot_handle = OFFERS_BOT_LINK.rstrip("/").split("/")[-1]
+    parts.append(f'🔗 <a href="{OFFERS_BOT_LINK}">@{_bot_handle}</a>')
 
     # схлопываем случайные двойные пустые строки (когда почти все поля пустые
     # и подряд идёт несколько условных блоков с "" в начале)
@@ -917,9 +923,7 @@ async def send_cv_email(to_email: str, subject: str, body: str, attachment_bytes
 
 def channel_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="🎯 Get More Offers", url=f"https://t.me/{BOT_USERNAME}?start=join"
-        )
+        InlineKeyboardButton(text="🎯 Get More Job Offers", url=WEBSITE_URL)
     ]])
 
 
@@ -1139,7 +1143,7 @@ async def cmd_start(message: Message, command: CommandObject):
             "/contacts — список email/агентств из сохранённых вакансий\n"
             "/testchannel — проверить доступ бота к каналу\n"
             "/ad — опубликовать рекламный пост с кнопкой «Консультация»\n"
-            "/cvmatch — подбор вакансий по резюме\n/linkedin — раздел «Вакансии из LinkedIn» (сводка, список, модерация)\n"
+            "/cvmatch — подбор вакансий из базы по резюме\n/cvsearch — поиск в LinkedIn под резюме моряка\n/linkedin — раздел «Вакансии из LinkedIn» (сводка, список, модерация)\n"
             "/search — открыть поиск вакансий с фильтрами (мини-приложение)\n"
             "/applications — последние отклики через мини-приложение\n"
             "/subscribe — команда для кандидатов: подписка на вакансии по должности "
@@ -1404,6 +1408,9 @@ async def handle_cv_document(message: Message):
     tg_id = message.from_user.id
     if admin_only(tg_id) and pending_cv_match.pop(tg_id, False):
         await cv_match_document(message)
+        return
+    if admin_only(tg_id) and pending_cv_search.pop(tg_id, False):
+        await cv_match_document(message, search=True)
         return
     if admin_only(tg_id) or db.is_blocked(tg_id):
         return  # у админа документы — это его рабочие дела, не резюме кандидата
@@ -2009,6 +2016,9 @@ async def handle_vacancy_text(message: Message):
     # режим «Подбор по резюме»: резюме вставлено текстом
     if pending_cv_match.pop(user_id, False):
         await cv_match_run(message, message.text or "")
+        return
+    if pending_cv_search.pop(user_id, False):
+        await cv_match_run(message, message.text or "", search=True)
         return
 
     # режим исправления — админ прислал текст с правильными полями
@@ -2816,7 +2826,7 @@ async def cb_fix(callback: CallbackQuery):
 
 # ======================= Вакансии из LinkedIn =======================
 
-BOT_VERSION = "2026-11-20 v32-clients"
+BOT_VERSION = "2026-11-20 v33.2-links"
 _li_lock = asyncio.Lock()
 _li_phrase_cursor = 0
 
@@ -2955,7 +2965,7 @@ def cv_match_ai(cv_text: str) -> tuple[list[str], list[str]]:
     return tags, [str(k) for k in data.get("keywords", [])][:4]
 
 
-async def cv_match_run(message: Message, cv_text: str):
+async def cv_match_run(message: Message, cv_text: str, search: bool = False):
     if len(cv_text.strip()) < 40:
         await message.answer("Не смог прочитать текст резюме. Пришлите PDF/DOCX с текстом или вставьте текст.")
         return
@@ -2965,8 +2975,39 @@ async def cv_match_run(message: Message, cv_text: str):
     except Exception as e:
         await wait.edit_text(f"Не удалось определить должность: {type(e).__name__}")
         return
+    found_txt = ""
+    if search:
+        if not linkedin.APIFY_TOKEN:
+            await wait.edit_text("APIFY_TOKEN не задан — поиск в LinkedIn недоступен.")
+            return
+        queries = linkedin.queries_for_titles(keywords or [t for t in tags])
+        if not queries:
+            await wait.edit_text("Не удалось определить должность для поиска.")
+            return
+        await wait.edit_text(
+            f"🔎 Ищу в LinkedIn по должностям: {esc(', '.join(keywords))}\n"
+            f"Запросов: {len(queries)}, посты за вчера и сегодня. Займёт 5–15 минут, пришлю итог.")
+        try:
+            async with _li_lock:
+                posts = await linkedin.apify_search(queries, direct=True, posted_limit="week", max_posts=30)
+                posts_all = len(posts)
+                posts = [p for p in posts if linkedin.posted_since_yesterday(p)]
+                stats = {"fetched": len(posts), "seen": 0, "with_image": 0, "duplicates": 0,
+                         "ai_dropped": 0, "shore": 0, "published": 0, "pending": 0,
+                         "rejected": {"seeker": 0, "news": 0, "not_offshore": 0, "weak": 0, "no_email": 0}}
+                for post in posts:
+                    try:
+                        await li_process_post(message.bot, post, stats, force_review=True)
+                    except Exception as e:
+                        print(f"[cvsearch] пост {post.get('url')}: {type(e).__name__}: {e}")
+            found_txt = (f"Постов за вчера и сегодня: {stats['fetched']} (из {posts_all} за неделю), новых вакансий на проверку: {stats['pending']}, "
+                         f"уже видели: {stats['seen']}\n")
+        except Exception as e:
+            await message.answer(f"Поиск в LinkedIn не удался: {esc(str(e))[:300]}")
+            return
+        wait = await message.answer("📋 Собираю итоговый список…")
     rows = await asyncio.to_thread(db.cv_match_search, tags, keywords, 30, 20)
-    head = (f"🎯 Должности: {esc(', '.join(tags) or '—')}\n"
+    head = found_txt + (f"🎯 Должности: {esc(', '.join(tags) or '—')}\n"
             f"🔤 Слова: {esc(', '.join(keywords) or '—')}\n"
             f"Найдено за 30 дней: {len(rows)}\n")
     if not rows:
@@ -2983,7 +3024,7 @@ async def cv_match_run(message: Message, cv_text: str):
     await wait.edit_text(text[:4000], disable_web_page_preview=True)
 
 
-async def cv_match_document(message: Message):
+async def cv_match_document(message: Message, search: bool = False):
     doc = message.document
     try:
         buf = io.BytesIO()
@@ -2992,7 +3033,17 @@ async def cv_match_document(message: Message):
     except Exception as e:
         await message.answer(f"Не смог открыть файл ({type(e).__name__}). Пришлите PDF, DOCX или текст.")
         return
-    await cv_match_run(message, text)
+    await cv_match_run(message, text, search=search)
+
+
+@router.message(Command("cvsearch"))
+async def cmd_cvsearch(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    pending_cv_search[message.from_user.id] = True
+    await message.answer("📄 Пришлите резюме моряка (PDF, DOCX или текстом). Я найду его должность и "
+                         "поищу под неё свежие вакансии прямо в LinkedIn (за вчера и сегодня). Найденное придёт вам "
+                         "на проверку, ничего не публикуется и не отправляется само.")
 
 
 @router.message(Command("cvmatch"))
@@ -3147,7 +3198,7 @@ async def li_safe_send(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
     return False
 
 
-async def li_process_post(bot: Bot, post: dict, stats: dict):
+async def li_process_post(bot: Bot, post: dict, stats: dict, force_review: bool = False):
     url, text = post["url"], post["text"]
     if db.li_was_seen(url):
         stats["seen"] += 1
@@ -3183,7 +3234,7 @@ async def li_process_post(bot: Bot, post: dict, stats: dict):
 
     # разбор и итоговая проверка типа судна — ИИ
     items = await asyncio.to_thread(ai_parse_batch, combined)
-    review = li_flag("li_review", "on")
+    review = force_review or li_flag("li_review", "on")
     notify = li_flag("li_notify", "off")
     made = 0
     for fields in items:
